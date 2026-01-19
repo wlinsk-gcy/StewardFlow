@@ -1,0 +1,16 @@
+app:
+  port: 8000
+
+log:
+  level: info
+
+llm:
+  model: 改成你使用的模型
+  api_key: 改成你的key
+  base_url: 改成对应供应商的url
+  temperature: 1.0
+
+tools:
+  web_search:
+    api_key: 改成你的key，详细请看：https://serpapi.com/
+    paywall_keywords: ["subscribe", "login to continue", "access denied", "restricted content", "404", "this page is not working"]
