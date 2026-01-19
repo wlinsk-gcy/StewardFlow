@@ -46,6 +46,15 @@ async def run_agent(
     2. 启动后台任务执行 ReAct 循环
     3. 立即返回 agent_id
     """
+
+    def callback(task: asyncio.Task):
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"捕获异常: {type(exc).__name__}, {exc}")
+        except asyncio.CancelledError:
+            logger.warning("run_agent任务被取消")
+
     if request.agent_id:
         agent = agent_service.get_agent(request.agent_id)
         if not agent:
@@ -53,20 +62,12 @@ async def run_agent(
         if (agent.status == AgentStatus.WAITING
                 and agent.current_node == NodeType.HITL and agent.hitl):
             # 提交到服务层处理
-            result = await agent_service.submit_hitl(request.agent_id,
-                                                     request_id=agent.hitl['request_id'],
-                                                     input_text=request.task)
-
-            if not result.success:
-                return HITLResponse(
-                    status="rejected",
-                    message="Failed to process HITL request"
-                )
-
-            return HITLResponse(
-                request_id=result.response.request_id if result.response else None,
-                status="accepted",
-                message="HITL response processed"
+            hitl_task = asyncio.create_task(
+                agent_service.submit_hitl(request.agent_id, request_id=agent.hitl['request_id'],
+                                          input_text=request.task))
+            hitl_task.add_done_callback(callback)
+            return RunAgentResponse(
+                agent_id=request.agent_id,
             )
 
     # 创建 Agent
@@ -76,22 +77,11 @@ async def run_agent(
         max_turns=50,
     )
     task = asyncio.create_task(agent_service.execute_agent(agent.agent_id))
-
-    def callback(task: asyncio.Task):
-        try:
-            exc = task.exception()
-            if exc:
-                logger.error(f"捕获异常: {type(exc).__name__}, {exc}")
-        except asyncio.CancelledError:
-            logger.warning("execute_agent 任务被取消")
-
     task.add_done_callback(callback)
 
     # 返回
     return RunAgentResponse(
-        agent_id=agent.agent_id,
-        status=agent.status.value,
-        task=agent.task
+        agent_id=agent.agent_id
     )
 
 

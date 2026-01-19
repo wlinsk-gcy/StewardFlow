@@ -2,8 +2,10 @@
 ReAct 执行引擎
 实现 Thought → Action → Observation 的循环逻辑
 """
+import json
 import logging
 from datetime import datetime
+from typing import Optional
 
 from .protocol import (
     AgentStatus, NodeType, Thought, Action, Observation, Pending, HITLRequest,
@@ -11,10 +13,10 @@ from .protocol import (
 )
 from .llm import Provider
 from .tools.tool import ToolRegistry
-from storage.checkpoint import CheckpointStore
+from .storage.checkpoint import CheckpointStore
 from context import agent_id_ctx
 from utils.id_util import get_sonyflake
-from .extractor import extract_json
+from .extractor import extract_json, normalize_llm_dict
 from ws.connection_manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
@@ -46,7 +48,8 @@ class AgentExecutor:
         self.ws_manager = ws_manager
         self.turn_id: str = ''
         agent_id_ctx.set(self.agent.agent_id)
-        self.stream = True
+        # self.stream = True
+        self.stream = False
 
     def log(self, message: str):
         """打印日志"""
@@ -54,7 +57,7 @@ class AgentExecutor:
             print(message)
 
     def parse_llm_result(self, result: str) -> tuple[Thought, Action]:
-        llm_dict = extract_json(result)
+        llm_dict = normalize_llm_dict(extract_json(result))
         thought = Thought(
             content=llm_dict["thought"],
             turn_id=self.turn_id
@@ -95,6 +98,12 @@ class AgentExecutor:
         self.agent.pending = Pending(thought, action, False)
         event = Event(EventType.THOUGHT, self.agent.agent_id, self.turn_id, thought.to_dict())
         await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
+        if not self.stream and action.type == ActionType.FINISH:
+            event = Event(EventType.ANSWER, self.agent.agent_id, self.turn_id, {"content": action.answer})
+            await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
+            event = Event(EventType.END, self.agent.agent_id, self.turn_id, {"content": "done"})
+            await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
+
 
     async def decide_next_node(self):
         """DECIDE（Router）,LangGraph 的灵魂
@@ -132,6 +141,21 @@ class AgentExecutor:
 
         current_action = pending.action
         if current_action.type == ActionType.TOOL:
+            tool = self.tool_registry.get(current_action.tool_name)
+            if tool and tool.requires_confirmation and not getattr(pending, "confirmed", False):
+                prompt = f"Confirm to execute tool '{current_action.tool_name}' with args: {current_action.args}"
+                await self._execute_request_confirm(
+                    self.turn_id,
+                    prompt=prompt,
+                    context=f"tool:{current_action.tool_name}",
+                    tool_name=current_action.tool_name,
+                    tool_args=current_action.args
+                )
+                self.agent.status = AgentStatus.WAITING
+                self.agent.current_node = NodeType.HITL
+                self.checkpoint.save(self.agent)
+                return
+
             observation = await self._execute_tool(self.turn_id)
             self.agent.current_node = NodeType.OBSERVE
             self.append_tao_trajectory(observation)
@@ -152,7 +176,7 @@ class AgentExecutor:
             logger.error("任务运行到execute_node时，current_action 不存在，任务异常")
         self.checkpoint.save(self.agent)  # 一轮 ReAct 结束后保存快照
 
-    def hitl_node(self):
+    async def hitl_node(self):
         """HITL 节点（重点）, 没有await， 没有阻塞"""
         logger.info(f"[TURN {self.agent.current_turn}] [HITL] {self.agent.current_node}")
         if self.agent.pending.action.type not in [ActionType.REQUEST_INPUT, ActionType.REQUEST_CONFIRM]:
@@ -163,7 +187,14 @@ class AgentExecutor:
             return
         self.agent.status = AgentStatus.WAITING
         self.agent.current_node = NodeType.HITL  # HITL 人类介入
-        self._execute_request_input(self.turn_id, self.agent.pending.action)
+        if self.agent.pending.action.type == ActionType.REQUEST_CONFIRM:
+            await self._execute_request_confirm(
+                self.turn_id,
+                prompt=self.agent.pending.action.prompt,
+                context="action_confirm"
+            )
+        else:
+            self._execute_request_input(self.turn_id, self.agent.pending.action)
         self.checkpoint.save(self.agent)  # 进入HITL时需要Save Checkpoint
         return  # 🚨 停止执行
 
@@ -200,7 +231,6 @@ class AgentExecutor:
                 if self.agent.current_node == NodeType.THINK:
                     # 1. 思考阶段
                     await self.think_node()
-                    # await self.think_node_stream()
                     self.agent.current_node = NodeType.DECIDE
                     self.checkpoint.save(self.agent)
                 elif self.agent.current_node == NodeType.DECIDE:
@@ -212,7 +242,7 @@ class AgentExecutor:
                 elif self.agent.current_node == NodeType.HITL:
                     # 3.2. 执行HITL -- Execute和Hitl是同级节点，
                     # DECIDE -> [EXECUTE,HITL] 二选一
-                    self.hitl_node()
+                    await self.hitl_node()
                     return
                 elif self.agent.current_node == NodeType.OBSERVE:
                     # 观察阶段 -- 开启下一轮思考
@@ -276,7 +306,7 @@ class AgentExecutor:
             execute_result = tool.execute(**args)
             return Observation(
                 role="tool",
-                content=execute_result,
+                content= execute_result,
                 turn_id=turn_id,
                 success=True,
             )
@@ -304,6 +334,45 @@ class AgentExecutor:
         logger.debug(f"[HITL] Action requests human input: {hitl_request.prompt}")
         logger.debug("Waiting for input...")
 
+    async def _execute_request_confirm(
+        self,
+        turn_id: str,
+        prompt: Optional[str],
+        context: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        tool_args: Optional[dict] = None
+    ):
+        prompt_text = prompt or "Please confirm the action."
+        hitl_request = HITLRequest(
+            request_type=HITLRequestType.CONFIRM_ACTION,
+            prompt=prompt_text,
+            context=context,
+            turn_id=turn_id
+        )
+        self.agent.pending.requires_hitl = True
+        self.agent.hitl = hitl_request
+        self.agent.hitl_count += 1
+
+        event = Event(
+            EventType.HITL_CONFIRM,
+            self.agent.agent_id,
+            turn_id,
+            {
+                "request_id": hitl_request.request_id,
+                "prompt": prompt_text,
+                "context": context,
+                "tool_name": tool_name,
+                "args": tool_args or {}
+            }
+        )
+        await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
+        logger.debug(f"[HITL] Action requests confirmation: {hitl_request.prompt}")
+        logger.debug("Waiting for confirmation...")
+
+    def _parse_confirmation(self, input_text: str) -> bool:
+        normalized = (input_text or "").strip().lower()
+        return normalized in {"yes", "y", "confirm", "ok", "true", "1"}
+
     # ========================================================================
     # HITL 外部接口
     # ========================================================================
@@ -316,17 +385,45 @@ class AgentExecutor:
         if request_id != self.agent.hitl.request_id:
             return HITLResult(success=False)
 
-        observation = Observation(content=input_text,
-                                  turn_id=self.agent.pending.thought.turn_id,
-                                  success=True)
+        hitl_request = self.agent.hitl
+        if not self.agent.pending:
+            return HITLResult(success=False)
+
+        if hitl_request.request_type == HITLRequestType.CONFIRM_ACTION:
+            accepted = self._parse_confirmation(input_text)
+            self.agent.pending.requires_hitl = False
+            self.agent.hitl = None
+
+            is_tool_confirm = bool(hitl_request.context and hitl_request.context.startswith("tool:"))
+            if is_tool_confirm and accepted:
+                setattr(self.agent.pending, "confirmed", True)
+                self.agent.current_node = NodeType.EXECUTE
+                self.checkpoint.save(self.agent)
+                return HITLResult(success=True)
+
+            result_text = "User confirmed." if accepted else "User rejected."
+            observation = Observation(
+                content=result_text,
+                turn_id=self.agent.pending.thought.turn_id,
+                success=accepted,
+                error=None if accepted else "hitl_rejected"
+            )
+            self.agent.current_node = NodeType.OBSERVE
+            self.append_tao_trajectory(observation)
+            self.checkpoint.save(self.agent)
+            return HITLResult(success=True)
+
+        self.agent.hitl = None
+        observation = Observation(
+            content=input_text,
+            turn_id=self.agent.pending.thought.turn_id,
+            success=True
+        )
         self.agent.current_node = NodeType.OBSERVE
         self.append_tao_trajectory(observation)
         self.checkpoint.save(self.agent)
         return HITLResult(success=True)
 
-    # ========================================================================
-    # 结束与失败处理
-    # ========================================================================
 
     def _finish(self, final_answer: str):
         """任务完成"""

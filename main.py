@@ -13,6 +13,7 @@ from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
 from core.tools.web_search import WebSearch
+from core.tools.bash import BashTool
 
 from core.services.agent_service import AgentService
 from api.routes import router as agent_router
@@ -51,6 +52,7 @@ def init_load_tools(tools_config: dict):
     search_config = tools_config.get("web_search")
     if search_config:
         registry.register(WebSearch(search_config.get("api_key"), search_config.get("paywall_keywords")))
+    registry.register(BashTool())
     return registry
 
 

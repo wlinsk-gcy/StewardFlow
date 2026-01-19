@@ -7,41 +7,54 @@ logger = logging.getLogger(__name__)
 
 
 def build_system_prompt():
-    return f"""
-        # Role
-        You are an Agent Core Model, not a chatbot.
+    return """
+# Role
+You are an Agent Core Model, not a chatbot.
 
-        # Responsibilities
-        Your sole responsibility is to drive a deterministic agent state machine.
-        In each turn, based on the current task and the provided context, you must produce
-        ONE and ONLY ONE Thought and ONE Action.
+# Responsibilities
+Your sole responsibility is to drive a deterministic agent state machine.
+In each turn, based on the current task and the provided context, you must produce
+ONE and ONLY ONE Thought and ONE Action.
 
-        # Context Protocol (Very Important)
-        You will receive prior context as a sequence of messages.
+# Context Protocol (Very Important)
+You will receive prior context as a sequence of messages.
 
-        The context may include:
-        - Natural language descriptions of the initial task or goal.
-        - JSON objects representing actions you previously decided.
-        - Natural language observations representing feedback from the external world
-          (such as tool results or human input).
+The context may include:
+- Natural language descriptions of the initial task or goal.
+- JSON objects representing actions you previously decided.
+- Natural language observations representing feedback from the external world
+  (such as tool results or human input).
 
-        The context is a chronological execution trace.
-        You must treat it as ground truth.
+The context is a chronological execution trace.
+You must treat it as ground truth.
 
-        # Important rules about context:
-        - Thoughts are NEVER included in the context.
-        - You must NOT infer or reconstruct past thoughts.
-        - You must NOT reason about how the context was generated.
-        - You only decide the NEXT action.
+# Important rules about context:
+- Thoughts are NEVER included in the context.
+- You must NOT infer or reconstruct past thoughts.
+- You must NOT reason about how the context was generated.
+- You only decide the NEXT action.
 
-        # Behavioral Constraints
-        1. Output EXACTLY ONE action per turn.
-        2. Do NOT plan multiple steps.
-        3. Do NOT explain your reasoning outside the "thought" field.
-        4. Do NOT output anything other than the required JSON.
-        5. If required information is missing, you MUST use "request_input" or "request_confirm" and put the question in the "prompt" field.
-        6. When the task is successfully completed or an ultimate conclusion is reached, you MUST use "finish" and put the final response in the "answer" field.
-        """
+# Behavioral Constraints
+1. Output EXACTLY ONE action per turn.
+2. Do NOT plan multiple steps.
+3. Do NOT explain your reasoning outside the "thought" field.
+4. Do NOT output anything other than the required JSON.
+5. If required information is missing, you MUST use "request_input" or "request_confirm" and put the question in the "prompt" field.
+6. When the task is successfully completed or an ultimate conclusion is reached, you MUST use "finish" and put the final response in the "answer" field.
+
+# Output Format (Strict)
+- Always output a single JSON object with keys: "thought" and "action".
+- "thought" MUST be a string (can be empty).
+- "action" MUST be an object with key "type".
+- Valid action types: "tool", "request_input", "request_confirm", "finish".
+- If type is "tool": include "tool_name" (string) and "args" (object). Set "prompt" and "answer" to null.
+- If type is "request_input": include "prompt" (string). Set "tool_name", "args", "answer" to null.
+- If type is "request_confirm": include "prompt" (string). Set "tool_name", "args", "answer" to null.
+- If type is "finish": include "answer" (string). Set "tool_name", "args", "prompt" to null.
+- Never omit required keys. Use null explicitly when a field does not apply.
+
+# Example (tool)
+{"thought":"...","action":{"type":"tool","tool_name":"web_search","args":{"query":"..."},"prompt":null,"answer":null}}"""
 
 
 def build_llm_messages(context: Dict[str, Any], system_prompt: str):
@@ -58,7 +71,9 @@ def build_llm_messages(context: Dict[str, Any], system_prompt: str):
         messages.append({"role": "assistant", "content": json.dumps(traj["action"], ensure_ascii=False)})
         # 非常重要：Observation 一定要用 user role
         # 因为这是“环境反馈”，不是 Agent 自言自语。
-        messages.append({"role": traj["observation"]["role"], "content": traj["observation"]["content"]})
+        # messages.append({"role": traj["observation"]["role"], "content": traj["observation"]["content"]})
+        # QWEN系列不支持role为tool的情况下，没有tool call id，可是模型没有返回tool call记录，所以只能用user
+        messages.append({"role": "user", "content": traj["observation"]["content"]})
 
     logger.info(f"===messages: {messages}")
     return messages
@@ -93,11 +108,27 @@ at the field level and must be strictly followed.
                             "additionalProperties": False,
                             "required": ["type", "tool_name", "args", "prompt", "answer"],
                             "properties": {
-                                "type": {"type": "string", "enum": ["tool"]},
-                                "tool_name": {"type": "string"},
-                                "args": {"type": "object"},
-                                "prompt": {"type": "null"},
-                                "answer": {"type": "null"}
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["tool"],
+                                    "description": "Use to call a tool."
+                                },
+                                "tool_name": {
+                                    "type": "string",
+                                    "description": "Registered tool name."
+                                },
+                                "args": {
+                                    "type": "object",
+                                    "description": "Tool arguments."
+                                },
+                                "prompt": {
+                                    "type": "null",
+                                    "description": "Must be null for tool actions."
+                                },
+                                "answer": {
+                                    "type": "null",
+                                    "description": "Must be null for tool actions."
+                                }
                             }
                         },
                         # request_input
@@ -106,11 +137,27 @@ at the field level and must be strictly followed.
                             "additionalProperties": False,
                             "required": ["type", "tool_name", "args", "prompt", "answer"],
                             "properties": {
-                                "type": {"type": "string", "enum": ["request_input"]},
-                                "tool_name": {"type": "null"},
-                                "args": {"type": "null"},
-                                "prompt": {"type": "string"},
-                                "answer": {"type": "null"}
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["request_input"],
+                                    "description": "Use when required information is missing."
+                                },
+                                "tool_name": {
+                                    "type": "null",
+                                    "description": "Must be null for request_input."
+                                },
+                                "args": {
+                                    "type": "null",
+                                    "description": "Must be null for request_input."
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "Question to ask the user."
+                                },
+                                "answer": {
+                                    "type": "null",
+                                    "description": "Must be null for request_input."
+                                }
                             }
                         },
                         # request_confirm
@@ -119,11 +166,27 @@ at the field level and must be strictly followed.
                             "additionalProperties": False,
                             "required": ["type", "tool_name", "args", "prompt", "answer"],
                             "properties": {
-                                "type": {"type": "string", "enum": ["request_confirm"]},
-                                "tool_name": {"type": "null"},
-                                "args": {"type": "null"},
-                                "prompt": {"type": "string"},
-                                "answer": {"type": "null"}
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["request_confirm"],
+                                    "description": "Use when a user confirmation is required."
+                                },
+                                "tool_name": {
+                                    "type": "null",
+                                    "description": "Must be null for request_confirm."
+                                },
+                                "args": {
+                                    "type": "null",
+                                    "description": "Must be null for request_confirm."
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "Confirmation question for the user."
+                                },
+                                "answer": {
+                                    "type": "null",
+                                    "description": "Must be null for request_confirm."
+                                }
                             }
                         },
                         # finish
@@ -132,11 +195,27 @@ at the field level and must be strictly followed.
                             "additionalProperties": False,
                             "required": ["type", "tool_name", "args", "prompt", "answer"],
                             "properties": {
-                                "type": {"type": "string", "enum": ["finish"]},
-                                "tool_name": {"type": "null"},
-                                "args": {"type": "null"},
-                                "prompt": {"type": "null"},
-                                "answer": {"type": "string"}
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["finish"],
+                                    "description": "Use when the task is complete."
+                                },
+                                "tool_name": {
+                                    "type": "null",
+                                    "description": "Must be null for finish."
+                                },
+                                "args": {
+                                    "type": "null",
+                                    "description": "Must be null for finish."
+                                },
+                                "prompt": {
+                                    "type": "null",
+                                    "description": "Must be null for finish."
+                                },
+                                "answer": {
+                                    "type": "string",
+                                    "description": "Final response to the user."
+                                }
                             }
                         }
                     ]

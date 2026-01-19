@@ -20,10 +20,11 @@ class RunAgentRequest(BaseModel):
 
 
 class RunAgentResponse(BaseModel):
-    """运行 Agent 响应"""
-    agent_id: str
-    status: str
-    task: str
+
+    agent_id: Optional[str] = None
+    status: Optional[str] = None
+    request_id: Optional[str] = None
+    message: Optional[str] = None
 
 # Agent的生命周期
 class AgentStatus(str, Enum):
@@ -231,6 +232,7 @@ class Pending:
     thought: Thought = field(default_factory=Thought)
     action: Action = field(default_factory=Action)
     requires_hitl: bool = False
+    confirmed: bool = False
 
 @dataclass
 class AgentState:
@@ -267,7 +269,8 @@ class AgentState:
     # {
     #     thought: Thought,
     #     action: Action,
-    #     requires_hitl: bool = False
+    #     requires_hitl: bool = False,
+    #     confirmed: bool = False
     # }
 
     # ========== HITL 状态 ==========

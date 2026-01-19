@@ -75,7 +75,7 @@ class WebSearch(Tool):
 
         return results
 
-    def execute(self, query: str) -> str:
+    def execute(self, query: str, **kwargs) -> str:
         if self.api_key is None:
             return "Error: No SerpApi key provided."
 

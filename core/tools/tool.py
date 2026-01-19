@@ -10,6 +10,7 @@ class Tool:
         self.type = "function" # This should always be function
         self.name = "undefined"
         self.description = "undefined"
+        self.requires_confirmation = False
 
     @abstractmethod
     def schema(self) -> dict:

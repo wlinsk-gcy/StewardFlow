@@ -40,6 +40,14 @@ const MessageContent: React.FC<{ content: string }> = ({ content }) => {
     );
 };
 
+type PendingConfirm = {
+    requestId: string;
+    prompt: string;
+    toolName?: string;
+    args?: unknown;
+    turnId?: string;
+};
+
 export const AgentWorkbench: React.FC = () => {
 
     const [goal, setGoal] = useState("");
@@ -49,6 +57,7 @@ export const AgentWorkbench: React.FC = () => {
     const [activeTab, setActiveTab] = useState<'runner' | 'browser'>('runner');
     const [currentUrl, setCurrentUrl] = useState("about:blank");
     const [currentScreenshot, setCurrentScreenshot] = useState<string | null>(null);
+    const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
 
     // --- 新增：WebSocket 相关状态 ---
     const [clientId] = useState(() => uuidv4()); // 保持整个生命周期 clientId 唯一
@@ -146,7 +155,23 @@ export const AgentWorkbench: React.FC = () => {
         }
 
         if (event_type === 'hitl_confirm') {
-            // TODO 需要用户请求需要弹确认框，要怎么做？
+            setIsRunning(false);
+            const promptText = data?.prompt || "Please confirm the action.";
+            setPendingConfirm({
+                requestId: data?.request_id || uuidv4(),
+                prompt: promptText,
+                toolName: data?.tool_name,
+                args: data?.args,
+                turnId: turn_id
+            });
+            setChatHistory(prev => [...prev, {
+                id: uuidv4(),
+                role: 'assistant',
+                content: promptText,
+                timestamp: new Date(timestamp).getTime(),
+                turnId: turn_id,
+                isHitl: true
+            }]);
         }
 
         // 2. 处理聊天窗口消息 (Chat Window)
@@ -169,8 +194,47 @@ export const AgentWorkbench: React.FC = () => {
         // }
     }, []);
 
+    const handleConfirm = async (decision: 'confirm' | 'reject') => {
+        if (!agentId || isRunning) return;
+
+        const userMessage: ChatMessage = {
+            id: uuidv4(),
+            role: 'user',
+            content: decision === 'confirm' ? 'Confirm' : 'Reject',
+            timestamp: Date.now(),
+        };
+
+        setChatHistory(prev => [...prev, userMessage]);
+        setPendingConfirm(null);
+        setIsRunning(true);
+        setPendingConfirm(null);
+
+        try {
+            const response = await fetch('http://localhost:8000/agent/run', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    client_id: clientId,
+                    task: decision,
+                    ...(agentId && {agent_id: agentId})
+                })
+            });
+
+            if (!response.ok) throw new Error("Failed to submit confirmation");
+        } catch (e) {
+            console.error(e);
+            setChatHistory(prev => [...prev, {
+                id: uuidv4(),
+                role: 'assistant',
+                content: "Failed to submit confirmation. Please try again.",
+                timestamp: Date.now()
+            }]);
+            setIsRunning(false);
+        }
+    };
+
     const handleRun = async () => {
-        if (!goal.trim() || isRunning) return;
+        if (!goal.trim() || isRunning || pendingConfirm) return;
 
         // 1. UI 反馈
         const userMessage: ChatMessage = {
@@ -316,6 +380,30 @@ export const AgentWorkbench: React.FC = () => {
 
                     {/* Chat Input */}
                     <div className="p-6 border-t border-gray-100 bg-white">
+                        {pendingConfirm && (
+                            <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm">
+                                <div className="text-[10px] font-black uppercase tracking-widest text-amber-700">
+                                    Confirmation Required
+                                </div>
+                                <div className="mt-2 text-xs text-amber-900">
+                                    {pendingConfirm.prompt}
+                                </div>
+                                <div className="mt-3 flex gap-2">
+                                    <button
+                                        onClick={() => handleConfirm('confirm')}
+                                        className="px-3 py-2 rounded-lg text-xs font-bold uppercase tracking-widest bg-emerald-600 text-white hover:bg-emerald-700"
+                                    >
+                                        Confirm
+                                    </button>
+                                    <button
+                                        onClick={() => handleConfirm('reject')}
+                                        className="px-3 py-2 rounded-lg text-xs font-bold uppercase tracking-widest bg-rose-600 text-white hover:bg-rose-700"
+                                    >
+                                        Reject
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                         <div className="relative group">
                             <div
                                 className="absolute -inset-1 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-2xl blur opacity-10 group-focus-within:opacity-25 transition duration-1000"></div>
@@ -327,13 +415,13 @@ export const AgentWorkbench: React.FC = () => {
                       value={goal}
                       onChange={(e) => setGoal(e.target.value)}
                       onKeyDown={handleKeyDown}
-                      disabled={isRunning}
+                      disabled={isRunning || Boolean(pendingConfirm)}
                   />
                                 <button
                                     onClick={handleRun}
-                                    disabled={isRunning || !goal.trim()}
+                                    disabled={isRunning || Boolean(pendingConfirm) || !goal.trim()}
                                     className={`absolute right-3 bottom-3 p-3 rounded-xl transition-all ${
-                                        isRunning || !goal.trim()
+                                        isRunning || Boolean(pendingConfirm) || !goal.trim()
                                             ? 'bg-gray-100 text-gray-400'
                                             : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-200 active:scale-95'
                                     }`}

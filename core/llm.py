@@ -39,9 +39,10 @@ class Provider:
             messages=messages,
             temperature=0.2,
             top_p=0.9,
-            max_tokens=768,
+            # max_tokens=1024,
             tools=self.tool_registry.get_all_schemas(),
-            response_format=llm_response_schema
+            response_format=llm_response_schema,
+            # extra_body={"enable_thinking": False,}
         )
         if response is None:
             raise Exception("OpenAI response is empty.")

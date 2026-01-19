@@ -51,6 +51,117 @@ def extract_json(text: str) -> dict:
     raise ValueError("No valid JSON object found in LLM output")
 
 
+def normalize_llm_dict(data: dict) -> dict:
+    """
+    把 LLM（大模型）吐出来的“可能不规范的 JSON”清洗/兜底成一个固定结构，确保后续执行引擎永远能拿到：
+    {
+      "thought": "string",
+      "action": {
+        "type": "tool|request_input|request_confirm|finish",
+        "tool_name": "string|null",
+        "args": "object|null",
+        "prompt": "string|null",
+        "answer": "string|null"
+      }
+    }
+    """
+    if not isinstance(data, dict):
+        raise ValueError("LLM output is not a JSON object")
+
+    thought = data.get("thought")
+    if not isinstance(thought, str):
+        thought = "" if thought is None else str(thought)
+
+    action = data.get("action") or {}
+    if not isinstance(action, dict):
+        action = {}
+
+    action_type = action.get("type")
+    if not isinstance(action_type, str):
+        action_type = None
+
+    if not action_type:
+        if action.get("tool_name"):
+            action_type = "tool"
+        elif action.get("prompt"):
+            action_type = "request_input"
+        elif action.get("answer"):
+            action_type = "finish"
+        else:
+            action_type = "request_input"
+            action["prompt"] = "Please provide the next action."
+
+    if action_type == "tool":
+        tool_name = action.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return {
+                "thought": thought,
+                "action": {
+                    "type": "request_input",
+                    "tool_name": None,
+                    "args": None,
+                    "prompt": "Missing tool_name for tool action. Provide a valid tool name.",
+                    "answer": None
+                }
+            }
+        args = action.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        normalized_action = {
+            "type": "tool",
+            "tool_name": tool_name,
+            "args": args,
+            "prompt": None,
+            "answer": None
+        }
+    elif action_type == "request_input":
+        prompt = action.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = "Please provide the required input."
+        normalized_action = {
+            "type": "request_input",
+            "tool_name": None,
+            "args": None,
+            "prompt": prompt,
+            "answer": None
+        }
+    elif action_type == "request_confirm":
+        prompt = action.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = "Please confirm the action."
+        normalized_action = {
+            "type": "request_confirm",
+            "tool_name": None,
+            "args": None,
+            "prompt": prompt,
+            "answer": None
+        }
+    elif action_type == "finish":
+        answer = action.get("answer")
+        if answer is None:
+            answer = ""
+        normalized_action = {
+            "type": "finish",
+            "tool_name": None,
+            "args": None,
+            "prompt": None,
+            "answer": str(answer)
+        }
+    else:
+        normalized_action = {
+            "type": "request_input",
+            "tool_name": None,
+            "args": None,
+            "prompt": f"Unknown action type '{action_type}'. Provide a valid action.",
+            "answer": None
+        }
+
+    return {
+        "thought": thought,
+        "action": normalized_action
+    }
+
+
 def extract_json_by_brace_matching(text: str) -> dict:
     """括号平衡算法兜底"""
     stack = []
