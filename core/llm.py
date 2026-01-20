@@ -39,28 +39,18 @@ class Provider:
             messages=messages,
             temperature=0.2,
             top_p=0.9,
-            # max_tokens=1024,
             tools=self.tool_registry.get_all_schemas(),
             response_format=llm_response_schema,
-            # extra_body={"enable_thinking": False,}
         )
         if response is None:
             raise Exception("OpenAI response is empty.")
-        # "stop", "length", "tool_calls", "content_filter"
-        # finish_reason = response.choices[0].finish_reason
         result = response.choices[0].message.content
-        # Only the deepseek-R1 series and Qwen/QwQ-32B models support reasoning_content. This part returns the reasoning content, which is at the same level as the content. In each round of the conversation, the model outputs the reasoning chain content (reasoning_content) and the final answer (content). In the next round of the conversation, the reasoning chain content from previous rounds will not be appended to the context.
-        # reasoning_content = response.choices[0].message.reasoning_content
-        tool_calls = response.choices[0].message.tool_calls # 目前测了NVIDIA的Qwen和Ds都不会返回tool calls
         # logger.info(f"===result: {result}")
         logger.info(
             f"消耗输入token：{response.usage.prompt_tokens}， \n消耗输出token：{response.usage.completion_tokens}, \n总消耗token：{response.usage.total_tokens}")
-        # Deepseek,minimax 等模型的think部分需要通过正则表达式去获取
-        # Qwen系列模型的think部分则是在reasoning_content字段中直接获取
-        # 如果后续需要适配多个供应商，需要写个适配器
         think_match = THINK_PATTERN.search(result)
         think_content = think_match.group(1).strip() if think_match else None
-        # logger.info(f"===think_content: {think_content}")
+        logger.info(f"===think_content: {think_content}")
         result = THINK_PATTERN.sub("", result).strip()
         return result
 
@@ -86,7 +76,6 @@ class Provider:
                 messages=messages,
                 temperature=0.2,
                 top_p=0.9,
-                max_tokens=768,
                 tools=self.tool_registry.get_all_schemas(),
                 response_format=llm_response_schema,
                 stream=True,
@@ -163,7 +152,6 @@ class Provider:
                     result += n
                     events = json_filter.feed(n)
                     for event_type, text in events:
-                        # logger.info(f"[LLM events text] {text}")
                         stream_kind = event_type
                         if event_type == "prompt":
                             # 这里是 action.prompt，即给用户的HITL提示词
@@ -177,7 +165,6 @@ class Provider:
                                           context.get("agent_id"),
                                           context.get("turn_id"),
                                           {"content": text})
-                            # logger.info(f"[WebSocket LLM answer] {text}")
                             await self.ws_manager.send(event.to_dict(), context.get("client_id"))
                 # stop：只发一次 END，并且 break（非常关键）
                 if finish_reason == "stop" and not ended:
