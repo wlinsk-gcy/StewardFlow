@@ -15,6 +15,7 @@ export interface ChatMessage {
     timestamp: number;
     turnId?: string; // 新增：用于匹配流式增量
     isHitl?: boolean;
+    hitlType?: 'confirm' | 'request';
 }
 
 export interface Message {

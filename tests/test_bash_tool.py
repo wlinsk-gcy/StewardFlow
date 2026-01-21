@@ -4,6 +4,14 @@ import subprocess
 from unittest.mock import patch, MagicMock
 from core.tools.bash import BashTool
 
+class AsyncTestBashTool(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tool = BashTool()
+
+    async def test_simple_cmd_v2(self):
+        command = "dir"
+        output = await self.tool.execute(command)
+        print(output)
 
 class TestBashTool(unittest.TestCase):
     def setUp(self):

@@ -39,22 +39,25 @@ You must treat it as ground truth.
 2. Do NOT plan multiple steps.
 3. Do NOT explain your reasoning outside the "thought" field.
 4. Do NOT output anything other than the required JSON.
-5. If required information is missing, you MUST use "request_input" or "request_confirm" and put the question in the "prompt" field.
+5. If required information is missing, you MUST use "request_input" and put the question in the "prompt" field.
 6. When the task is successfully completed or an ultimate conclusion is reached, you MUST use "finish" and put the final response in the "answer" field.
 
 # Output Format (Strict)
 - Always output a single JSON object with keys: "thought" and "action".
 - "thought" MUST be a string (can be empty).
 - "action" MUST be an object with key "type".
-- Valid action types: "tool", "request_input", "request_confirm", "finish".
+- Valid action types: "tool", "request_input", "finish".
 - If type is "tool": include "tool_name" (string) and "args" (object). Set "prompt" and "answer" to null.
 - If type is "request_input": include "prompt" (string). Set "tool_name", "args", "answer" to null.
-- If type is "request_confirm": include "prompt" (string). Set "tool_name", "args", "answer" to null.
 - If type is "finish": include "answer" (string). Set "tool_name", "args", "prompt" to null.
 - Never omit required keys. Use null explicitly when a field does not apply.
 
-# Example (tool)
-{"thought":"...","action":{"type":"tool","tool_name":"web_search","args":{"query":"..."},"prompt":null,"answer":null}}"""
+# Example
+- {"thought":"...","action":{"type":"finish","tool_name": null,"args": null,"prompt":null,"answer":"..."}},
+- {"thought":"...","action":{"type":"request_input","tool_name": null,"args": null,"prompt":"...","answer": null}},
+- {"thought":"...","action":{"type":"tool","tool_name":"web_search","args":{"query":"..."},"prompt":null,"answer":null}},
+- {"thought":"...","action":{"type":"tool","tool_name":"bash","args":{"command":"..."},"prompt":null,"answer":null}}
+"""
 
 
 def build_llm_messages(context: Dict[str, Any], system_prompt: str):
@@ -157,35 +160,6 @@ at the field level and must be strictly followed.
                                 "answer": {
                                     "type": "null",
                                     "description": "Must be null for request_input."
-                                }
-                            }
-                        },
-                        # request_confirm
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "required": ["type", "tool_name", "args", "prompt", "answer"],
-                            "properties": {
-                                "type": {
-                                    "type": "string",
-                                    "enum": ["request_confirm"],
-                                    "description": "Use when a user confirmation is required."
-                                },
-                                "tool_name": {
-                                    "type": "null",
-                                    "description": "Must be null for request_confirm."
-                                },
-                                "args": {
-                                    "type": "null",
-                                    "description": "Must be null for request_confirm."
-                                },
-                                "prompt": {
-                                    "type": "string",
-                                    "description": "Confirmation question for the user."
-                                },
-                                "answer": {
-                                    "type": "null",
-                                    "description": "Must be null for request_confirm."
                                 }
                             }
                         },

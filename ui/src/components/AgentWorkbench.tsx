@@ -46,6 +46,23 @@ type PendingConfirm = {
   turnId?: string;
 };
 
+function getConfirmCommand(pending: PendingConfirm | null): string | null {
+  if (!pending) return null;
+  const args = pending.args as { command?: unknown } | undefined;
+  if (pending.toolName === "bash" && typeof args?.command === "string") {
+    return args.command;
+  }
+  if (typeof pending.args === "string") return pending.args;
+  if (pending.args && typeof pending.args === "object") {
+    try {
+      return JSON.stringify(pending.args);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export const AgentWorkbench: React.FC = () => {
   const [goal, setGoal] = useState("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
@@ -138,7 +155,9 @@ export const AgentWorkbench: React.FC = () => {
             ...targetMsg,
             content: targetMsg.content + (data.content || ""),
             // 如果是 hitl_request，确保标记状态
-            isHitl: event_type.startsWith("hitl"),
+            isHitl: event_type.startsWith("hitl") ? true : targetMsg.isHitl,
+            hitlType:
+              event_type === "hitl_request" ? "request" : targetMsg.hitlType,
           };
           return newHistory;
         } else {
@@ -152,6 +171,7 @@ export const AgentWorkbench: React.FC = () => {
               timestamp: new Date(timestamp).getTime(),
               turnId: turn_id,
               isHitl: event_type.startsWith("hitl"),
+              hitlType: event_type === "hitl_request" ? "request" : undefined,
             },
           ];
         }
@@ -177,6 +197,7 @@ export const AgentWorkbench: React.FC = () => {
           timestamp: new Date(timestamp).getTime(),
           turnId: turn_id,
           isHitl: true,
+          hitlType: "confirm",
         },
       ]);
     }
@@ -214,7 +235,6 @@ export const AgentWorkbench: React.FC = () => {
     setChatHistory((prev) => [...prev, userMessage]);
     setPendingConfirm(null);
     setIsRunning(true);
-    setPendingConfirm(null);
 
     try {
       const response = await fetch("http://localhost:8000/agent/run", {
@@ -387,6 +407,36 @@ export const AgentWorkbench: React.FC = () => {
                     }`}
                   >
                     <MessageContent content={String(msg.content ?? "")} />
+                    {msg.role === "assistant" &&
+                      msg.hitlType === "confirm" &&
+                      pendingConfirm &&
+                      msg.turnId === pendingConfirm.turnId && (
+                        <div className="mt-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3 shadow-inner">
+                          <div className="flex items-center gap-2 text-[10px] font-black tracking-widest text-indigo-600 uppercase">
+                            <span className="h-1.5 w-1.5 rounded-full bg-indigo-500"></span>
+                            Bash Command Confirmation
+                          </div>
+                          {getConfirmCommand(pendingConfirm) && (
+                            <div className="mt-2 rounded-lg border border-slate-900 bg-slate-950 px-3 py-2 font-mono text-[11px] text-slate-100">
+                              $ {getConfirmCommand(pendingConfirm)}
+                            </div>
+                          )}
+                          <div className="mt-3 flex gap-2">
+                            <button
+                              onClick={() => handleConfirm("confirm")}
+                              className="rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-bold tracking-widest text-white uppercase hover:bg-emerald-700"
+                            >
+                              Approve
+                            </button>
+                            <button
+                              onClick={() => handleConfirm("reject")}
+                              className="rounded-lg bg-rose-600 px-3 py-2 text-[10px] font-bold tracking-widest text-white uppercase hover:bg-rose-700"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        </div>
+                      )}
                   </div>
                 </div>
               </div>
@@ -414,30 +464,6 @@ export const AgentWorkbench: React.FC = () => {
 
           {/* Chat Input */}
           <div className="border-t border-gray-100 bg-white p-6">
-            {pendingConfirm && (
-              <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm">
-                <div className="text-[10px] font-black tracking-widest text-amber-700 uppercase">
-                  Confirmation Required
-                </div>
-                <div className="mt-2 text-xs text-amber-900">
-                  {pendingConfirm.prompt}
-                </div>
-                <div className="mt-3 flex gap-2">
-                  <button
-                    onClick={() => handleConfirm("confirm")}
-                    className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold tracking-widest text-white uppercase hover:bg-emerald-700"
-                  >
-                    Confirm
-                  </button>
-                  <button
-                    onClick={() => handleConfirm("reject")}
-                    className="rounded-lg bg-rose-600 px-3 py-2 text-xs font-bold tracking-widest text-white uppercase hover:bg-rose-700"
-                  >
-                    Reject
-                  </button>
-                </div>
-              </div>
-            )}
             <div className="group relative">
               <div className="absolute -inset-1 rounded-2xl bg-gradient-to-r from-indigo-500 to-purple-500 opacity-10 blur transition duration-1000 group-focus-within:opacity-25"></div>
               <div className="relative overflow-hidden rounded-2xl border border-gray-200 bg-white transition-all focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-50">

@@ -1,151 +1,151 @@
-import re
-import json
+from pathlib import Path
+import os
 import platform
-import shutil
-import subprocess
-from typing import Optional, Tuple, List
+from typing import Optional
+import asyncio
+import sys
+import locale
+import codecs
+import signal
+import json
 
 from .tool import Tool
 
-UNIX_CMDS = {
-    "ls","cat","grep","awk","sed","cut","find","xargs","head","tail",
-    "cp","mv","rm","chmod","chown","which","ps","kill","tar","ssh"
-}
-
-WIN_HINT_CMDS = {
-    "dir","cd","ipconfig","tasklist","whoami","systeminfo","type","copy","move","del"
-}
-
-def needs_bash(command: str) -> bool:
-    s = command.strip()
-
-    # 明显的 bash 语法/路径/变量
-    bash_signals = [
-        "~/" , "/etc/", "/usr/", "/bin/", "/var/",
-        "$HOME", "$PATH", "${", "$(",
-        ">/dev/null", "2>&1", "&&", "||", "|", ";", "source ", ". ",
-        "chmod ", "chown ", "./", ".sh"
-    ]
-    if any(sig in s for sig in bash_signals):
-        return True
-
-    # 以 unix 命令开头
-    first = re.split(r"\s+", s, maxsplit=1)[0]
-    if first in UNIX_CMDS:
-        return True
-
-    return False
-
-def looks_like_windows_cmd(command: str) -> bool:
-    s = command.strip().lower()
-    first = re.split(r"\s+", s, maxsplit=1)[0]
-    return first in WIN_HINT_CMDS or s.startswith("powershell") or s.startswith("pwsh")
+DEFAULT_TIMEOUT_MS = int(os.getenv("BASH_DEFAULT_TIMEOUT_MS", str(2 * 60 * 1000)))
 
 
 
+
+class Instance:
+    # Change this to your sandbox dir
+    directory: str = str(Path.cwd())
+
+    @staticmethod
+    def contains_path(p: str) -> bool:
+        """
+        Whether path is inside sandbox root.
+        Replace with your real policy.
+        """
+        root = Path(Instance.directory).resolve()
+        try:
+            return root in Path(p).resolve().parents or Path(p).resolve() == root
+        except Exception:
+            return False
+
+def pick_stream_encoding() -> str:
+    # 非 Windows：绝大多数 shell 输出就是 UTF-8
+    if not sys.platform.startswith("win"):
+        return "utf-8"
+
+    # Windows：dir/cmd 内置命令通常走 OEM code page（比如 936）
+    try:
+        import ctypes
+        oem = ctypes.windll.kernel32.GetOEMCP()
+        return f"cp{oem}"
+    except Exception:
+        # 兜底：系统首选编码
+        return locale.getpreferredencoding(False) or "utf-8"
+
+async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """
+    Kill a process and its children (best-effort).
+    - POSIX: kill process group
+    - Windows: taskkill /T /F
+    """
+    if proc.returncode is not None:
+        return
+
+    sys = platform.system().lower()
+    try:
+        if sys != "windows":
+            # If we started the process in a new process group, killpg works.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                # fallback: kill only proc
+                proc.kill()
+        else:
+            # taskkill kills child processes with /T
+            await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(proc.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 class BashTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "bash"
+        os_name = platform.system()
         self.description = (
-            "Execute a bash command on the local machine. "
+            f"Execute a bash command on the local machine (os={os_name}). "
             "On Windows, runs cmd/PowerShell for Windows-native commands; "
-            "uses bash/WSL only when needed."
-            "Requires explicit user confirmation for every command."
+            "uses bash/WSL only when needed. "
         )
         self.requires_confirmation = True
 
-    def _resolve_bash(self, command: str) -> Tuple[Optional[List[str]], bool, str]:
-        """
-        :param command:
-        :return: cmd, uses_wsl, shell_kind
-        """
-        system = platform.system().lower()
-        if system == "windows":
-            # 1) 如果不像 bash 命令，直接走 Windows shell（更合理、更稳定）
-            if not needs_bash(command) and looks_like_windows_cmd(command):
-                # 用 cmd.exe 执行（支持内置命令 dir/cd 等）
-                return ["cmd.exe", "/c", command], False, "cmd"
+    async def execute(self, command: str, cwd: Optional[str] = None, **kwargs) -> str:
+        cwd = cwd or Instance.directory
+        timeout_ms = DEFAULT_TIMEOUT_MS
 
-            # 2) 需要 bash：优先找 Git Bash / MSYS bash
-            bash_path = shutil.which("bash")
-            if bash_path:
-                return [bash_path, "-lc", command], False, "bash"
-
-            # 3) 没有本地 bash 就走 WSL
-            wsl_path = shutil.which("wsl")
-            if wsl_path:
-                return [wsl_path, "bash", "-lc", command], True, "wsl"
-
-            # 4) 既不是明显 Windows 命令，又没 bash/wsl：给出缺失
-            return None, False, "missing"
-
-            # 非 Windows：直接 bash
-        bash_path = shutil.which("bash") or "/bin/bash"
-        return [bash_path, "-lc", command], False, "bash"
-
-    def execute(self, command: str, cwd: Optional[str] = None, timeout_sec: Optional[int] = 60, **kwargs) -> str:
-        cmd, uses_wsl, shell_kind = self._resolve_bash(command)
-        if not cmd:
-            raise RuntimeError(
-                "bash_unavailable: No bash/wsl found for a bash-like command. "
-                "Install Git Bash or enable WSL, or use a Windows-native command."
-            )
-
-        if uses_wsl and cwd:
-            raise RuntimeError("cwd is not supported when running via WSL in this tool.")
+        sys = platform.system().lower()
+        preexec_fn = os.setsid if sys != "windows" else None
 
         try:
-            completed = subprocess.run(
-                cmd,
+            proc = await asyncio.create_subprocess_shell(
+                command,
                 cwd=cwd,
-                capture_output=True,
-                text=False,
-                timeout=timeout_sec,
-                check=False
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=preexec_fn,  # type: ignore[arg-type]
             )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Command timed out after {timeout_sec} seconds.")
         except Exception as e:
-            raise RuntimeError(f"Failed to execute bash command: {str(e)}")
+            print(str(e))
+            raise e
+        output = ""
+        timed_out = False
+        async def read_stream(stream: Optional[asyncio.StreamReader], encoding: str) -> None:
+            nonlocal output
+            if stream is None:
+                return
 
-        stdout_text, stderr_text = self._decode_output(completed.stdout, completed.stderr, shell_kind)
-        result = {
-            "platform": platform.system(),
-            "shell": shell_kind,
-            "exit_code": completed.returncode,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-        }
-        return json.dumps(result, ensure_ascii=False)
+            decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                output += decoder.decode(chunk)
+            # flush 可能残留的半个字符
+            output += decoder.decode(b"", final=True)
 
-    def _decode_bytes_smart(self, data: bytes, encodings: list[str]) -> str:
-        if not data:
-            return ""
-        for enc in encodings:
-            try:
-                return data.decode(enc)
-            except UnicodeDecodeError:
-                continue
-        # 最后兜底：不报错，替换非法字符
-        return data.decode(encodings[0], errors="replace")
+        enc = pick_stream_encoding()
+        # Concurrent stdout/stderr
+        out_task = asyncio.create_task(read_stream(proc.stdout,enc))
+        err_task = asyncio.create_task(read_stream(proc.stderr,enc))
 
-    def _decode_output(self, stdout: bytes, stderr: bytes, shell_kind: str):
-        if shell_kind == "wsl":
-            # wsl 常见：utf-16le（有时也可能 utf-8）
-            encs = ["utf-16le", "utf-8", "gbk"]
-        elif shell_kind == "cmd":
-            # cmd 常见：gbk，但有时是 utf-8（chcp 65001）
-            encs = ["gbk", "utf-8", "utf-16le"]
-        else:
-            # bash 通常 utf-8
-            encs = ["utf-8", "gbk", "utf-16le"]
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            timed_out = True
+            await kill_process_tree(proc)
+        finally:
+            # ensure streams drained
+            await asyncio.gather(out_task, err_task, return_exceptions=True)
+        err_msg = ""
+        if timed_out:
+            err_msg = f"bash tool terminated command after exceeding timeout {timeout_ms} ms"
 
-        return (
-            self._decode_bytes_smart(stdout, encs),
-            self._decode_bytes_smart(stderr, encs),
-        )
+        return json.dumps({"output": output, "error": err_msg})
 
     def schema(self) -> dict:
         return {
@@ -163,10 +163,6 @@ class BashTool(Tool):
                         "cwd": {
                             "type": "string",
                             "description": "Optional working directory for the command."
-                        },
-                        "timeout_sec": {
-                            "type": "integer",
-                            "description": "Optional timeout in seconds."
                         }
                     },
                     "required": ["command"],

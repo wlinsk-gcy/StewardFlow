@@ -21,7 +21,7 @@ class Tool:
         raise NotImplementedError
 
     @abstractmethod
-    def execute(self, **kwargs) -> str:
+    async def execute(self, **kwargs) -> str:
         raise NotImplementedError
 
 

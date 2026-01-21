@@ -2,6 +2,10 @@
 FastAPI ReAct + HITL Agent MVP
 入口文件
 """
+import sys
+import asyncio
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 import logging
 import yaml
 from contextlib import asynccontextmanager
@@ -12,7 +16,6 @@ from utils.id_util import get_sonyflake
 from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
-from core.tools.web_search import WebSearch
 from core.tools.bash import BashTool
 
 from core.services.agent_service import AgentService
@@ -51,13 +54,19 @@ def init_load_tools(tools_config: dict):
     registry = ToolRegistry()
     search_config = tools_config.get("web_search")
     if search_config:
+        from core.tools.web_search_use_serpapi import WebSearch
         registry.register(WebSearch(search_config.get("api_key"), search_config.get("paywall_keywords")))
+    else:
+        from core.tools.web_search_use_exa import WebSearch
+        registry.register(WebSearch())
     registry.register(BashTool())
     return registry
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    loop = asyncio.get_running_loop()
+    logger.info(f"asyncio loop: {type(loop)}")
     # ===== startup =====
     ws_manager = ConnectionManager() # ws管理器
     checkpoint = CheckpointStore() # AgentState快照储存器
@@ -168,6 +177,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=port,
-        reload=True,  # 热重载
         log_level=log_level
     )
