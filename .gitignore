@@ -4,3 +4,4 @@ __pycache__/
 nul
 
 config.yaml
+mcp_config.json

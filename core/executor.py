@@ -2,6 +2,7 @@
 ReAct 执行引擎
 实现 Thought → Action → Observation 的循环逻辑
 """
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -16,6 +17,7 @@ from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from context import agent_id_ctx
 from utils.id_util import get_sonyflake
+from utils.screenshot_util import wait_and_emit_screenshot_event
 from .extractor import extract_json, normalize_llm_dict
 from ws.connection_manager import ConnectionManager
 
@@ -291,6 +293,8 @@ class AgentExecutor:
         """执行 Tool"""
         tool_name = self.agent.pending.action.tool_name
         args = self.agent.pending.action.args
+        screenshot_tool = None
+        screenshot_path = None
 
         logger.debug(f"[EXECUTING] Action: tool")
         logger.debug(f"Tool: {tool_name}")
@@ -305,8 +309,24 @@ class AgentExecutor:
                 success=False,
                 error=f"Tool not found: {tool_name}"
             )
+        if tool.name.startswith("chrome-devtools"):
+            screenshot_tool = self.tool_registry.get("chrome-devtools.take_screenshot")
+            screenshot_path = f"./.screenshots/{self.agent.agent_id}_screenshot.png"
         try:
             execute_result = await tool.execute(**args)
+            if screenshot_tool:
+                screenshot_result = await screenshot_tool.execute(filePath=screenshot_path)
+                if self._is_tool_response_success(screenshot_result):
+                    asyncio.create_task(
+                        wait_and_emit_screenshot_event(
+                            self.ws_manager,
+                            client_id=self.agent.client_id,
+                            agent_id=self.agent.agent_id,
+                            turn_id=turn_id,
+                            img_path=screenshot_path,
+                            timeout_s=10.0,
+                        )
+                    )
             return Observation(
                 role="tool",
                 content=execute_result,
@@ -321,6 +341,23 @@ class AgentExecutor:
                 success=False,
                 error=f"Tool '{tool_name}' executed error: {str(e)}"
             )
+
+    
+    def _is_tool_response_success(self, response: Optional[str]) -> bool:
+        if response is None:
+            return True
+        try:
+            parsed = json.loads(response)
+        except (TypeError, json.JSONDecodeError):
+            return True
+        if isinstance(parsed, dict):
+            if "success" in parsed:
+                return bool(parsed["success"])
+            if "ok" in parsed:
+                return bool(parsed["ok"])
+            if "error" in parsed and parsed["error"]:
+                return False
+        return True
 
     def _execute_request_input(self, turn_id: str, action: Action):
         """执行请求输入（HITL）"""

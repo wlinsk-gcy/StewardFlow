@@ -71,12 +71,17 @@ def build_llm_messages(context: Dict[str, Any], system_prompt: str):
     # TODO 后续缩短tao历史记录，进行摘要生成
     # 将历史轨迹单独加入 messages
     for traj in tao_trajectory:
-        messages.append({"role": "assistant", "content": json.dumps(traj["action"], ensure_ascii=False)})
+
+        messages.append({"role": "assistant", "content": json.dumps({"thought": traj["thought"]["content"],"action": traj["action"]}, ensure_ascii=False)})
         # 非常重要：Observation 一定要用 user role
         # 因为这是“环境反馈”，不是 Agent 自言自语。
         # messages.append({"role": traj["observation"]["role"], "content": traj["observation"]["content"]})
         # QWEN系列不支持role为tool的情况下，没有tool call id，可是模型没有返回tool call记录，所以只能用user
-        messages.append({"role": "user", "content": traj["observation"]["content"]})
+        if traj["observation"]["role"] == "tool":
+            content = "工具执行结果：" + traj["observation"]["content"]
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": traj["observation"]["content"]})
 
     logger.info(f"===messages: {messages}")
     return messages

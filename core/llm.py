@@ -50,6 +50,7 @@ class Provider:
             f"消耗输入token：{response.usage.prompt_tokens}， \n消耗输出token：{response.usage.completion_tokens}, \n总消耗token：{response.usage.total_tokens}")
         think_match = THINK_PATTERN.search(result)
         think_content = think_match.group(1).strip() if think_match else None
+
         logger.info(f"===think_content: {think_content}")
         result = THINK_PATTERN.sub("", result).strip()
         return result

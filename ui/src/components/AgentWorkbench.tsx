@@ -85,46 +85,29 @@ export const AgentWorkbench: React.FC = () => {
   const traceScrollRef = useRef<HTMLDivElement>(null);
 
   // --- 新增：初始化 WebSocket ---
-  useEffect(() => {
-    const socket = new WebSocket(`ws://localhost:8000/ws/${clientId}`);
-
-    socket.onopen = () => console.log("Connected to WS:", clientId);
-
-    socket.onmessage = (event) => {
-      const serverEvent = JSON.parse(event.data);
-      handleIncomingEvent(serverEvent);
-    };
-
-    socket.onclose = () => console.log("WS Disconnected");
-    socketRef.current = socket;
-
-    return () => socket.close();
-  }, [clientId]);
-
-  useEffect(() => {
-    if (chatScrollRef.current) {
-      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
-    }
-  }, [chatHistory, isRunning]);
-
-  useEffect(() => {
-    if (traceScrollRef.current) {
-      traceScrollRef.current.scrollTop = traceScrollRef.current.scrollHeight;
-    }
-  }, [steps]);
-
-  // --- 新增：事件分流处理器 ---
   const handleIncomingEvent = useCallback((event: any) => {
     const { event_type, data, timestamp, turn_id } = event;
     // console.log('incoming event', event);
+    if (event_type === "screenshot") {
+      console.log("[ws] screenshot event", data);
+      if (data?.content) {
+        setCurrentScreenshot(data.content);
+        setActiveTab("browser");
+      }
+      return;
+    }
 
     // 1. 处理执行日志 (Execution Trace)
     // 日志通常不需要流式输出，直接追加到 steps 数组即可
     if (["thought", "action", "observation", "final"].includes(event_type)) {
       // console.log('receive execute trace', event);
+      const MAX_LEN = 500;
+      const rawContent = data.content ?? "";
+      const content =
+        rawContent.length > MAX_LEN ? rawContent.slice(0, MAX_LEN) + "..." : rawContent;
       const newStep: AgentStep = {
         type: event_type,
-        content: data.content || "",
+        content: content,
         tool: data.tool_name,
         toolInput: data.args,
         timestamp: timestamp,
@@ -222,6 +205,70 @@ export const AgentWorkbench: React.FC = () => {
     // }
   }, []);
 
+  useEffect(() => {
+    let closedByUser = false;
+    let retryCount = 0;
+    let retryTimer: number | undefined;
+
+    const connect = () => {
+      const socket = new WebSocket(`ws://localhost:8000/ws/${clientId}`);
+      socketRef.current = socket;
+
+      socket.onopen = () => {
+        retryCount = 0;
+        console.log("Connected to WS:", clientId);
+      };
+
+      socket.onmessage = (event) => {
+        const serverEvent = JSON.parse(event.data);
+        handleIncomingEvent(serverEvent);
+      };
+
+      socket.onerror = () => {
+        // Error ????? close?????????????
+        try {
+          socket.close();
+        } catch {
+          // ignore
+        }
+      };
+
+      socket.onclose = () => {
+        console.log("WS Disconnected");
+        if (closedByUser) return;
+        const delay = Math.min(1000 * 2 ** retryCount, 10000);
+        retryCount += 1;
+        retryTimer = window.setTimeout(connect, delay);
+        console.log(`[ws] reconnect in ${delay}ms`);
+      };
+    };
+
+    connect();
+
+    return () => {
+      closedByUser = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+      }
+      if (socketRef.current && socketRef.current.readyState <= 1) {
+        socketRef.current.close();
+      }
+    };
+  }, [clientId, handleIncomingEvent]);
+
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatHistory, isRunning]);
+
+  useEffect(() => {
+    if (traceScrollRef.current) {
+      traceScrollRef.current.scrollTop = traceScrollRef.current.scrollHeight;
+    }
+  }, [steps]);
+
+  // --- 新增：事件分流处理器 ---
   const handleConfirm = async (decision: "confirm" | "reject") => {
     if (!agentId || isRunning) return;
 
@@ -331,7 +378,7 @@ export const AgentWorkbench: React.FC = () => {
             <Cpu className="h-5 w-5 text-white" />
           </div>
           <div>
-            <h2 className="font-bold text-gray-900">ReAct Agent Studio</h2>
+            <h2 className="font-bold text-gray-900">Steward Flow</h2>
             <div className="mt-0.5 flex items-center gap-2">
               <span className="flex h-2 w-2 rounded-full bg-green-500"></span>
               <p className="text-[10px] font-bold tracking-widest text-gray-500 uppercase">

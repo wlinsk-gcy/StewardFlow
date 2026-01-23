@@ -9,14 +9,18 @@ if sys.platform.startswith("win"):
 import logging
 import yaml
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from context import request_id_ctx, agent_id_ctx
+
 from utils.id_util import get_sonyflake
+from utils.screenshot_util import clean_screenshot
 from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
 from core.tools.bash import BashTool
+from core.mcp.client import MCPClient
 
 from core.services.agent_service import AgentService
 from api.routes import router as agent_router
@@ -50,9 +54,9 @@ logger.handlers.clear()
 logger.addHandler(handler)
 
 
-def init_load_tools(tools_config: dict):
+def init_load_tools(tools_config: dict | None = None):
     registry = ToolRegistry()
-    search_config = tools_config.get("web_search")
+    search_config = tools_config.get("web_search") if tools_config else None
     if search_config:
         from core.tools.web_search_use_serpapi import WebSearch
         registry.register(WebSearch(search_config.get("api_key"), search_config.get("paywall_keywords")))
@@ -65,12 +69,12 @@ def init_load_tools(tools_config: dict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    loop = asyncio.get_running_loop()
-    logger.info(f"asyncio loop: {type(loop)}")
     # ===== startup =====
     ws_manager = ConnectionManager() # ws管理器
     checkpoint = CheckpointStore() # AgentState快照储存器
     tool_registry = init_load_tools(config.get("tools")) # 工具管理器
+    mcp_client = MCPClient(config = "./mcp_config.json")
+    await mcp_client.initialize(tool_registry)
     llm_config = config.get("llm")
     provider = Provider(llm_config.get("model"),
                         llm_config.get("api_key"),
@@ -89,9 +93,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # ===== shutdown =====
-    # 如果有需要释放的资源（线程池、连接池）
-    # await agent_service.close()
-    # await storage.close()
+    await mcp_client.close_all_sessions()
+    clean_screenshot()
 
 
 # 创建 FastAPI 应用
@@ -122,7 +125,6 @@ async def request_id_middleware(request: Request, call_next):
         return response
     finally:
         request_id_ctx.reset(token)
-
 
 # 注册路由
 app.include_router(agent_router)

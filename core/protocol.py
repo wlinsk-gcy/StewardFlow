@@ -52,6 +52,7 @@ class EventType(str, Enum):
     ACTION = "action"             # execution trace - 展示行为动作
     OBSERVATION = "observation"   # execution trace - 展示执行结果
     FINAL = "final"               # execution trace - 展示最终回复
+    SCREENSHOT = "screenshot"     # browser view - base64 screenshot
 
     HITL_REQUEST = "hitl_request" # 当需要HITL用户输入时，向用户输出的提示词
     HITL_CONFIRM = "hitl_confirm" # 当需要HITL用户确认时

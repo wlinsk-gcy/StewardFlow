@@ -1,0 +1,463 @@
+import logging
+import warnings
+from abc import ABC, abstractmethod
+from datetime import timedelta
+from typing import Any
+
+from mcp import ClientSession, Implementation
+from mcp.client.session import (
+    ElicitationFnT,
+    ListRootsFnT,
+    LoggingFnT,
+    MessageHandlerFnT,
+    SamplingFnT,
+)
+from mcp.shared.context import RequestContext
+from mcp.shared.exceptions import McpError
+from mcp.types import (
+    CallToolResult,
+    ErrorData,
+    GetPromptResult,
+    InitializeResult,
+    ListRootsResult,
+    Prompt,
+    PromptListChangedNotification,
+    ReadResourceResult,
+    Resource,
+    ResourceListChangedNotification,
+    Root,
+    ServerCapabilities,
+    ServerNotification,
+    Tool,
+    ToolListChangedNotification,
+)
+from pydantic import AnyUrl
+
+from core.mcp.manager.base import ConnectionManager
+
+logger = logging.getLogger(__name__)
+
+
+class BaseConnector(ABC):
+    """Base class for MCP connectors.
+
+    This class defines the interface that all MCP connectors must implement.
+    """
+
+    def __init__(
+        self,
+        sampling_callback: SamplingFnT | None = None,
+        elicitation_callback: ElicitationFnT | None = None,
+        message_handler: MessageHandlerFnT | None = None,
+        logging_callback: LoggingFnT | None = None,
+        roots: list[Root] | None = None,
+        list_roots_callback: ListRootsFnT | None = None,
+    ):
+        """Initialize base connector with common attributes.
+
+        Args:
+            sampling_callback: Optional callback to handle sampling requests from servers.
+            elicitation_callback: Optional callback to handle elicitation requests from servers.
+            message_handler: Optional callback to handle messages from servers.
+            logging_callback: Optional callback to handle log messages from servers.
+            middleware: Optional list of middleware to apply to requests.
+            roots: Optional initial list of roots to advertise to the server.
+                Roots represent directories or files that the client has access to.
+            list_roots_callback: Optional custom callback to handle roots/list requests.
+                If provided, this takes precedence over the default behavior.
+                If not provided, the connector will use an internal callback that returns
+                the roots set via the `roots` parameter or `set_roots()` method.
+        """
+        self.client_session: ClientSession | None = None
+        self._connection_manager: ConnectionManager | None = None
+        self._tools: list[Tool] | None = None
+        self._resources: list[Resource] | None = None
+        self._prompts: list[Prompt] | None = None
+        self._connected = False
+        self._initialized = False  # Track if client_session.initialize() has been called
+        self.auto_reconnect = True  # Whether to automatically reconnect on connection loss (not configurable for now)
+        self.sampling_callback = sampling_callback
+        self.elicitation_callback = elicitation_callback
+        self.message_handler = message_handler
+        self.logging_callback = logging_callback
+        self.capabilities: ServerCapabilities | None = None
+
+        # Roots support - always advertise roots capability
+        self._roots: list[Root] = roots or []
+        self._user_list_roots_callback = list_roots_callback
+
+    async def _internal_list_roots_callback(
+            self,
+            context: RequestContext[ClientSession, Any, Any],
+    ) -> ListRootsResult | ErrorData:
+        """Internal callback to handle roots/list requests from the server.
+
+        If a user-provided callback exists, it will be used instead.
+        Otherwise, returns the cached roots list.
+        """
+        if self._user_list_roots_callback:
+            return await self._user_list_roots_callback(context)
+
+        logger.debug(f"Server requested roots list, returning {len(self._roots)} root(s)")
+        return ListRootsResult(roots=self._roots)
+
+    @property
+    def list_roots_callback(self) -> ListRootsFnT:
+        """Get the list_roots_callback to pass to ClientSession.
+
+        This always returns a callback to ensure the roots capability is advertised.
+        """
+        return self._internal_list_roots_callback
+
+    def get_roots(self) -> list[Root]:
+        """Get the current list of roots.
+
+        Returns:
+            A copy of the current roots list.
+        """
+        return list(self._roots)
+
+    async def set_roots(self, roots: list[Root]) -> None:
+        """Set the roots and notify the server if connected.
+
+        Roots represent directories or files that the client has access to.
+
+        Args:
+            roots: Array of Root objects with `uri` (must start with "file://") and optional `name`.
+
+        Example:
+            ```python
+            await connector.set_roots([
+                Root(uri="file:///home/user/project", name="My Project"),
+                Root(uri="file:///home/user/data"),
+            ])
+            ```
+        """
+        self._roots = list(roots)
+        if self.client_session and self._connected:
+            logger.debug(f"Sending roots/list_changed notification with {len(roots)} root(s)")
+            await self.client_session.send_roots_list_changed()
+
+    async def _internal_message_handler(self, message: Any) -> None:
+        """Wrap the user-provided message handler."""
+        if isinstance(message, ServerNotification):
+            if isinstance(message.root, ToolListChangedNotification):
+                logger.debug("Received tool list changed notification")
+            elif isinstance(message.root, ResourceListChangedNotification):
+                logger.debug("Received resource list changed notification")
+            elif isinstance(message.root, PromptListChangedNotification):
+                logger.debug("Received prompt list changed notification")
+
+        # Call the user's handler
+        if self.message_handler:
+            await self.message_handler(message)
+
+    @abstractmethod
+    async def connect(self) -> None:
+        """Establish a connection to the MCP implementation."""
+        pass
+
+    @property
+    @abstractmethod
+    def public_identifier(self) -> str:
+        """Get the identifier for the connector."""
+        pass
+
+    async def disconnect(self) -> None:
+        """Close the connection to the MCP implementation."""
+        if not self._connected:
+            logger.debug("Not connected to MCP implementation")
+            return
+
+        logger.debug("Disconnecting from MCP implementation")
+        await self._cleanup_resources()
+        self._connected = False
+        logger.debug("Disconnected from MCP implementation")
+
+    async def _cleanup_resources(self) -> None:
+        """Clean up all resources associated with this connector."""
+        errors = []
+
+        # First stop the connection manager, this closes the ClientSession inside
+        # the same task where it was opened, avoiding cancel-scope mismatches.
+        # We only need client sessions' manual exit for connectors that never
+        # had a _connection_manager. Without this variable we would always have
+        # the client session exit called causing in RuntimeError raised.
+        manager_existed = self._connection_manager is not None
+        if self._connection_manager:
+            try:
+                logger.debug("Stopping connection manager")
+                await self._connection_manager.stop()
+            except Exception as e:
+                error_msg = f"Error stopping connection manager: {e}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+            finally:
+                self._connection_manager = None
+
+        # Ensure the client_session reference is cleared (it should already be
+        # closed by the connection manager). Only attempt a direct __aexit__ if
+        # the connection manager did *not* exist, this covers edge-cases like
+        # failed connections where no manager was started.
+        if self.client_session:
+            try:
+                if not manager_existed:
+                    logger.debug("Closing client session (no connection manager)")
+                    await self.client_session.__aexit__(None, None, None)
+            except Exception as e:
+                error_msg = f"Error closing client session: {e}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+            finally:
+                self.client_session = None
+
+        # Reset tools
+        self._tools = None
+        self._resources = None
+        self._prompts = None
+        self._initialized = False  # Reset initialization flag
+
+        if errors:
+            logger.warning(f"Encountered {len(errors)} errors during resource cleanup")
+
+    async def initialize(self) -> InitializeResult | None:
+        """Initialize the MCP session and return session information."""
+        if not self.client_session:
+            raise RuntimeError("MCP client is not connected")
+
+        # Check if already initialized
+        if self._initialized:
+            return None
+
+        # Initialize the session
+        result = await self.client_session.initialize()
+        self._initialized = True  # Mark as initialized
+
+        self.capabilities = result.capabilities
+
+        if self.capabilities.tools:
+            # Get available tools directly from client session
+            try:
+                tools_result = await self.client_session.list_tools()
+                self._tools = tools_result.tools if tools_result else []
+            except Exception as e:
+                logger.error(f"Error listing tools for connector {self.public_identifier}: {e}")
+                self._tools = []
+        else:
+            self._tools = []
+
+        if self.capabilities.resources:
+            # Get available resources directly from client session
+            try:
+                resources_result = await self.client_session.list_resources()
+                self._resources = resources_result.resources if resources_result else []
+            except Exception as e:
+                logger.error(f"Error listing resources for connector {self.public_identifier}: {e}")
+                self._resources = []
+        else:
+            self._resources = []
+
+        if self.capabilities.prompts:
+            # Get available prompts directly from client session
+            try:
+                prompts_result = await self.client_session.list_prompts()
+                self._prompts = prompts_result.prompts if prompts_result else []
+            except Exception as e:
+                logger.error(f"Error listing prompts for connector {self.public_identifier}: {e}")
+                self._prompts = []
+        else:
+            self._prompts = []
+
+        logger.debug(
+            f"MCP session initialized with {len(self._tools)} tools, "
+            f"{len(self._resources)} resources, "
+            f"and {len(self._prompts)} prompts"
+        )
+
+        return result
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if the connector is actually connected and the connection is alive.
+
+        This property checks not only the connected flag but also verifies that
+        the underlying connection manager and streams are still active.
+
+        Returns:
+            True if the connector is connected and the connection is alive, False otherwise.
+        """
+
+        # Check if we have a client session
+        if not self.client_session:
+            # Update the connected flag since we don't have a client session
+            self._connected = False
+            return False
+
+        # First check the basic connected flag
+        if not self._connected:
+            return False
+
+        # Check if we have a connection manager and if its task is still running
+        if self._connection_manager:
+            try:
+                # Check if the connection manager task is done (indicates disconnection)
+                if hasattr(self._connection_manager, "_task") and self._connection_manager._task:
+                    if self._connection_manager._task.done():
+                        logger.debug("Connection manager task is done, marking as disconnected")
+                        self._connected = False
+                        return False
+
+                # For HTTP-based connectors, also check if streams are still open
+                # Use the get_streams method to get the current connection
+                streams = self._connection_manager.get_streams()
+                if streams:
+                    # Connection should be a tuple of (read_stream, write_stream)
+                    if isinstance(streams, tuple) and len(streams) == 2:
+                        read_stream, write_stream = streams
+                        # Check if streams are closed using getattr with default value
+                        if getattr(read_stream, "_closed", False):
+                            logger.debug("Read stream is closed, marking as disconnected")
+                            self._connected = False
+                            return False
+                        if getattr(write_stream, "_closed", False):
+                            logger.debug("Write stream is closed, marking as disconnected")
+                            self._connected = False
+                            return False
+
+            except Exception as e:
+                # If we can't check the connection state, assume disconnected for safety
+                logger.debug(f"Error checking connection state: {e}, marking as disconnected")
+                self._connected = False
+                return False
+
+        return True
+
+    async def _ensure_connected(self) -> None:
+        """Ensure the connector is connected, reconnecting if necessary.
+
+        Raises:
+            RuntimeError: If connection cannot be established and auto_reconnect is False.
+        """
+        if not self.client_session:
+            raise RuntimeError("MCP client is not connected")
+
+        if not self.is_connected:
+            if self.auto_reconnect:
+                logger.debug("Connection lost, attempting to reconnect...")
+                try:
+                    await self.connect()
+                    logger.debug("Reconnection successful")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to reconnect to MCP server: {e}") from e
+            else:
+                raise RuntimeError(
+                    "Connection to MCP server has been lost. Auto-reconnection is disabled. Please reconnect manually."
+                )
+
+    async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, Any],
+            read_timeout_seconds: timedelta | None = None,
+    ) -> CallToolResult:
+        """Call an MCP tool with automatic reconnection handling.
+
+        Args:
+            name: The name of the tool to call.
+            arguments: The arguments to pass to the tool.
+            read_timeout_seconds: timeout seconds when calling tool
+
+        Returns:
+            The result of the tool call.
+
+        Raises:
+            RuntimeError: If the connection is lost and cannot be reestablished.
+        """
+
+        # Ensure we're connected
+        await self._ensure_connected()
+
+        logger.debug(f"Calling tool '{name}' with arguments: {arguments}")
+        try:
+            result = await self.client_session.call_tool(name, arguments, read_timeout_seconds)
+            logger.debug(f"Tool '{name}' called with result: {result}")
+            return result
+        except Exception as e:
+            # Check if the error might be due to connection loss
+            if not self.is_connected:
+                raise RuntimeError(f"Tool call '{name}' failed due to connection loss: {e}") from e
+            else:
+                # Re-raise the original error if it's not connection-related
+                raise
+
+    async def list_tools(self) -> list[Tool]:
+        """List all available tools from the MCP implementation."""
+
+        if self.capabilities and not self.capabilities.tools:
+            logger.debug(f"Server {self.public_identifier} does not support tools")
+            return []
+
+        # Ensure we're connected
+        await self._ensure_connected()
+
+        logger.debug("Listing tools")
+        try:
+            result = await self.client_session.list_tools()
+            self._tools = result.tools
+            return result.tools
+        except McpError as e:
+            logger.error(f"Error listing tools for connector {self.public_identifier}: {e}")
+            return []
+
+    async def list_resources(self) -> list[Resource]:
+        """List all available resources from the MCP implementation."""
+
+        if self.capabilities and not self.capabilities.resources:
+            logger.debug(f"Server {self.public_identifier} does not support resources")
+            return []
+
+        # Ensure we're connected
+        await self._ensure_connected()
+
+        logger.debug("Listing resources")
+        try:
+            result = await self.client_session.list_resources()
+            self._resources = result.resources
+            return result.resources
+        except McpError as e:
+            logger.warning(f"Error listing resources for connector {self.public_identifier}: {e}")
+            return []
+
+    async def read_resource(self, uri: AnyUrl) -> ReadResourceResult:
+        """Read a resource by URI."""
+        await self._ensure_connected()
+
+        logger.debug(f"Reading resource: {uri}")
+        result = await self.client_session.read_resource(uri)
+        return result
+
+    async def list_prompts(self) -> list[Prompt]:
+        """List all available prompts from the MCP implementation."""
+
+        if self.capabilities and not self.capabilities.prompts:
+            logger.debug(f"Server {self.public_identifier} does not support prompts")
+            return []
+
+        await self._ensure_connected()
+
+        logger.debug("Listing prompts")
+        try:
+            result = await self.client_session.list_prompts()
+            self._prompts = result.prompts
+            return result.prompts
+        except McpError as e:
+            logger.error(f"Error listing prompts for connector {self.public_identifier}: {e}")
+            return []
+
+    async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> GetPromptResult:
+        """Get a prompt by name."""
+        await self._ensure_connected()
+
+        logger.debug(f"Getting prompt: {name}")
+        result = await self.client_session.get_prompt(name, arguments)
+        return result
