@@ -14,6 +14,7 @@ from core.executor import AgentExecutor
 from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from ws.connection_manager import ConnectionManager
+from core.protocol import Observation
 
 
 class AgentService:
@@ -46,29 +47,40 @@ class AgentService:
 
         return agent
 
-    async def execute_agent(self, agent_id: str):
+    async def execute_agent(self, agent_id: str, observation: Optional[str] = None):
         agent = self.checkpoint.load(agent_id) # 获取checkpoint
         if not agent:
             raise ValueError(f"Agent not found: {agent_id}")
 
-        if agent.status != AgentStatus.IDLE:
-            raise ValueError(f"Agent is not idle: {agent.status.value}")
-
-        # 创建 Executor
-        executor = AgentExecutor(
-            llm=self.provider,
-            tool_registry=self.tool_registry,
-            agent_state=agent,
-            checkpoint=self.checkpoint,
-            ws_manager=self.ws_manager,
-            verbose=True
-        )
-
-        # 存储 Executor
-        # TODO 如果使用asyncio.create_task，需要确保executor被完全释放并GC，否则会导致协程任务堆积，内存泄露
-        async with self._executor_lock:
-            self._executors[agent_id] = executor
-
+        if agent.status == AgentStatus.IDLE:
+            # 创建 Executor
+            executor = AgentExecutor(
+                llm=self.provider,
+                tool_registry=self.tool_registry,
+                agent_state=agent,
+                checkpoint=self.checkpoint,
+                ws_manager=self.ws_manager,
+                verbose=True
+            )
+            # 存储 Executor
+            # TODO 如果使用asyncio.create_task，需要确保executor被完全释放并GC，否则会导致协程任务堆积，内存泄露
+            async with self._executor_lock:
+                self._executors[agent_id] = executor
+        elif (agent.status == AgentStatus.DONE
+              and agent.current_node == NodeType.END
+              and observation is not None
+              and agent.pending):
+            executor = self._executors.get(agent_id)
+            executor.agent.current_node = NodeType.OBSERVE
+            observation = Observation(
+                content=observation,
+                turn_id=executor.agent.pending.thought.turn_id,
+                success=True
+            )
+            executor.append_tao_trajectory(observation)
+            executor.checkpoint.save(executor.agent)
+        else:
+            raise ValueError(f"Agent {agent_id} has status {agent.status}")
         # 执行
         try:
             await executor.run()

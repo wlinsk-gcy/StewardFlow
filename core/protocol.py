@@ -53,6 +53,7 @@ class EventType(str, Enum):
     OBSERVATION = "observation"   # execution trace - 展示执行结果
     FINAL = "final"               # execution trace - 展示最终回复
     SCREENSHOT = "screenshot"     # browser view - base64 screenshot
+    TOKEN_INFO = "token_info"     # token消耗详情
 
     HITL_REQUEST = "hitl_request" # 当需要HITL用户输入时，向用户输出的提示词
     HITL_CONFIRM = "hitl_confirm" # 当需要HITL用户确认时
@@ -250,7 +251,6 @@ class AgentState:
 
     # ========== 任务上下文 ==========
     task: str = "" # 当前任务描述
-    scenario: Optional[List[Dict[str, Any]]] = None # 预设场景
 
     max_turns: int = 50  # 最大轮次限制
     current_turn: int = 0  # 当前轮次
@@ -284,6 +284,8 @@ class AgentState:
     finished_at: Optional[datetime] = None
     error_message: Optional[str] = None
 
+    token_info: Optional[Dict[str, Any]] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """转换为字典（用于 API 响应）"""
         return {
@@ -301,5 +303,6 @@ class AgentState:
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
-            "error_message": self.error_message
+            "error_message": self.error_message,
+            "token_info": self.token_info,
         }

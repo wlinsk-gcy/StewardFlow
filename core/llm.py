@@ -32,7 +32,7 @@ class Provider:
         self.system_prompt = build_system_prompt()
         self.ws_manager = ws_manager
 
-    def generate(self, context: Dict[str, Any]) -> str:
+    def generate(self, context: Dict[str, Any]) -> tuple[str, dict]:
         messages = build_llm_messages(context, self.system_prompt)
         response = self.client.chat.completions.create(
             model=self.model,
@@ -48,14 +48,19 @@ class Provider:
         # logger.info(f"===result: {result}")
         logger.info(
             f"消耗输入token：{response.usage.prompt_tokens}， \n消耗输出token：{response.usage.completion_tokens}, \n总消耗token：{response.usage.total_tokens}")
+        token_info = {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens
+        }
         think_match = THINK_PATTERN.search(result)
         think_content = think_match.group(1).strip() if think_match else None
 
         logger.info(f"===think_content: {think_content}")
         result = THINK_PATTERN.sub("", result).strip()
-        return result
+        return result, token_info
 
-    async def stream_generate(self, context: Dict[str, Any]):
+    async def stream_generate(self, context: Dict[str, Any]) -> tuple[str, dict]:
         messages = build_llm_messages(context, self.system_prompt)
         extractor = ThinkStreamExtractor()
         json_filter = HybridJSONStreamFilter()
@@ -70,6 +75,12 @@ class Provider:
         # 暴力熔断，可能导致JSON不完整。
         blank_run = 0
         MAX_BLANK_RUN = 120  # 可按你的模型/网络情况调整
+
+        token_info = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
 
         try:
             stream = await self.async_client.chat.completions.create(
@@ -176,7 +187,7 @@ class Provider:
                         await self.ws_manager.send(event.to_dict(), context.get("client_id"))
                     break
 
-            return result
+            return result, token_info
         except Exception as e:
             event = Event(EventType.ERROR,
                           context.get("agent_id"),

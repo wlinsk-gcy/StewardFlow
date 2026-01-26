@@ -73,6 +73,11 @@ export const AgentWorkbench: React.FC = () => {
   const [currentScreenshot, setCurrentScreenshot] = useState<string | null>(
     null,
   );
+  const [tokenInfo, setTokenInfo] = useState<{
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  } | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
     null,
   );
@@ -94,6 +99,15 @@ export const AgentWorkbench: React.FC = () => {
         setCurrentScreenshot(data.content);
         setActiveTab("browser");
       }
+      return;
+    }
+
+    if (event_type === "token_info") {
+      setTokenInfo({
+        prompt_tokens: Number(data?.prompt_tokens ?? 0),
+        completion_tokens: Number(data?.completion_tokens ?? 0),
+        total_tokens: Number(data?.total_tokens ?? 0),
+      });
       return;
     }
 
@@ -323,6 +337,7 @@ export const AgentWorkbench: React.FC = () => {
 
     setChatHistory((prev) => [...prev, userMessage]);
     setSteps([]); // 清空旧日志
+    if (!agentId) setTokenInfo(null);
     setIsRunning(true);
     const currentGoal = goal;
     setGoal("");
@@ -558,9 +573,20 @@ export const AgentWorkbench: React.FC = () => {
                     执行日志
                   </h3>
                 </div>
-                <span className="rounded-full bg-indigo-500 px-2 py-0.5 text-[10px] font-black text-white">
-                  {steps.length} LOGS
-                </span>
+                <div className="flex items-center gap-2">
+                  {tokenInfo && (
+                    <div className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                      <span>Prompt {tokenInfo.prompt_tokens}</span>
+                      <span className="text-indigo-300">/</span>
+                      <span>Completion {tokenInfo.completion_tokens}</span>
+                      <span className="text-indigo-300">/</span>
+                      <span>Total {tokenInfo.total_tokens}</span>
+                    </div>
+                  )}
+                  <span className="rounded-full bg-indigo-500 px-2 py-0.5 text-[10px] font-black text-white">
+                    {steps.length} LOGS
+                  </span>
+                </div>
               </div>
               <div
                 ref={traceScrollRef}

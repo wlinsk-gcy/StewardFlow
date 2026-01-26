@@ -94,12 +94,21 @@ class AgentExecutor:
             "max_turns": self.agent.max_turns
         }
         if self.stream:
-            result = await self.llm.stream_generate(context)
+            result, token_info = await self.llm.stream_generate(context)
         else:
-            result = self.llm.generate(context)
+            result, token_info = self.llm.generate(context)
         thought, action = self.parse_llm_result(result)
         self.agent.pending = Pending(thought, action, False)
+        # TODO 把token info发送给前端展示
+        if self.agent.token_info:
+            self.agent.token_info["prompt_tokens"] += token_info["prompt_tokens"]
+            self.agent.token_info["completion_tokens"] += token_info["completion_tokens"]
+            self.agent.token_info["total_tokens"] += token_info["total_tokens"]
+        else:
+            self.agent.token_info = token_info
         event = Event(EventType.THOUGHT, self.agent.agent_id, self.turn_id, thought.to_dict())
+        await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
+        event = Event(EventType.TOKEN_INFO, self.agent.agent_id, self.turn_id, self.agent.token_info)
         await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
         if not self.stream:
             if action.type == ActionType.FINISH:
@@ -267,12 +276,13 @@ class AgentExecutor:
                     self.agent.status = AgentStatus.DONE
                     self.agent.finished_at = datetime.utcnow()
                     self.checkpoint.save(self.agent)
-                    content = self.agent.tao_trajectory[-1]['observation'][
-                        'content'] if self.agent.tao_trajectory else self.agent.pending.action.answer
+                    answer_content = self.agent.pending.action.answer
+                    tao_observation_content = self.agent.tao_trajectory[-1]['observation'][
+                        'content'] if self.agent.tao_trajectory else None
                     event = Event(EventType.FINAL,
                                   self.agent.agent_id,
                                   self.turn_id,
-                                  {"content": content})
+                                  {"content": answer_content if answer_content else tao_observation_content})
                     await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
                     return
 

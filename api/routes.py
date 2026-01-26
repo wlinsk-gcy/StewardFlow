@@ -69,6 +69,13 @@ async def run_agent(
             return RunAgentResponse(
                 agent_id=request.agent_id,
             )
+        elif (agent.status == AgentStatus.DONE
+              and agent.current_node == NodeType.END):
+            task = asyncio.create_task(agent_service.execute_agent(agent.agent_id,request.task))
+            task.add_done_callback(callback)
+            return RunAgentResponse(
+                agent_id=request.agent_id,
+            )
 
     # 创建 Agent
     agent = await agent_service.create_agent(
