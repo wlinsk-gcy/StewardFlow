@@ -46,6 +46,8 @@ class Provider:
             raise Exception("OpenAI response is empty.")
         result = response.choices[0].message.content
         # logger.info(f"===result: {result}")
+        if response.usage.prompt_tokens_details:
+            logger.info(f"====Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
         logger.info(
             f"消耗输入token：{response.usage.prompt_tokens}， \n消耗输出token：{response.usage.completion_tokens}, \n总消耗token：{response.usage.total_tokens}")
         token_info = {
