@@ -67,14 +67,28 @@ class AgentExecutor:
         )
         # 封装成 Action 对象
         action_dict = llm_dict["action"]
-        action = Action(
-            type=ActionType(action_dict["type"]),
-            tool_name=action_dict.get("tool_name"),
-            args=action_dict.get("args"),
-            prompt=action_dict.get("prompt"),
-            answer=action_dict.get("answer"),
-            turn_id=self.turn_id
-        )
+        try:
+            action = Action(
+                type=ActionType(action_dict["type"]),
+                tool_name=action_dict.get("tool_name"),
+                args=action_dict.get("args"),
+                prompt=action_dict.get("prompt"),
+                answer=action_dict.get("answer"),
+                turn_id=self.turn_id
+            )
+        except Exception as e:
+            if "is not a valid ActionType" in str(e):
+                logger.error(str(e))
+                action = Action(
+                    type=ActionType.ERROR,
+                    tool_name=action_dict.get("tool_name"),
+                    args=action_dict.get("args"),
+                    prompt=str(e),
+                    answer=action_dict.get("answer"),
+                    turn_id=self.turn_id
+                )
+            else:
+                raise
         logger.info(f"[THOUGHT] {thought.content}")
         logger.info(f"[ACTION] {action}")
         return thought, action
@@ -106,8 +120,9 @@ class AgentExecutor:
             self.agent.token_info["total_tokens"] += token_info["total_tokens"]
         else:
             self.agent.token_info = token_info
-        event = Event(EventType.THOUGHT, self.agent.agent_id, self.turn_id, thought.to_dict())
-        await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
+        if len(thought.content) > 0:
+            event = Event(EventType.THOUGHT, self.agent.agent_id, self.turn_id, thought.to_dict())
+            await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
         event = Event(EventType.TOKEN_INFO, self.agent.agent_id, self.turn_id, self.agent.token_info)
         await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
         if not self.stream:
@@ -138,6 +153,8 @@ class AgentExecutor:
 
         if pending.action.type == ActionType.FINISH:
             self.agent.current_node = NodeType.END
+        elif pending.action.type == ActionType.ERROR:
+            self.agent.current_node = NodeType.EXECUTE
         elif pending.action.type == ActionType.REQUEST_INPUT:
             self.agent.current_node = NodeType.HITL
         elif tool and tool.requires_confirmation and not getattr(pending, "confirmed", False):
@@ -149,6 +166,8 @@ class AgentExecutor:
                 tool_name=pending.action.tool_name,
                 tool_args=pending.action.args
             )
+            event = Event(EventType.ACTION, self.agent.agent_id, self.turn_id, pending.action.to_dict())
+            await self.ws_manager.send(event.to_dict(), client_id=self.agent.client_id)
             self.agent.status = AgentStatus.WAITING
             self.agent.current_node = NodeType.HITL
         else:
@@ -178,16 +197,19 @@ class AgentExecutor:
             self.agent.current_node = NodeType.END  # 流程结束
             self.append_tao_trajectory(observation)
         else:
+            if self.agent.error_count >= 2:
+                raise RuntimeError
             observation = Observation(
-                content=f"Unknown action type: {current_action.type}",
+                content=f"Unknown action type: {current_action.type}, Error Message: {current_action.prompt}",
                 turn_id=self.turn_id,
-                success=False,
-                error=f"Unknown action type: {current_action.type}"
+                success=False
             )
-            self.agent.status = AgentStatus.FAILED
-            self.agent.current_node = NodeType.END
+            # self.agent.status = AgentStatus.FAILED
+            # self.agent.current_node = NodeType.END
+            self.agent.current_node = NodeType.OBSERVE
             self.append_tao_trajectory(observation)
-            logger.error("任务运行到execute_node时，current_action 不存在，任务异常")
+            self.agent.error_count += 1
+            logger.error("任务运行到execute_node时，current_actionType 不存在，任务异常, 开始重试")
         self.checkpoint.save(self.agent)  # 一轮 ReAct 结束后保存快照
 
     async def hitl_node(self):

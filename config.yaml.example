@@ -11,6 +11,33 @@ llm:
   temperature: 1.0
 
 tools:
-  web_search: # web_search为空时，将使用web_search_use_exa，
+  web_search: # web_search为空时，将使用web_search_use_exa�?
     api_key: 改成你的key，详细请看：https://serpapi.com/
     paywall_keywords: ["subscribe", "login to continue", "access denied", "restricted content", "404", "this page is not working"]
+
+context:
+  pre_rot_threshold_tokens: 160000
+  keep_recent_ratio: 0.30
+  compaction_ratio: 0.70
+  summarization_ratio: 0.70
+  dump_dir: data
+  summary_max_tokens: 2048
+  summary_temperature: 0.2
+  web_search_top_n: 5
+  bash_max_key_lines: 6
+  ls_glob_max_items: 20
+  grep_max_matches: 5
+  read_max_chars: 800
+  read_tail_chars: 200
+  backfill_max_matches: 20
+  backfill_max_chars: 4000
+  backfill_case_sensitive: false
+  auto_backfill_enabled: true
+  auto_backfill_max_patterns: 6
+  auto_backfill_keywords:
+    - error
+    - exception
+    - traceback
+    - ��־
+    - ����
+    - ·��

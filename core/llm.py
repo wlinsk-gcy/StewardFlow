@@ -4,7 +4,8 @@ from openai import OpenAI,AsyncOpenAI
 from .tools.tool import ToolRegistry
 from .extractor import THINK_PATTERN, ThinkStreamExtractor
 from .json_stream_filter import HybridJSONStreamFilter
-from .builder.build import llm_response_schema,build_llm_messages,build_system_prompt
+from .builder.build import llm_response_schema,build_system_prompt
+from .context_manager import ContextManager, ContextManagerConfig
 from ws.connection_manager import ConnectionManager
 from .protocol import Event, EventType
 
@@ -18,7 +19,7 @@ class Provider:
     ws_manager: ConnectionManager
     model: str
 
-    def __init__(self, model:str, api_key: str, base_url: str, tool_registry: ToolRegistry, ws_manager: ConnectionManager):
+    def __init__(self, model:str, api_key: str, base_url: str, tool_registry: ToolRegistry, ws_manager: ConnectionManager, context_config: dict | None = None):
         self.model = model # NVIDIA的免费API接口测试：QWEN系列模型不支持function call
         self.client = OpenAI(
             base_url=base_url,
@@ -31,15 +32,24 @@ class Provider:
         self.tool_registry = tool_registry
         self.system_prompt = build_system_prompt()
         self.ws_manager = ws_manager
+        cfg = ContextManagerConfig(**(context_config or {}))
+        self.context_manager = ContextManager(cfg, self.client, self.model)
 
     def generate(self, context: Dict[str, Any]) -> tuple[str, dict]:
-        messages = build_llm_messages(context, self.system_prompt)
+        tool_schemas = self.tool_registry.get_all_schemas()
+        messages, audit = self.context_manager.build_messages(
+            context,
+            self.system_prompt,
+            tool_schemas,
+            llm_response_schema,
+        )
+        logger.info(f"[context_manager] stage={audit.get('stage')} token_est={audit.get('token_estimate')} dump={audit.get('dump_path')}")
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=0.2,
             top_p=0.9,
-            tools=self.tool_registry.get_all_schemas(),
+            tools=tool_schemas,
             response_format=llm_response_schema,
         )
         if response is None:
@@ -49,7 +59,15 @@ class Provider:
         if response.usage.prompt_tokens_details:
             logger.info(f"====Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
         logger.info(
-            f"消耗输入token：{response.usage.prompt_tokens}， \n消耗输出token：{response.usage.completion_tokens}, \n总消耗token：{response.usage.total_tokens}")
+            f"消耗输入token：{response.usage.prompt_tokens}\n消耗输出token：{response.usage.completion_tokens}\n总消耗token：{response.usage.total_tokens}")
+        if response.usage and response.usage.prompt_tokens:
+            self.context_manager.update_calibration(
+                response.usage.prompt_tokens,
+                messages,
+                tool_schemas,
+                llm_response_schema,
+            )
+
         token_info = {
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
@@ -63,11 +81,20 @@ class Provider:
         return result, token_info
 
     async def stream_generate(self, context: Dict[str, Any]) -> tuple[str, dict]:
-        messages = build_llm_messages(context, self.system_prompt)
+        tool_schemas = self.tool_registry.get_all_schemas()
+        messages, audit = self.context_manager.build_messages(
+            context,
+            self.system_prompt,
+            tool_schemas,
+            llm_response_schema,
+        )
+        logger.info(f"[context_manager] stage={audit.get('stage')} token_est={audit.get('token_estimate')} dump={audit.get('dump_path')}")
         extractor = ThinkStreamExtractor()
         json_filter = HybridJSONStreamFilter()
 
         result = ""
+
+        last_prompt_tokens = None
 
         # 只在真正产生 prompt/answer 时才发 END
         stream_kind = None  # "prompt" | "answer" | None
@@ -90,7 +117,7 @@ class Provider:
                 messages=messages,
                 temperature=0.2,
                 top_p=0.9,
-                tools=self.tool_registry.get_all_schemas(),
+                tools=tool_schemas,
                 response_format=llm_response_schema,
                 stream=True,
                 stream_options={"include_usage": True},
@@ -99,6 +126,8 @@ class Provider:
                 # logger.info(f"chunk: {chunk}")
                 if not chunk.choices:
                     logger.info(f"[LLM usage] {chunk.usage}")
+                    if chunk.usage and getattr(chunk.usage, "prompt_tokens", None) is not None:
+                        last_prompt_tokens = chunk.usage.prompt_tokens
                     continue
 
                 choice = chunk.choices[0]
@@ -188,6 +217,14 @@ class Provider:
                                       {"content": "done"})
                         await self.ws_manager.send(event.to_dict(), context.get("client_id"))
                     break
+
+            if last_prompt_tokens:
+                self.context_manager.update_calibration(
+                    last_prompt_tokens,
+                    messages,
+                    tool_schemas,
+                    llm_response_schema,
+                )
 
             return result, token_info
         except Exception as e:

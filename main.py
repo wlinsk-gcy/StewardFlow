@@ -20,6 +20,10 @@ from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
 from core.tools.bash import BashTool
+from core.tools.grep import GrepTool
+from core.tools.ls import LsTool
+from core.tools.glob import GlobTool
+from core.tools.read import ReadTool
 from core.mcp.client import MCPClient
 
 from core.services.agent_service import AgentService
@@ -56,14 +60,20 @@ logger.addHandler(handler)
 
 def init_load_tools(tools_config: dict | None = None):
     registry = ToolRegistry()
-    search_config = tools_config.get("web_search") if tools_config else None
-    if search_config:
-        from core.tools.web_search_use_serpapi import WebSearch
-        registry.register(WebSearch(search_config.get("api_key"), search_config.get("paywall_keywords")))
-    else:
-        from core.tools.web_search_use_exa import WebSearch
-        registry.register(WebSearch())
+    # search_config = tools_config.get("web_search") if tools_config else None
+    # if search_config:
+    #     from core.tools.web_search_use_serpapi import WebSearch
+    #     registry.register(WebSearch(search_config.get("api_key"), search_config.get("paywall_keywords")))
+    # else:
+    #     from core.tools.web_search_use_exa import WebSearch
+    #     registry.register(WebSearch())
+    from core.tools.web_search_use_exa import WebSearch
+    registry.register(WebSearch())
     registry.register(BashTool())
+    registry.register(GrepTool())
+    registry.register(LsTool())
+    registry.register(GlobTool())
+    registry.register(ReadTool())
     return registry
 
 
@@ -80,7 +90,8 @@ async def lifespan(app: FastAPI):
                         llm_config.get("api_key"),
                         llm_config.get("base_url"),
                         tool_registry,
-                        ws_manager)
+                        ws_manager,
+                        config.get("context"))
 
 
     agent_service = AgentService(checkpoint, provider, tool_registry, ws_manager)

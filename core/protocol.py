@@ -283,6 +283,7 @@ class AgentState:
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    error_count: int = 0
 
     token_info: Optional[Dict[str, Any]] = field(default_factory=dict)
 
