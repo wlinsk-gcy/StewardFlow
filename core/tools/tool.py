@@ -1,6 +1,22 @@
 from abc import abstractmethod
 from typing import Optional,Dict
+from pathlib import Path
 
+class Instance:
+    # Change this to your sandbox dir
+    directory: str = str(Path.cwd())
+
+    @staticmethod
+    def contains_path(p: str) -> bool:
+        """
+        Whether path is inside sandbox root.
+        Replace with your real policy.
+        """
+        root = Path(Instance.directory).resolve()
+        try:
+            return root in Path(p).resolve().parents or Path(p).resolve() == root
+        except Exception:
+            return False
 
 class Tool:
     """

@@ -1,4 +1,4 @@
-from pathlib import Path
+
 import os
 import platform
 from typing import Optional
@@ -9,28 +9,12 @@ import codecs
 import signal
 import json
 
-from .tool import Tool
+from .tool import Tool, Instance
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("BASH_DEFAULT_TIMEOUT_MS", str(2 * 60 * 1000)))
 
 
 
-
-class Instance:
-    # Change this to your sandbox dir
-    directory: str = str(Path.cwd())
-
-    @staticmethod
-    def contains_path(p: str) -> bool:
-        """
-        Whether path is inside sandbox root.
-        Replace with your real policy.
-        """
-        root = Path(Instance.directory).resolve()
-        try:
-            return root in Path(p).resolve().parents or Path(p).resolve() == root
-        except Exception:
-            return False
 
 def pick_stream_encoding() -> str:
     # 非 Windows：绝大多数 shell 输出就是 UTF-8
