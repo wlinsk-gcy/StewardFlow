@@ -136,7 +136,7 @@ class MCPClient:
                 tools = await session.connector.list_tools()
                 logger.debug(f"\nAvailable tools ({len(tools)}):")
                 for tool in tools:
-                    fq = f"{name}.{tool.name}"
+                    fq = f"{name}_{tool.name}"
                     proxy = MCPToolProxy(
                         fq_name=fq,
                         description=tool.description or "",

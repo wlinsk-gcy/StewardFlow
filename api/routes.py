@@ -11,6 +11,7 @@ from core.protocol import (
 )
 
 from core.services.agent_service import AgentService
+from core.services.task_service import TaskService
 from core.storage.checkpoint import CheckpointStore
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,10 @@ def get_agent_service() -> AgentService:
     """获取 AgentService 实例"""
     from main import app
     return app.state.agent_service
+
+def get_task_service() -> TaskService:
+    from main import app
+    return app.state.task_service
 
 
 def get_checkpoint() -> CheckpointStore:
@@ -36,7 +41,8 @@ router = APIRouter(prefix="/agent", tags=["Agent"])
 @router.post("/run", response_model=RunAgentResponse, status_code=201)
 async def run_agent(
         request: RunAgentRequest,
-        agent_service: AgentService = Depends(get_agent_service)
+        task_service: TaskService = Depends(get_task_service)
+        # agent_service: AgentService = Depends(get_agent_service)
 ):
     """
     启动一次 Agent 执行
@@ -55,41 +61,28 @@ async def run_agent(
         except asyncio.CancelledError:
             logger.warning("run_agent任务被取消")
 
-    if request.agent_id:
-        agent = agent_service.get_agent(request.agent_id)
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        if (agent.status == AgentStatus.WAITING
-                and agent.current_node == NodeType.HITL and agent.hitl):
-            # 提交到服务层处理
-            hitl_task = asyncio.create_task(
-                agent_service.submit_hitl(request.agent_id, request_id=agent.hitl['request_id'],
-                                          input_text=request.task))
+    if request.trace_id:
+        trace = await task_service.get_trace(request.trace_id)
+        if not trace:
+            raise HTTPException(status_code=404, detail="Trace not found")
+        if trace.status == AgentStatus.WAITING and trace.node == NodeType.HITL:
+            hitl_task = asyncio.create_task(task_service.submit_hitl(trace,request.task))
             hitl_task.add_done_callback(callback)
-            return RunAgentResponse(
-                agent_id=request.agent_id,
-            )
-        elif (agent.status == AgentStatus.DONE
-              and agent.current_node == NodeType.END):
-            task = asyncio.create_task(agent_service.execute_agent(agent.agent_id,request.task))
+            return RunAgentResponse(trace_id=request.trace_id)
+        elif trace.status == AgentStatus.DONE and trace.node == NodeType.END:
+            await task_service.new_turn(trace, request.task)
+            task = asyncio.create_task(task_service.start(trace))
             task.add_done_callback(callback)
-            return RunAgentResponse(
-                agent_id=request.agent_id,
-            )
+            return RunAgentResponse(trace_id=request.trace_id)
+        else:
+            raise HTTPException(status_code=404, detail="Trace Status is invalid")
 
-    # 创建 Agent
-    agent = await agent_service.create_agent(
-        cliend_id=request.client_id,
-        task=request.task,
-        max_turns=50,
-    )
-    task = asyncio.create_task(agent_service.execute_agent(agent.agent_id))
+    trace = await task_service.initialize(request.task, request.client_id)
+    task = asyncio.create_task(task_service.start(trace))
     task.add_done_callback(callback)
 
     # 返回
-    return RunAgentResponse(
-        agent_id=agent.agent_id
-    )
+    return RunAgentResponse(trace_id=trace.trace_id)
 
 
 @router.get("/health")

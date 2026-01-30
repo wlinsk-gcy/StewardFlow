@@ -4,6 +4,7 @@ FastAPI ReAct + HITL Agent MVP
 """
 import sys
 import asyncio
+import os
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 import logging
@@ -16,6 +17,7 @@ from context import request_id_ctx, agent_id_ctx
 
 from utils.id_util import get_sonyflake
 from utils.screenshot_util import clean_screenshot
+from utils.snapshot_util import clear_snapshot_logs
 from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
@@ -24,14 +26,24 @@ from core.tools.grep import GrepTool
 from core.tools.ls import LsTool
 from core.tools.glob import GlobTool
 from core.tools.read import ReadTool
+from core.tools.snapshot_query import SnapshotQueryTool
 from core.mcp.client import MCPClient
 
 from core.services.agent_service import AgentService
+from core.services.task_service import TaskService
 from api.routes import router as agent_router
 from ws.connection_manager import ConnectionManager
 
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
+
+snapshot_path = (
+    config.get("snapshot_path")
+    or config.get("snapshot_path")
+    or (config.get("snapshot") or {}).get("path")
+)
+if snapshot_path:
+    os.environ["SNAPSHOT_PATH"] = str(snapshot_path)
 
 
 class RequestIdFilter(logging.Filter):
@@ -74,6 +86,7 @@ def init_load_tools(tools_config: dict | None = None):
     registry.register(LsTool())
     registry.register(GlobTool())
     registry.register(ReadTool())
+    registry.register(SnapshotQueryTool())
     return registry
 
 
@@ -95,17 +108,21 @@ async def lifespan(app: FastAPI):
 
 
     agent_service = AgentService(checkpoint, provider, tool_registry, ws_manager)
+    task_service = TaskService(checkpoint, provider, tool_registry, ws_manager)
 
     app.state.checkpoint = checkpoint
+    app.state.tool_registry = tool_registry
     app.state.provider = provider
     app.state.agent_service = agent_service
     app.state.ws_manager = ws_manager
 
+    app.state.task_service = task_service
     yield
 
     # ===== shutdown =====
     await mcp_client.close_all_sessions()
     clean_screenshot()
+    clear_snapshot_logs()
 
 
 # 创建 FastAPI 应用

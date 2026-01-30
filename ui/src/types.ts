@@ -13,7 +13,7 @@ export interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
     timestamp: number;
-    turnId?: string; // 新增：用于匹配流式增量
+    requestId?: string; // HITL confirm Ψһ��ʶ
     isHitl?: boolean;
     hitlType?: 'confirm' | 'request';
 }
@@ -30,3 +30,5 @@ export interface Tool {
 }
 
 export const PYTHON_REFERENCE_CODE = `# Removed in favor of Browser View implementation`;
+
+

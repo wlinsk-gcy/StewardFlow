@@ -1,15 +1,34 @@
 import logging
-from typing import Dict, Any
+import json
+from typing import Dict, Any, List, cast
 from openai import OpenAI,AsyncOpenAI
 from .tools.tool import ToolRegistry
 from .extractor import THINK_PATTERN, ThinkStreamExtractor
 from .json_stream_filter import HybridJSONStreamFilter
-from .builder.build import llm_response_schema,build_system_prompt
+from .builder.build import llm_response_schema,build_system_prompt, llm_response_schema_v2, build_system_prompt_v2
 from .context_manager import ContextManager, ContextManagerConfig
 from ws.connection_manager import ConnectionManager
-from .protocol import Event, EventType
+from .protocol import Event, EventType, ActionV2,ActionType, Trace,Turn,Step,ObservationV2
+from utils.id_util import get_sonyflake
 
 logger = logging.getLogger(__name__)
+
+def normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+    if not tool_calls:
+        return []
+    out = []
+    for tc in tool_calls:
+        if hasattr(tc, "model_dump"):
+            d = tc.model_dump()
+        elif hasattr(tc, "dict"):
+            d = tc.dict()
+        elif isinstance(tc, dict):
+            d = tc
+        else:
+            d = vars(tc)
+        out.append(d)
+    return out
+
 
 
 class Provider:
@@ -235,3 +254,58 @@ class Provider:
             await self.ws_manager.send(event.to_dict(), context.get("client_id"))
             logger.error(f"[LLM GENERATE ERROR] {e}")
             raise e
+
+
+
+    def generate_v2(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
+        step = cast(Step,context.get("step")) # current_step
+        is_thinking = context.get("is_thinking", False)
+        # TODO 针对429 Error Code做 Retry
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=context.get("messages"),
+            temperature=0.2,
+            top_p=0.9,
+            tools=self.tool_registry.get_all_schemas(),
+            response_format=llm_response_schema_v2,
+            extra_body={"enable_thinking": is_thinking},
+            parallel_tool_calls=True,
+        )
+        if response is None:
+            raise Exception("OpenAI response is empty.")
+        raw = response.choices[0].message.content
+        content = raw or ""
+        think_match = THINK_PATTERN.search(content)
+        reasoning = (think_match.group(1).strip() if think_match else response.choices[0].message.reasoning_content) if is_thinking else ""
+        content = THINK_PATTERN.sub("", content).strip()
+        actions = []
+        if response.choices[0].finish_reason == "tool_calls":
+            calls = response.choices[0].message.tool_calls
+            step.tool_calls = normalize_tool_calls(response.choices[0].message.tool_calls)
+            for call in calls:
+                tool = self.tool_registry.get(call.function.name)
+                action = ActionV2(action_id=call.id,
+                                  type=ActionType.TOOL,
+                                  tool_name=call.function.name,
+                                  args=json.loads(call.function.arguments),
+                                  requires_confirm=tool.requires_confirmation,
+                                  confirm_status="pending" if tool.requires_confirmation else None)
+                actions.append(action)
+        else:
+            res = json.loads(content)
+            actions.append(ActionV2(action_id=get_sonyflake("action_"),type=ActionType(res["type"]),message=res["message"], full_ref=raw))
+
+        if response.usage.prompt_tokens_details:
+            logger.info(f"====Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
+        logger.info(
+            f"消耗输入token：{response.usage.prompt_tokens}\n消耗输出token：{response.usage.completion_tokens}\n总消耗token：{response.usage.total_tokens}")
+        token_info = {
+            "cache_tokens": response.usage.prompt_tokens_details.cached_tokens if response.usage.prompt_tokens_details else 0,
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens
+        }
+        return reasoning, actions, token_info
+
+
+

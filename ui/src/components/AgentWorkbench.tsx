@@ -43,7 +43,7 @@ type PendingConfirm = {
   prompt: string;
   toolName?: string;
   args?: unknown;
-  turnId?: string;
+  msgId?: string;
 };
 
 function getConfirmCommand(pending: PendingConfirm | null): string | null {
@@ -74,24 +74,28 @@ export const AgentWorkbench: React.FC = () => {
     null,
   );
   const [tokenInfo, setTokenInfo] = useState<{
+    cache_tokens: number;
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
   } | null>(null);
+  const [wsStatus, setWsStatus] = useState<"online" | "offline" | "reconnecting">(
+    "offline",
+  );
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
     null,
   );
 
   // --- 新增：WebSocket 相关状态 ---
-  const [clientId] = useState(() => uuidv4()); // 保持整个生命周期 clientId 唯一
-  const [agentId, setAgentId] = useState<string | null>(null); // 新增：存储后端返回的 agent_id
+  const [clientId] = useState(() => uuidv4());
+  const [traceId, setTraceId] = useState<string | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const traceScrollRef = useRef<HTMLDivElement>(null);
 
   // --- 新增：初始化 WebSocket ---
   const handleIncomingEvent = useCallback((event: any) => {
-    const { event_type, data, timestamp, turn_id } = event;
+    const { event_type, data, timestamp, msg_id } = event;
     // console.log('incoming event', event);
     if (event_type === "screenshot") {
       console.log("[ws] screenshot event", data);
@@ -104,6 +108,7 @@ export const AgentWorkbench: React.FC = () => {
 
     if (event_type === "token_info") {
       setTokenInfo({
+        cache_tokens: Number(data?.cache_tokens ?? 0),
         prompt_tokens: Number(data?.prompt_tokens ?? 0),
         completion_tokens: Number(data?.completion_tokens ?? 0),
         total_tokens: Number(data?.total_tokens ?? 0),
@@ -140,9 +145,9 @@ export const AgentWorkbench: React.FC = () => {
       // console.log('receive answer or hitl_request');
       setIsRunning((prev) => (prev ? false : prev));
       setChatHistory((prev) => {
-        // 查找是否已经存在相同 turn_id 且角色为 assistant 的消息
+        // 查找是否已经存在相同 msg_id 且角色为 assistant 的消息
         const existingMsgIndex = prev.findIndex(
-          (m) => m.turnId === turn_id && m.role === "assistant",
+          (m) => m.msg_id === msg_id && m.role === "assistant",
         );
         if (existingMsgIndex !== -1) {
           // 如果消息已存在，在原有内容基础上追加 text
@@ -158,7 +163,7 @@ export const AgentWorkbench: React.FC = () => {
           };
           return newHistory;
         } else {
-          // 如果是该 turn_id 的第一块数据，创建新消息
+          // 如果是该 msg_id 的第一块数据，创建新消息
           return [
             ...prev,
             {
@@ -166,7 +171,7 @@ export const AgentWorkbench: React.FC = () => {
               role: "assistant",
               content: data.content || "",
               timestamp: new Date(timestamp).getTime(),
-              turnId: turn_id,
+              msg_id: msg_id,
               isHitl: event_type.startsWith("hitl"),
               hitlType: event_type === "hitl_request" ? "request" : undefined,
             },
@@ -178,12 +183,13 @@ export const AgentWorkbench: React.FC = () => {
     if (event_type === "hitl_confirm") {
       setIsRunning(false);
       const promptText = data?.prompt || "Please confirm the action.";
+      const requestId = data?.request_id || uuidv4();
       setPendingConfirm({
-        requestId: data?.request_id || uuidv4(),
+        requestId,
         prompt: promptText,
         toolName: data?.tool_name,
         args: data?.args,
-        turnId: turn_id,
+        msgId: msg_id,
       });
       setChatHistory((prev) => [
         ...prev,
@@ -192,7 +198,8 @@ export const AgentWorkbench: React.FC = () => {
           role: "assistant",
           content: promptText,
           timestamp: new Date(timestamp).getTime(),
-          turnId: turn_id,
+          msg_id: msg_id,
+          requestId,
           isHitl: true,
           hitlType: "confirm",
         },
@@ -230,6 +237,7 @@ export const AgentWorkbench: React.FC = () => {
 
       socket.onopen = () => {
         retryCount = 0;
+        setWsStatus("online");
         console.log("Connected to WS:", clientId);
       };
 
@@ -240,6 +248,7 @@ export const AgentWorkbench: React.FC = () => {
 
       socket.onerror = () => {
         // Error ????? close?????????????
+        setWsStatus("offline");
         try {
           socket.close();
         } catch {
@@ -249,9 +258,11 @@ export const AgentWorkbench: React.FC = () => {
 
       socket.onclose = () => {
         console.log("WS Disconnected");
+        setWsStatus("offline");
         if (closedByUser) return;
         const delay = Math.min(1000 * 2 ** retryCount, 10000);
         retryCount += 1;
+        setWsStatus("reconnecting");
         retryTimer = window.setTimeout(connect, delay);
         console.log(`[ws] reconnect in ${delay}ms`);
       };
@@ -261,6 +272,7 @@ export const AgentWorkbench: React.FC = () => {
 
     return () => {
       closedByUser = true;
+      setWsStatus("offline");
       if (retryTimer) {
         clearTimeout(retryTimer);
       }
@@ -284,7 +296,7 @@ export const AgentWorkbench: React.FC = () => {
 
   // --- 新增：事件分流处理器 ---
   const handleConfirm = async (decision: "confirm" | "reject") => {
-    if (!agentId || isRunning) return;
+    if (!traceId || isRunning) return;
 
     const userMessage: ChatMessage = {
       id: uuidv4(),
@@ -304,7 +316,7 @@ export const AgentWorkbench: React.FC = () => {
         body: JSON.stringify({
           client_id: clientId,
           task: decision,
-          ...(agentId && { agent_id: agentId }),
+          ...(traceId && { trace_id: traceId }),
         }),
       });
 
@@ -337,7 +349,7 @@ export const AgentWorkbench: React.FC = () => {
 
     setChatHistory((prev) => [...prev, userMessage]);
     setSteps([]); // 清空旧日志
-    if (!agentId) setTokenInfo(null);
+    if (!traceId) setTokenInfo(null);
     setIsRunning(true);
     const currentGoal = goal;
     setGoal("");
@@ -350,17 +362,17 @@ export const AgentWorkbench: React.FC = () => {
         body: JSON.stringify({
           client_id: clientId,
           task: currentGoal,
-          // --- 新增：如果已经有 agent_id，则携带它 ---
-          ...(agentId && { agent_id: agentId }),
+          // --- 新增：如果已经有 trace_id，则携带它 ---
+          ...(traceId && { trace_id: traceId }),
         }),
       });
 
       if (!response.ok) throw new Error("Failed to start agent");
 
       const data = await response.json();
-      if (data.agent_id) {
-        setAgentId(data.agent_id);
-        console.log("Current Agent ID session:", data.agent_id);
+      if (data.trace_id) {
+        setTraceId(data.trace_id);
+        console.log("Current Agent ID session:", data.trace_id);
       }
     } catch (e) {
       console.error(e);
@@ -384,6 +396,19 @@ export const AgentWorkbench: React.FC = () => {
     }
   };
 
+  const handleNewSession = () => {
+    setChatHistory([]);
+    setSteps([]);
+    setPendingConfirm(null);
+    setIsRunning(false);
+    setGoal("");
+    setTokenInfo(null);
+    setTraceId(null);
+    setCurrentScreenshot(null);
+    setCurrentUrl("about:blank");
+    setActiveTab("runner");
+  };
+
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
       {/* Tab Header */}
@@ -395,9 +420,21 @@ export const AgentWorkbench: React.FC = () => {
           <div>
             <h2 className="font-bold text-gray-900">Steward Flow</h2>
             <div className="mt-0.5 flex items-center gap-2">
-              <span className="flex h-2 w-2 rounded-full bg-green-500"></span>
+              <span
+                className={`flex h-2 w-2 rounded-full ${
+                  wsStatus === "online"
+                    ? "bg-green-500"
+                    : wsStatus === "reconnecting"
+                      ? "bg-yellow-500"
+                      : "bg-red-500"
+                }`}
+              ></span>
               <p className="text-[10px] font-bold tracking-widest text-gray-500 uppercase">
-                System Online
+                {wsStatus === "online"
+                  ? "System Online"
+                  : wsStatus === "reconnecting"
+                    ? "System Offline · Reconnecting..."
+                    : "System Offline"}
               </p>
             </div>
           </div>
@@ -422,6 +459,17 @@ export const AgentWorkbench: React.FC = () => {
       <div className="flex flex-1 divide-x divide-gray-100 overflow-hidden">
         {/* Left Column: Chat History & Input */}
         <div className="flex w-1/2 flex-col bg-white">
+          <div className="flex items-center justify-between border-b border-gray-100 bg-white px-6 py-3">
+            <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">
+              Chat
+            </span>
+            <button
+              onClick={handleNewSession}
+              className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold tracking-widest text-gray-600 uppercase hover:border-gray-300 hover:text-gray-800"
+            >
+              New Session
+            </button>
+          </div>
           {/* Chat Messages */}
           <div
             ref={chatScrollRef}
@@ -433,10 +481,10 @@ export const AgentWorkbench: React.FC = () => {
                   <Bot className="h-10 w-10 text-indigo-500 opacity-60" />
                 </div>
                 <h3 className="mb-2 text-xl font-bold text-gray-900">
-                  你好，我是你的私人AI助理
+                  你好，我是你的私人AI管家
                 </h3>
                 <p className="text-sm leading-relaxed text-gray-500">
-                  让我浏览网页、进行复杂计算，或用ReAct框架解决逻辑谜题。
+                  一站式工具助手：网页自动化 + 文档检索 + 命令执行，输出可复现步骤，关键操作先确认。
                 </p>
               </div>
             )}
@@ -472,7 +520,8 @@ export const AgentWorkbench: React.FC = () => {
                     {msg.role === "assistant" &&
                       msg.hitlType === "confirm" &&
                       pendingConfirm &&
-                      msg.turnId === pendingConfirm.turnId && (
+                      msg.requestId &&
+                      msg.requestId === pendingConfirm.requestId && (
                         <div className="mt-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3 shadow-inner">
                           <div className="flex items-center gap-2 text-[10px] font-black tracking-widest text-indigo-600 uppercase">
                             <span className="h-1.5 w-1.5 rounded-full bg-indigo-500"></span>
@@ -576,6 +625,8 @@ export const AgentWorkbench: React.FC = () => {
                 <div className="flex items-center gap-2">
                   {tokenInfo && (
                     <div className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                      <span>Cache {tokenInfo.cache_tokens}</span>
+                      <span className="text-indigo-300">/</span>
                       <span>Prompt {tokenInfo.prompt_tokens}</span>
                       <span className="text-indigo-300">/</span>
                       <span>Completion {tokenInfo.completion_tokens}</span>

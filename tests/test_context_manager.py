@@ -87,7 +87,7 @@ class TestContextManager(unittest.TestCase):
     def test_compact_chrome_devtools_content(self):
         cm = ContextManager(ContextManagerConfig(dry_run=True), DummyClient(), "dummy")
         compacted = json.loads(
-            cm._compact_chrome_devtools_content("raw", {"tool_name": "chrome-devtools.foo", "args": {"url": "x"}})
+            cm._compact_chrome_devtools_content("raw", {"tool_name": "chrome-devtools_foo", "args": {"url": "x"}})
         )
         self.assertEqual(compacted["type"], "chrome_devtools_compact")
         self.assertEqual(compacted["args"], {"url": "x"})
