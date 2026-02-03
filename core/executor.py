@@ -26,6 +26,19 @@ from ws.connection_manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SCREENSHOT_FLAG = ["chrome-devtools_click",
+                           "chrome-devtools_drag",
+                           "chrome-devtools_fill",
+                           "chrome-devtools_fill_form",
+                           "chrome-devtools_handle_dialog",
+                           "chrome-devtools_hover",
+                           "chrome-devtools_press_key",
+                           "chrome-devtools_upload_file",
+                           "chrome-devtools_close_page",
+                           "chrome-devtools_list_pages",
+                           "chrome-devtools_navigate_page",
+                           "chrome-devtools_new_page",
+                           "chrome-devtools_select_page"]
 
 class AgentExecutor:
     """ReAct 执行引擎
@@ -720,6 +733,8 @@ class TaskExecutor:
         if actions:
             trace.node = NodeType.THINK
         else:
+            step.status = StepStatus.DONE
+            step.finished_at = datetime.utcnow()
             trace.node = NodeType.THINK
             event = Event(EventType.OBSERVATION,
                           trace.trace_id,
@@ -773,11 +788,15 @@ class TaskExecutor:
                                  type=ObservationType.TOOL_ERROR,
                                  ok=False,
                                  content=f"Tool '{tool_name}' not found")
-        if tool.name != "chrome-devtools_take_screenshot" and tool.name.startswith("chrome-devtools"):
+        if tool.name in DEFAULT_SCREENSHOT_FLAG:
             screenshot_tool = self.tool_registry.get("chrome-devtools_take_screenshot")
             screenshot_path = f"./.screenshots/{trace.trace_id}_screenshot.png"
         try:
             execute_result = await tool.execute(**args)
+            if tool_name == "chrome-devtools_wait_for" and execute_result == "wait_for response":
+                # wait_for作为响应屏障，拿到结果后直接snapshot，并返回链接，由LLM按需检索
+                snapshot_tool = self.tool_registry.get("chrome-devtools_take_snapshot")
+                execute_result = await snapshot_tool.execute()
             action.status = ActionStatus.DONE
             if screenshot_tool:
                 screenshot_result = await screenshot_tool.execute(filePath=screenshot_path)

@@ -8,31 +8,43 @@ from typing import List, Optional, Dict, Tuple
 
 
 def should_summarize_snapshot(tool_name: Optional[str]) -> bool:
-    if tool_name and tool_name.lower() in ["chrome-devtools_wait_for", "chrome-devtools_take_snapshot"]:
+    # if tool_name and tool_name.lower() in ["chrome-devtools_wait_for", "chrome-devtools_take_snapshot"]:
+    if tool_name and tool_name.lower() == "chrome-devtools_take_snapshot":
         return True
     return False
 
 
 def save_snapshot_raw(tool_name:str, text: str) -> str:
-    if tool_name.lower() == "chrome-devtools_take_snapshot":
-        latest_path, history_path = _get_snapshot_paths()
-    else:
-        latest_path, history_path = _get_wait_for_paths()
+    latest_path, history_path = _get_snapshot_paths()
     _ensure_parent_dir(latest_path)
     with open(latest_path, "w", encoding="utf-8") as f:
         f.write(text)
     _ensure_parent_dir(history_path)
     with open(history_path, "a", encoding="utf-8") as f:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if tool_name.lower() == "chrome-devtools_take_snapshot":
-            f.write(f"\n--- snapshot {stamp} ---\n")
-        else:
-            f.write(f"\n--- wait_for {stamp} ---\n")
+        f.write(f"\n--- snapshot {stamp} ---\n")
         f.write(text)
-    if tool_name.lower() == "chrome-devtools_take_snapshot":
-        return json.dumps({"type": "snapshot_ref", "path": "data/snapshot_latest.txt"})
-    else:
-        return json.dumps({"type": "wait_for_ref", "path": "data/wait_for_log_latest.txt"})
+    return json.dumps({"type": "snapshot_ref", "path": "data/snapshot_latest.txt"})
+
+    # if tool_name.lower() == "chrome-devtools_take_snapshot":
+    #     latest_path, history_path = _get_snapshot_paths()
+    # else:
+    #     latest_path, history_path = _get_wait_for_paths()
+    # _ensure_parent_dir(latest_path)
+    # with open(latest_path, "w", encoding="utf-8") as f:
+    #     f.write(text)
+    # _ensure_parent_dir(history_path)
+    # with open(history_path, "a", encoding="utf-8") as f:
+    #     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    #     if tool_name.lower() == "chrome-devtools_take_snapshot":
+    #         f.write(f"\n--- snapshot {stamp} ---\n")
+    #     else:
+    #         f.write(f"\n--- wait_for {stamp} ---\n")
+    #     f.write(text)
+    # if tool_name.lower() == "chrome-devtools_take_snapshot":
+    #     return json.dumps({"type": "snapshot_ref", "path": "data/snapshot_latest.txt"})
+    # else:
+    #     return json.dumps({"type": "wait_for_ref", "path": "data/wait_for_log_latest.txt"})
 
 
 def clear_snapshot_logs() -> None:

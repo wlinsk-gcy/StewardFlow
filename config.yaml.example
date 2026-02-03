@@ -12,13 +12,9 @@ llm:
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   temperature: 1.0
 
-tools:
-  web_search: # web_search为空时，将使用web_search_use_exa�?
-    api_key: 改成你的key，详细请看：https://serpapi.com/
-    paywall_keywords: ["subscribe", "login to continue", "access denied", "restricted content", "404", "this page is not working"]
 
 context:
-  pre_rot_threshold_tokens: 12200 # deepseek-v3.2最大输入长度96K 取12.8% ~ 20.0% 作为腐烂前阈值
+  pre_rot_threshold_tokens: 19200 # deepseek-v3.2最大输入长度96K 取12.8% ~ 20.0% 作为腐烂前阈值
   keep_recent_ratio: 0.30
   compaction_ratio: 0.70
   summarization_ratio: 0.70

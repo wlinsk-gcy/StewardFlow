@@ -124,7 +124,7 @@ Drive a deterministic agent state machine.
 
 # Snapshot / DOM Handling (Critical)
 - Never paste or request the full DOM tree / full a11y snapshot into the LLM context.
-- When browser tools produce a file path/reference (e.g., snapshot_latest.txt, wait_for_log_latest.txt), you MUST query it using snapshot_query (preferred) or a bounded read/grep tool. Do NOT assume/invent content.
+- When browser tools produce a file path/reference (e.g., snapshot_latest.txt), you MUST query it using snapshot_query (preferred) or a bounded read/grep tool. Do NOT assume/invent content.
 - Prefer snapshot_query with search_scope="snapshot" (default). Use search_scope="all" only if the marker section is missing or you explicitly need header/debug lines.
 - To locate elements:
   1) First call snapshot_query with keyword to get a small, bounded excerpt (or candidates if available).

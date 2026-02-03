@@ -1,3 +1,4 @@
+import re
 import logging
 import json
 from typing import Dict, Any, List, cast
@@ -28,6 +29,30 @@ def normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
             d = vars(tc)
         out.append(d)
     return out
+
+def safe_parse_tool_args(arg_str: str) -> dict:
+    s = (arg_str or "").strip()
+    if not s:
+        return {}  # 空参就当成 {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
+        # 兜底：记录前 200 字符，方便定位模型到底回了什么
+        logger.warning("Invalid tool arguments JSON: %r", s[:200])
+        return {}  # 或 raise，看你是否愿意 fail fast
+
+JSON_CODEBLOCK_RE = re.compile(
+    r"```(?:json)?\s*([\s\S]*?)\s*```",
+    re.IGNORECASE
+)
+
+def extract_json_from_markdown(s: str) -> str:
+    s = (s or "").strip()
+    m = JSON_CODEBLOCK_RE.search(s)
+    if m:
+        return m.group(1).strip()
+    return s
 
 
 
@@ -266,7 +291,7 @@ class Provider:
             messages=context.get("messages"),
             temperature=0.2,
             top_p=0.9,
-            tools=self.tool_registry.get_all_schemas(),
+            tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot","chrome-devtools_evaluate_script"]),
             response_format=llm_response_schema_v2,
             extra_body={"enable_thinking": is_thinking},
             parallel_tool_calls=True,
@@ -287,11 +312,13 @@ class Provider:
                 action = ActionV2(action_id=call.id,
                                   type=ActionType.TOOL,
                                   tool_name=call.function.name,
-                                  args=json.loads(call.function.arguments),
+                                  args=safe_parse_tool_args(call.function.arguments),
                                   requires_confirm=tool.requires_confirmation,
                                   confirm_status="pending" if tool.requires_confirmation else None)
                 actions.append(action)
         else:
+            logger.info(f"llm result: {content}")
+            content = extract_json_from_markdown(content)
             res = json.loads(content)
             actions.append(ActionV2(action_id=get_sonyflake("action_"),type=ActionType(res["type"]),message=res["message"], full_ref=raw))
 

@@ -40,6 +40,9 @@ class Tool:
     async def execute(self, **kwargs) -> str:
         raise NotImplementedError
 
+    async def do_another(self, **kwargs) -> str:
+        pass
+
 
 class ToolRegistry:
     def __init__(self):
@@ -58,5 +61,7 @@ class ToolRegistry:
     def get_tool_name(self) -> list[str]:
         return list(self.tools.keys())
 
-    def get_all_schemas(self) -> list[Dict]:
+    def get_all_schemas(self, excludes: Optional[list[str]] = None) -> list[Dict]:
+        if excludes:
+            return [tool.schema() for tool in self.tools.values() if tool.name not in excludes]
         return [tool.schema() for tool in self.tools.values()]
