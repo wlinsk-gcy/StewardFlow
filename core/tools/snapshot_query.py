@@ -283,6 +283,42 @@ def _query_by_keyword(
         "hit_indices": hit_indices,  # 供 compact 使用
     }
 
+def _normalize_for_dedupe(s: str) -> str:
+    """
+    用于去重的规范化：
+    - 去掉 uid=xxx（因为重复通常只是 uid 不同）
+    - 可选去掉 url=...（很多 url 带 token 导致无法 exact match）
+    - 压缩空白
+    - 去掉 focusable / focused 等状态噪声
+    """
+    # 去 uid
+    s = re.sub(r'\buid=[^\s]+\b', 'uid=__', s)
+
+    # 去 url（可选：如果你希望不同 url 不去重，就把这一行删掉）
+    s = re.sub(r'\burl="[^"]*"', 'url="__"', s)
+
+    # 去 description（可选）
+    s = re.sub(r'\bdescription="[^"]*"', 'description="__"', s)
+
+    # 去常见状态噪声
+    s = re.sub(r'\b(focusable|focused|disabled|expanded|selected)\b', '', s)
+
+    # 压缩空白
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    """按规范化 key 去重，但保留原始 item & 原始顺序"""
+    seen = set()
+    out: List[str] = []
+    for it in items:
+        key = _normalize_for_dedupe(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
 def _compact_top_hits(
     lines: List[str],
     hit_indices: List[int],
@@ -316,7 +352,64 @@ def _compact_top_hits(
                 chunk.append(f"    {ln}")
         excerpts.append("\n".join(chunk))
 
+    # 去重（保序）
+    excerpts = _dedupe_preserve_order(excerpts)
     return excerpts
+
+def _normalize_keywords(keywords: Optional[List[Any]], max_items: int = 30) -> List[str]:
+    """
+    清洗 keywords：
+    - 去 None / 去空串 / 去重（保序）
+    - 上限 max_items，避免一次过大输入
+    """
+    if not keywords:
+        return []
+
+    seen = set()
+    out: List[str] = []
+    for x in keywords:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+def _apply_compact_to_keyword_result(
+    *,
+    keyword_target_lines: List[str],
+    keyword: str,
+    result: Dict[str, Any],
+    top_hits_limit: int,
+) -> Dict[str, Any]:
+    """
+    将 keyword_grep 结果裁剪为 keyword_grep_compact（使用 hit_indices + neighbor_lines）
+    """
+    hit_indices = result.get("hit_indices") or []
+    top_hits = _compact_top_hits(
+        keyword_target_lines,
+        hit_indices,
+        keyword=keyword,
+        neighbor_lines=1,
+        top_hits_limit=top_hits_limit,
+        case_insensitive=True,
+    )
+
+    return {
+        "found": result.get("found"),
+        "mode": "keyword_grep_compact",
+        "keyword": result.get("keyword"),
+        "matched": result.get("matched"),
+        "truncated": result.get("truncated"),
+        "returned_lines": result.get("returned_lines"),
+        "top_hits": top_hits,
+    }
 
 
 def snapshot_query_latest(
@@ -324,6 +417,7 @@ def snapshot_query_latest(
     latest_path: str = DEFAULT_LATEST_PATH,
     uid: Optional[str] = None,
     keyword: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
     max_lines: int = 200,
     context_lines: int = 8,
     include_ancestors: bool = True,
@@ -333,12 +427,21 @@ def snapshot_query_latest(
 ) -> Dict[str, Any]:
     """
     通用查询器：
-    - latest_path 可以是 snapshot_latest.txt / wait_for_log_latest.txt
+    - latest_path 可以是 snapshot_latest.txt
     - 默认 search_scope="snapshot"：只查 marker 后的 snapshot 区域（更稳、更省 token）
     - uid 查询：永远先全文件定位 uid，再映射到 snapshot 段做 subtree（避免找不到/错段）
     """
-    if not uid and not keyword:
-        raise ValueError("either uid or keyword must be provided")
+    kw_list = _normalize_keywords(keywords)
+
+    # 互斥校验：三选一
+    if uid:
+        if keyword or kw_list:
+            raise ValueError("uid query cannot be combined with keyword/keywords in one call")
+    else:
+        if keyword and kw_list:
+            raise ValueError("keyword and keywords cannot be combined in one call")
+        if (not keyword) and (not kw_list):
+            raise ValueError("one of uid/keyword/keywords must be provided")
 
     all_lines = _read_latest_lines(latest_path)
     header_lines, snapshot_lines, marker_index = _split_snapshot(all_lines)
@@ -354,25 +457,6 @@ def snapshot_query_latest(
     raw_text = "\n".join(snapshot_lines if snapshot_lines else all_lines)
     snapshot_id = _sha1_12(raw_text)
 
-    if uid:
-        result = _query_by_uid(
-            all_lines=all_lines,
-            header_lines=header_lines,
-            snapshot_lines=snapshot_lines,
-            marker_index=marker_index,
-            uid=uid,
-            max_lines=max_lines,
-            include_ancestors=include_ancestors,
-        )
-    else:
-        result = _query_by_keyword(
-            keyword_target_lines,
-            keyword or "",
-            max_lines=max_lines,
-            context_lines=context_lines,
-            case_insensitive=True,
-        )
-
     payload: Dict[str, Any] = {
         "type": "snapshot_query_result",
         "latest_path": latest_path,
@@ -387,6 +471,7 @@ def snapshot_query_latest(
         "query": {
             "uid": uid,
             "keyword": keyword,
+            "keywords": kw_list if kw_list else None,
             "max_lines": max_lines,
             "context_lines": context_lines,
             "include_ancestors": include_ancestors,
@@ -394,35 +479,79 @@ def snapshot_query_latest(
             "compact": compact,
             "top_hits_limit": top_hits_limit,
         },
-        "result": result,
+        "result": None,
     }
 
-    # 裁剪 keyword_grep 的内容（compact）
-    if compact and isinstance(result, dict) and result.get("mode") == "keyword_grep":
-        hit_indices = result.get("hit_indices") or []
-        top_hits = _compact_top_hits(
+    # --- uid 单查 ---
+    if uid:
+        result = _query_by_uid(
+            all_lines=all_lines,
+            header_lines=header_lines,
+            snapshot_lines=snapshot_lines,
+            marker_index=marker_index,
+            uid=uid,
+            max_lines=max_lines,
+            include_ancestors=include_ancestors,
+        )
+        payload["result"] = result
+        return payload
+
+    # --- keyword 单查 ---
+    if keyword:
+        result = _query_by_keyword(
             keyword_target_lines,
-            hit_indices,
-            keyword=result.get("keyword") or (keyword or ""),
-            neighbor_lines=1,          # 关键：带上相邻行，避免丢“粉丝/14”等
-            top_hits_limit=top_hits_limit,
+            keyword,
+            max_lines=max_lines,
+            context_lines=context_lines,
             case_insensitive=True,
         )
 
-        payload["result"] = {
-            "found": result.get("found"),
-            "mode": "keyword_grep_compact",
-            "keyword": result.get("keyword"),
-            "matched": result.get("matched"),
-            "truncated": result.get("truncated"),
-            "returned_lines": result.get("returned_lines"),
-            "top_hits": top_hits,
-        }
+        # compact
+        if compact and isinstance(result, dict) and result.get("mode") == "keyword_grep":
+            payload["result"] = _apply_compact_to_keyword_result(
+                keyword_target_lines=keyword_target_lines,
+                keyword=result.get("keyword") or keyword,
+                result=result,
+                top_hits_limit=top_hits_limit,
+            )
+        else:
+            # 清理内部字段
+            result.pop("hit_indices", None)
+            payload["result"] = result
 
-    # 清理内部字段：避免把 hit_indices 暴露给 LLM（如果你想保留也行）
-    if isinstance(payload.get("result"), dict) and payload["result"].get("mode") == "keyword_grep":
-        payload["result"].pop("hit_indices", None)
+        return payload
 
+    # --- keywords 批量查 ---
+    items: List[Dict[str, Any]] = []
+    for kw in kw_list:
+        r = _query_by_keyword(
+            keyword_target_lines,
+            kw,
+            max_lines=max_lines,
+            context_lines=context_lines,
+            case_insensitive=True,
+        )
+
+        if compact and isinstance(r, dict) and r.get("mode") == "keyword_grep":
+            r_compact = _apply_compact_to_keyword_result(
+                keyword_target_lines=keyword_target_lines,
+                keyword=r.get("keyword") or kw,
+                result=r,
+                top_hits_limit=top_hits_limit,
+            )
+            items.append({"keyword": kw, "result": r_compact})
+        else:
+            # 清理内部字段
+            if isinstance(r, dict):
+                r.pop("hit_indices", None)
+            items.append({"keyword": kw, "result": r})
+
+    payload["result"] = {
+        "found": True,
+        "mode": "keyword_grep_batch",
+        "count": len(items),
+        "items": items,
+    }
     return payload
 
 
@@ -432,6 +561,7 @@ class SnapshotQueryTool(Tool):
         self.name = "snapshot_query"
         self.description = (
             "Query latest a11y snapshot file by uid subtree or keyword grep. "
+            "Supports batch keyword search via 'keywords'. "
             "Supports both take_snapshot (snapshot_latest.txt) and wait_for logs (wait_for_log_latest.txt) "
             "via latest_path. Default searches only within '## Latest page snapshot' section."
         )
@@ -452,6 +582,11 @@ class SnapshotQueryTool(Tool):
                         },
                         "uid": {"type": "string", "description": "Find subtree by uid (preferred)."},
                         "keyword": {"type": "string", "description": "Search by keyword (grep-like)."},
+                        "keywords": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Batch search keywords. Cannot be used with uid/keyword in the same call.",
+                        },
                         "max_lines": {"type": "integer", "default": 60, "minimum": 20, "maximum": 2000},
                         "context_lines": {"type": "integer", "default": 2, "minimum": 0, "maximum": 50},
                         "include_ancestors": {"type": "boolean", "default": True},
@@ -464,7 +599,7 @@ class SnapshotQueryTool(Tool):
                         "compact": {
                             "type": "boolean",
                             "default": False,
-                            "description": "If true and mode=keyword_grep, return only compact top hit excerpts to reduce noise/tokens.",
+                            "description": "If true and mode=keyword_grep, return only compact top hit excerpts to reduce noise/tokens. Applies to batch too.",
                         },
                         "top_hits_limit": {
                             "type": "integer",
@@ -486,6 +621,7 @@ class SnapshotQueryTool(Tool):
             latest_path=kwargs.get("latest_path", DEFAULT_LATEST_PATH),
             uid=kwargs.get("uid"),
             keyword=kwargs.get("keyword"),
+            keywords=kwargs.get("keywords"),
             max_lines=int(kwargs.get("max_lines", 60)),
             context_lines=int(kwargs.get("context_lines", 2)),
             include_ancestors=bool(kwargs.get("include_ancestors", True)),
