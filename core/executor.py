@@ -2,6 +2,7 @@
 ReAct 执行引擎
 实现 Thought → Action → Observation 的循环逻辑
 """
+import time
 import asyncio
 import json
 import logging
@@ -570,9 +571,8 @@ class TaskExecutor:
                 observations_map = {observation.get("action_id"): observation for observation in
                                     step.get("observations")} if step.get("observations") else {}
                 if step.get("tool_calls"):
-                    messages.append({"role": "assistant",
-                                     "content": json.dumps({"type": "tool", "message": "__tool_calls__"},
-                                                           ensure_ascii=False), "tool_calls": step.get("tool_calls")})
+                    # messages.append({"role": "assistant","content": json.dumps({"type": "tool", "message": "__tool_calls__"},ensure_ascii=False), "tool_calls": step.get("tool_calls")})
+                    messages.append({"role": "assistant", "tool_calls": step.get("tool_calls")})
                     for call in step.get("tool_calls"):
                         observation = observations_map.get(call.get("id"))
                         if not observation:
@@ -792,6 +792,28 @@ class TaskExecutor:
                             timeout_s=10.0,
                         )
                     )
+                # async def _bg_screenshot():
+                #     try:
+                #         t0 = time.time()
+                #         logger.info("take_screenshot start path=%s", screenshot_path)
+                #         await asyncio.wait_for(
+                #             screenshot_tool.execute(filePath=screenshot_path),
+                #             timeout=15.0
+                #         )
+                #         logger.info("take_screenshot end cost=%.3fs", time.time() - t0)
+                #     except asyncio.TimeoutError:
+                #         logger.warning("take_screenshot timeout, abort")
+                #         return
+                #     await wait_and_emit_screenshot_event(
+                #             self.ws_manager,
+                #             client_id=trace.client_id,
+                #             agent_id=trace.trace_id,
+                #             turn_id=turn.turn_id,
+                #             img_path=screenshot_path,
+                #             timeout_s=10.0,
+                #         )
+                # asyncio.create_task(_bg_screenshot())
+
             return ObservationV2(observation_id=observation_id,
                                  action_id=action.action_id,
                                  type=ObservationType.TOOL_RESULT,

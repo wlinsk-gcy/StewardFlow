@@ -1,7 +1,7 @@
 {
-  "name": "owner_manus_ui",
+  "name": "steward_flow",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

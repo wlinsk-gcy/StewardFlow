@@ -32,13 +32,11 @@ class MCPToolProxy(Tool):
         if content and isinstance(content[0], TextContent):
             text = content[0].text
             logger.info(f"'{self.name}' MCP Proxy Tool Result length: {len(text)}")
-            if should_summarize_snapshot(self.name, text):
+            if should_summarize_snapshot(self.name):
                 try:
-                    save_snapshot_raw(text)
+                    return save_snapshot_raw(self.name, text)
                 except Exception as e:
                     logger.warning(f"Failed to save snapshot logs: {e}")
-                summary = build_snapshot_summary(text, max_tokens=1000, max_items=120)
-                logger.info(f"MCP Proxy Tool summary Result length: {len(summary)}")
-                return summary
+                    raise e
             return text
         return json.dumps(res)

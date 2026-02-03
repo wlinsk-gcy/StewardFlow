@@ -7,9 +7,9 @@ log:
 snapshot_path: data
 
 llm:
-  model: 改成你使用的模型
+  model: deepseek-v3.2
   api_key: 改成你的key
-  base_url: 改成对应供应商的url
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   temperature: 1.0
 
 tools:
@@ -18,7 +18,7 @@ tools:
     paywall_keywords: ["subscribe", "login to continue", "access denied", "restricted content", "404", "this page is not working"]
 
 context:
-  pre_rot_threshold_tokens: 160000
+  pre_rot_threshold_tokens: 12200 # deepseek-v3.2最大输入长度96K 取12.8% ~ 20.0% 作为腐烂前阈值
   keep_recent_ratio: 0.30
   compaction_ratio: 0.70
   summarization_ratio: 0.70
@@ -36,10 +36,3 @@ context:
   backfill_case_sensitive: false
   auto_backfill_enabled: true
   auto_backfill_max_patterns: 6
-  auto_backfill_keywords:
-    - error
-    - exception
-    - traceback
-    - ��־
-    - ����
-    - ·��
