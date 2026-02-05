@@ -5,6 +5,7 @@ FastAPI ReAct + HITL Agent MVP
 import sys
 import asyncio
 import os
+
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 import logging
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from context import request_id_ctx, agent_id_ctx
+from context import request_id_ctx, trace_id_ctx
 
 from utils.id_util import get_sonyflake
 from utils.screenshot_util import clean_screenshot
@@ -29,18 +30,19 @@ from core.tools.read import ReadTool
 from core.tools.snapshot_query import SnapshotQueryTool
 from core.mcp.client import MCPClient
 
-from core.services.agent_service import AgentService
 from core.services.task_service import TaskService
 from api.routes import router as agent_router
 from ws.connection_manager import ConnectionManager
+from core.cache_manager import InMemoryCacheManager
+from core.builder.build import build_system_prompt
 
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 snapshot_path = (
-    config.get("snapshot_path")
-    or config.get("snapshot_path")
-    or (config.get("snapshot") or {}).get("path")
+        config.get("snapshot_path")
+        or config.get("snapshot_path")
+        or (config.get("snapshot") or {}).get("path")
 )
 if snapshot_path:
     os.environ["SNAPSHOT_PATH"] = str(snapshot_path)
@@ -51,7 +53,7 @@ class RequestIdFilter(logging.Filter):
         # request
         record.request_id = request_id_ctx.get()
         # agent runtime
-        record.agent_id = agent_id_ctx.get()
+        record.trace_id = trace_id_ctx.get()
         return True
 
 
@@ -60,7 +62,7 @@ logger.setLevel(logging.INFO)
 
 handler = logging.StreamHandler()
 formatter = logging.Formatter(
-    "%(asctime)s | req=%(request_id)s | agent=%(agent_id)s | "
+    "%(asctime)s | req=%(request_id)s | trace=%(trace_id)s | "
     "%(levelname)s | %(filename)s:%(lineno)d | %(name)s | %(message)s"
 )
 handler.setFormatter(formatter)
@@ -70,15 +72,8 @@ logger.handlers.clear()
 logger.addHandler(handler)
 
 
-def init_load_tools(tools_config: dict | None = None):
+def init_load_tools():
     registry = ToolRegistry()
-    # search_config = tools_config.get("web_search") if tools_config else None
-    # if search_config:
-    #     from core.tools.web_search_use_serpapi import WebSearch
-    #     registry.register(WebSearch(search_config.get("api_key"), search_config.get("paywall_keywords")))
-    # else:
-    #     from core.tools.web_search_use_exa import WebSearch
-    #     registry.register(WebSearch())
     from core.tools.web_search_use_exa import WebSearch
     registry.register(WebSearch())
     registry.register(BashTool())
@@ -93,10 +88,10 @@ def init_load_tools(tools_config: dict | None = None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ===== startup =====
-    ws_manager = ConnectionManager() # ws管理器
-    checkpoint = CheckpointStore() # AgentState快照储存器
-    tool_registry = init_load_tools(config.get("tools")) # 工具管理器
-    mcp_client = MCPClient(config = "./mcp_config.json")
+    ws_manager = ConnectionManager()
+    checkpoint = CheckpointStore()
+    tool_registry = init_load_tools()
+    mcp_client = MCPClient(config="./mcp_config.json")
     await mcp_client.initialize(tool_registry)
     llm_config = config.get("llm")
     provider = Provider(llm_config.get("model"),
@@ -105,15 +100,15 @@ async def lifespan(app: FastAPI):
                         tool_registry,
                         ws_manager,
                         config.get("context"))
+    cache_manager = InMemoryCacheManager(model=llm_config.get("model"), api_key=llm_config.get("api_key"),
+                                         base_url=llm_config.get("base_url"),
+                                         build_system_prompt_fn=build_system_prompt)
 
-
-    agent_service = AgentService(checkpoint, provider, tool_registry, ws_manager)
-    task_service = TaskService(checkpoint, provider, tool_registry, ws_manager)
+    task_service = TaskService(checkpoint, provider, tool_registry, ws_manager, cache_manager)
 
     app.state.checkpoint = checkpoint
     app.state.tool_registry = tool_registry
     app.state.provider = provider
-    app.state.agent_service = agent_service
     app.state.ws_manager = ws_manager
 
     app.state.task_service = task_service
@@ -154,6 +149,7 @@ async def request_id_middleware(request: Request, call_next):
     finally:
         request_id_ctx.reset(token)
 
+
 # 注册路由
 app.include_router(agent_router)
 
@@ -170,6 +166,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     except WebSocketDisconnect:
         ws_manager.disconnect(client_id)
         logger.info(f"Disconnected from client: {client_id}")
+
 
 # 根路径
 @app.get("/")

@@ -7,10 +7,9 @@ import logging
 from fastapi import APIRouter, HTTPException, Depends
 
 from core.protocol import (
-    AgentStatus, NodeType, HITLResponse, RunAgentRequest, RunAgentResponse
+    AgentStatus, NodeType, RunAgentRequest, RunAgentResponse
 )
 
-from core.services.agent_service import AgentService
 from core.services.task_service import TaskService
 from core.storage.checkpoint import CheckpointStore
 
@@ -18,11 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 # 全局依赖注入（通过 app.state 传递）
-def get_agent_service() -> AgentService:
-    """获取 AgentService 实例"""
-    from main import app
-    return app.state.agent_service
-
 def get_task_service() -> TaskService:
     from main import app
     return app.state.task_service
@@ -42,16 +36,7 @@ router = APIRouter(prefix="/agent", tags=["Agent"])
 async def run_agent(
         request: RunAgentRequest,
         task_service: TaskService = Depends(get_task_service)
-        # agent_service: AgentService = Depends(get_agent_service)
 ):
-    """
-    启动一次 Agent 执行
-
-    流程：
-    1. 创建 Agent 实例
-    2. 启动后台任务执行 ReAct 循环
-    3. 立即返回 agent_id
-    """
 
     def callback(task: asyncio.Task):
         try:
@@ -81,7 +66,6 @@ async def run_agent(
     task = asyncio.create_task(task_service.start(trace))
     task.add_done_callback(callback)
 
-    # 返回
     return RunAgentResponse(trace_id=trace.trace_id)
 
 

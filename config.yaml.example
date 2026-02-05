@@ -10,25 +10,3 @@ llm:
   model: deepseek-v3.2
   api_key: 改成你的key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  temperature: 1.0
-
-
-context:
-  pre_rot_threshold_tokens: 19200 # deepseek-v3.2最大输入长度96K 取12.8% ~ 20.0% 作为腐烂前阈值
-  keep_recent_ratio: 0.30
-  compaction_ratio: 0.70
-  summarization_ratio: 0.70
-  dump_dir: data
-  summary_max_tokens: 2048
-  summary_temperature: 0.2
-  web_search_top_n: 5
-  bash_max_key_lines: 6
-  ls_glob_max_items: 20
-  grep_max_matches: 5
-  read_max_chars: 800
-  read_tail_chars: 200
-  backfill_max_matches: 20
-  backfill_max_chars: 4000
-  backfill_case_sensitive: false
-  auto_backfill_enabled: true
-  auto_backfill_max_patterns: 6

@@ -3,7 +3,7 @@ import json
 from typing import cast
 from core.tools.tool import Tool
 from mcp.types import TextContent
-from utils.snapshot_util import should_summarize_snapshot, save_snapshot_raw, build_snapshot_summary
+from utils.snapshot_util import save_snapshot_raw
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class MCPToolProxy(Tool):
     async def do_another(self, **kwargs) -> str:
         if self.name == "chrome-devtools_take_snapshot":
             try:
-                return save_snapshot_raw(self.name, kwargs.get("text"))
+                return save_snapshot_raw(kwargs.get("text"))
             except Exception as e:
                 logger.warning(f"{self.name}' MCP Proxy Tool Result Failed to save snapshot logs: {e}")
                 raise e
@@ -42,13 +42,6 @@ class MCPToolProxy(Tool):
                 return text
         else:
             return ""
-        # if not should_summarize_snapshot(self.name):
-        #     return ""
-        # try:
-        #     return save_snapshot_raw(self.name, kwargs.get("text"))
-        # except Exception as e:
-        #     logger.warning(f"{self.name}' MCP Proxy Tool Result Failed to save snapshot logs: {e}")
-        #     raise e
 
 
     async def execute(self, **kwargs) -> str:

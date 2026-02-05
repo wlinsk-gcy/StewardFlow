@@ -1,18 +1,18 @@
 import re
 import logging
 import json
-from typing import Dict, Any, List, cast
+from typing import Dict, Any, List, Optional, cast
 from openai import OpenAI,AsyncOpenAI
 from .tools.tool import ToolRegistry
-from .extractor import THINK_PATTERN, ThinkStreamExtractor
-from .json_stream_filter import HybridJSONStreamFilter
-from .builder.build import llm_response_schema,build_system_prompt, llm_response_schema_v2, build_system_prompt_v2
-from .context_manager import ContextManager, ContextManagerConfig
+
+from .builder.build import build_system_prompt, llm_response_schema
 from ws.connection_manager import ConnectionManager
-from .protocol import Event, EventType, ActionV2,ActionType, Trace,Turn,Step,ObservationV2
+from .protocol import Action,ActionType,Step
 from utils.id_util import get_sonyflake
 
 logger = logging.getLogger(__name__)
+
+THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 def normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     if not tool_calls:
@@ -42,17 +42,57 @@ def safe_parse_tool_args(arg_str: str) -> dict:
         logger.warning("Invalid tool arguments JSON: %r", s[:200])
         return {}  # 或 raise，看你是否愿意 fail fast
 
+def _extract_first_balanced_json_object(text: str) -> Optional[str]:
+    """
+    从 text 中抽取第一个“完整配对”的 JSON 对象：{ ... }。
+    关键：忽略字符串中的花括号，并处理转义字符。
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    in_str = False
+    escape = False
+    depth = 0
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i+1].strip()
+
+    return None
+
 JSON_CODEBLOCK_RE = re.compile(
     r"```(?:json)?\s*([\s\S]*?)\s*```",
     re.IGNORECASE
 )
 
-def extract_json_from_markdown(s: str) -> str:
+def extract_json(s: str) -> str:
     s = (s or "").strip()
+    # markdown code block
     m = JSON_CODEBLOCK_RE.search(s)
     if m:
         return m.group(1).strip()
-    return s
+    else:
+        res =  _extract_first_balanced_json_object(s)
+        return res if res else s
 
 
 
@@ -76,213 +116,8 @@ class Provider:
         self.tool_registry = tool_registry
         self.system_prompt = build_system_prompt()
         self.ws_manager = ws_manager
-        cfg = ContextManagerConfig(**(context_config or {}))
-        self.context_manager = ContextManager(cfg, self.client, self.model)
 
-    def generate(self, context: Dict[str, Any]) -> tuple[str, dict]:
-        tool_schemas = self.tool_registry.get_all_schemas()
-        messages, audit = self.context_manager.build_messages(
-            context,
-            self.system_prompt,
-            tool_schemas,
-            llm_response_schema,
-        )
-        logger.info(f"[context_manager] stage={audit.get('stage')} token_est={audit.get('token_estimate')} dump={audit.get('dump_path')}")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.2,
-            top_p=0.9,
-            tools=tool_schemas,
-            response_format=llm_response_schema,
-        )
-        if response is None:
-            raise Exception("OpenAI response is empty.")
-        result = response.choices[0].message.content
-        # logger.info(f"===result: {result}")
-        if response.usage.prompt_tokens_details:
-            logger.info(f"====Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
-        logger.info(
-            f"消耗输入token：{response.usage.prompt_tokens}\n消耗输出token：{response.usage.completion_tokens}\n总消耗token：{response.usage.total_tokens}")
-        if response.usage and response.usage.prompt_tokens:
-            self.context_manager.update_calibration(
-                response.usage.prompt_tokens,
-                messages,
-                tool_schemas,
-                llm_response_schema,
-            )
-
-        token_info = {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens
-        }
-        think_match = THINK_PATTERN.search(result)
-        think_content = think_match.group(1).strip() if think_match else None
-
-        logger.info(f"===think_content: {think_content}")
-        result = THINK_PATTERN.sub("", result).strip()
-        return result, token_info
-
-    async def stream_generate(self, context: Dict[str, Any]) -> tuple[str, dict]:
-        tool_schemas = self.tool_registry.get_all_schemas()
-        messages, audit = self.context_manager.build_messages(
-            context,
-            self.system_prompt,
-            tool_schemas,
-            llm_response_schema,
-        )
-        logger.info(f"[context_manager] stage={audit.get('stage')} token_est={audit.get('token_estimate')} dump={audit.get('dump_path')}")
-        extractor = ThinkStreamExtractor()
-        json_filter = HybridJSONStreamFilter()
-
-        result = ""
-
-        last_prompt_tokens = None
-
-        # 只在真正产生 prompt/answer 时才发 END
-        stream_kind = None  # "prompt" | "answer" | None
-        ended = False
-
-        # 防止 provider 一直吐空白（\n / spaces）不 stop
-        # 暴力熔断，可能导致JSON不完整。
-        blank_run = 0
-        MAX_BLANK_RUN = 120  # 可按你的模型/网络情况调整
-
-        token_info = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        }
-
-        try:
-            stream = await self.async_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.2,
-                top_p=0.9,
-                tools=tool_schemas,
-                response_format=llm_response_schema,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-            async for chunk in stream:
-                # logger.info(f"chunk: {chunk}")
-                if not chunk.choices:
-                    logger.info(f"[LLM usage] {chunk.usage}")
-                    if chunk.usage and getattr(chunk.usage, "prompt_tokens", None) is not None:
-                        last_prompt_tokens = chunk.usage.prompt_tokens
-                    continue
-
-                choice = chunk.choices[0]
-                delta = choice.delta
-                finish_reason = choice.finish_reason  # Qwen 系列
-                if not delta:
-                    # 即便 delta 为空，也可能 finish_reason=stop
-                    if finish_reason == "stop" and not ended:
-                        ended = True
-                        if stream_kind in ("prompt", "answer"):
-                            event = Event(EventType.END, context.get("agent_id"), context.get("turn_id"),
-                                          {"content": "done"})
-                            await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-                        break
-                    continue
-
-                # 处理 reasoning_content（Qwen 会把推理放这），只打日志/trace，不喂 json_filter
-                rc = getattr(delta, "reasoning_content", None)
-                if rc:
-                    # 可以按需打印，别推给前端 chat
-                    # logger.info(f"[LLM reasoning] {rc}")
-                    pass
-
-                # 处理 delta.content（你真正关心的 JSON 输出）
-                if not getattr(delta, "content", None):
-                    # 没有 content 也检查 stop
-                    if finish_reason == "stop" and not ended:
-                        ended = True
-                        if stream_kind in ("prompt", "answer"):
-                            event = Event(EventType.END, context.get("agent_id"), context.get("turn_id"),
-                                          {"content": "done"})
-                            await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-                        break
-                    continue
-
-                # 空白熔断（避免一直 \n）
-                content = delta.content
-                if content.strip():
-                    blank_run = 0
-                else:
-                    blank_run += 1
-                    if blank_run >= MAX_BLANK_RUN:
-                        logger.warning(f"[LLM stream] too many blank chunks ({blank_run}), force break")
-                        if not ended:
-                            ended = True
-                            # 仍保持你的语义：只有产生过 prompt/answer 才发 END
-                            if stream_kind in ("prompt", "answer"):
-                                event = Event(EventType.END, context.get("agent_id"), context.get("turn_id"),
-                                              {"content": "done", "reason": "blank_run"})
-                                await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-                        break
-                        # 继续等下一块
-                    continue
-
-                # normal_parts: <think>标签外的内容
-                # think_parts: <think>标签内的内容
-                normal_parts, think_parts = extractor.feed(delta.content) # 用于deepseek / minimax等模型
-                # think：只打日志
-                # for t in think_parts:
-                    # logger.info(f"[LLM THINK] {t}")
-
-                # normal：流式输出
-                for n in normal_parts:
-                    # logger.info(f"[LLM normal_parts] {n}")
-                    result += n
-                    events = json_filter.feed(n)
-                    for event_type, text in events:
-                        stream_kind = event_type
-                        if event_type == "prompt":
-                            # 这里是 action.prompt，即给用户的HITL提示词
-                            event = Event(EventType.HITL_REQUEST,
-                                          context.get("agent_id"),
-                                          context.get("turn_id"),
-                                          {"content": text})
-                            await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-                        elif event_type == "answer":
-                            event = Event(EventType.ANSWER,
-                                          context.get("agent_id"),
-                                          context.get("turn_id"),
-                                          {"content": text})
-                            await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-                # stop：只发一次 END，并且 break（非常关键）
-                if finish_reason == "stop" and not ended:
-                    ended = True
-                    if stream_kind in ("prompt", "answer"):
-                        event = Event(EventType.END, context.get("agent_id"), context.get("turn_id"),
-                                      {"content": "done"})
-                        await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-                    break
-
-            if last_prompt_tokens:
-                self.context_manager.update_calibration(
-                    last_prompt_tokens,
-                    messages,
-                    tool_schemas,
-                    llm_response_schema,
-                )
-
-            return result, token_info
-        except Exception as e:
-            event = Event(EventType.ERROR,
-                          context.get("agent_id"),
-                          context.get("turn_id"),
-                          {"content": str(e)})
-            await self.ws_manager.send(event.to_dict(), context.get("client_id"))
-            logger.error(f"[LLM GENERATE ERROR] {e}")
-            raise e
-
-
-
-    def generate_v2(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
+    def generate(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
         is_thinking = context.get("is_thinking", False)
         # TODO 针对429 Error Code做 Retry
@@ -292,7 +127,7 @@ class Provider:
             temperature=0.2,
             top_p=0.9,
             tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot","chrome-devtools_evaluate_script"]),
-            response_format=llm_response_schema_v2,
+            response_format=llm_response_schema,
             extra_body={"enable_thinking": is_thinking},
             parallel_tool_calls=True,
         )
@@ -309,23 +144,29 @@ class Provider:
             step.tool_calls = normalize_tool_calls(response.choices[0].message.tool_calls)
             for call in calls:
                 tool = self.tool_registry.get(call.function.name)
-                action = ActionV2(action_id=call.id,
-                                  type=ActionType.TOOL,
-                                  tool_name=call.function.name,
-                                  args=safe_parse_tool_args(call.function.arguments),
-                                  requires_confirm=tool.requires_confirmation,
-                                  confirm_status="pending" if tool.requires_confirmation else None)
+                action = Action(action_id=call.id,
+                                type=ActionType.TOOL,
+                                tool_name=call.function.name,
+                                args=safe_parse_tool_args(call.function.arguments),
+                                requires_confirm=tool.requires_confirmation,
+                                confirm_status="pending" if tool.requires_confirmation else None)
                 actions.append(action)
         else:
             logger.info(f"llm result: {content}")
-            content = extract_json_from_markdown(content)
-            res = json.loads(content)
-            actions.append(ActionV2(action_id=get_sonyflake("action_"),type=ActionType(res["type"]),message=res["message"], full_ref=raw))
+            content = extract_json(content)
+            raw = content # raw回传回LLM，把raw收敛成标准json
+            try:
+                res = json.loads(content)
+            except Exception as e:
+                logger.error(f"parse llm raw content error: {e}")
+                # 兜底 -- json解析失败，让用户自己输入新的需求
+                res = {"type": "request_input", "message": content}
+                raw = json.dumps(res,ensure_ascii=False)
+            actions.append(Action(action_id=get_sonyflake("action_"), type=ActionType(res["type"]), message=res["message"], full_ref=raw))
 
         if response.usage.prompt_tokens_details:
-            logger.info(f"====Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
-        logger.info(
-            f"消耗输入token：{response.usage.prompt_tokens}\n消耗输出token：{response.usage.completion_tokens}\n总消耗token：{response.usage.total_tokens}")
+            logger.info(f"Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
+        logger.info(f"Prompt Token：{response.usage.prompt_tokens}, Completion Token：{response.usage.completion_tokens}, Total Token：{response.usage.total_tokens}")
         token_info = {
             "cache_tokens": response.usage.prompt_tokens_details.cached_tokens if response.usage.prompt_tokens_details else 0,
             "prompt_tokens": response.usage.prompt_tokens,
