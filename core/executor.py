@@ -79,7 +79,6 @@ class TaskExecutor:
                     return
 
     async def _think(self, trace: Trace, turn: Turn) -> Step:
-        # 一轮think创建新的Step
         step = Step(index=len(turn.steps) + 1)
         turn.steps.append(step)
         trace.current_step_id = step.step_id

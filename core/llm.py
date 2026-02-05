@@ -119,7 +119,7 @@ class Provider:
 
     def generate(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
-        is_thinking = context.get("is_thinking", False)
+        is_thinking = context.get("is_thinking", True)
         # TODO 针对429 Error Code做 Retry
         response = self.client.chat.completions.create(
             model=self.model,

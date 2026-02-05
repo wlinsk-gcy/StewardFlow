@@ -1,0 +1,69 @@
+﻿# StewardFlow: ReAct & HITL Agent
+
+![StewardFlow Banner](public/banner.png)
+
+StewardFlow is a FastAPI-based ReAct + HITL (Human-in-the-Loop) agent system. It provides a visual front-end workspace, traceable execution logs, and extensible integrations for tools and MCP services. It is well-suited for quickly building intelligent assistants that are **controllable, traceable, and reproducible**.
+
+## Key Features
+- **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
+- **Tool system**: built-in tools such as `bash`, `ls`, `grep`, `glob`, `read`, `snapshot_query`, etc.
+- **Web search & screenshot relay**: the UI can display browser screenshots and retrieval results
+- **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
+- **Frontend-backend separation**: FastAPI backend + Vite/React frontend workspace
+
+## Project Structure (Key Files)
+- `main.py`: backend entry point
+- `config.yaml.example`: backend configuration example
+- `mcp_config.json.example`: MCP service configuration example
+- `ui/`: frontend project (Vite + React)
+- `public/banner.png`: banner image at the top of the README
+
+## Quick Start
+
+### 1. Configure the backend
+```bash
+cp config.yaml.example config.yaml
+```
+
+Edit config.yaml and fill in at least:
+- llm.api_key
+- llm.model
+- llm.base_url
+
+If you need MCP services (optional):
+```
+cp mcp_config.json.example mcp_config.json
+```
+
+### 2. Start the backend
+```
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+Default port: `8000` (can be changed via `app.port` in `config.yaml`)
+
+### 3. Start the frontend
+```
+cd ui
+npm install
+npm run dev
+```
+Default URL: http://localhost:5173
+
+### 4. Open the UI and start using it
+- The frontend communicates with the backend via `http://localhost:8000`
+- WebSocket connects to `ws://localhost:8000/ws/{client_id}` to receive real-time events
+
+## Configuration
+### `config.yaml`
+- `app.port`: backend listening port
+- `log.level`: log level (e.g., info)
+- `snapshot_path`: directory to store screenshots/snapshots (default: `data`)
+- `llm.model` / `llm.api_key` / `llm.base_url`: LLM provider settings
+
+## API Endpoints
+- `POST /agent/run`: start or continue a task
+- `GET /agent/health`: agent subsystem health check
+- `GET /health`: service health check
