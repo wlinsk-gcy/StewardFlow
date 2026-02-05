@@ -4,6 +4,28 @@
 
 StewardFlow is a FastAPI-based ReAct + HITL (Human-in-the-Loop) agent system. It provides a visual front-end workspace, traceable execution logs, and extensible integrations for tools and MCP services. It is well-suited for quickly building intelligent assistants that are **controllable, traceable, and reproducible**.
 
+## Demo
+
+The LLM used in this case is deepseek-v3.2
+
+> If you don't have a deepseek API key, you have two ways to experience the Agent project.
+> 
+> 1. Go to `https:www.modelscope.cn` to get a free API key, which supports 20 free model calls per day
+> 2. Go to `https:bailian.console.aliyun.com` to apply for a free API Key, and new users can get a free trial credit of 1 million tokens for the deepseek-v3.2 model.
+
+
+### 1. Open Xiaohongshu, search for the homepage of the Qianwen model, and summarize
+
+**You can watch the 'public/demo1.mp4' video**
+
+### 2. 查看当前目录有哪些文件？
+
+**You can watch the 'public/demo2.mp4' video**
+
+### 3. 使用bash工具执行dir命令，查看当前目录有什么东西
+
+**You can watch the 'public/demo3.mp4' video**
+
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
 - **Tool system**: built-in tools such as `bash`, `ls`, `grep`, `glob`, `read`, `snapshot_query`, etc.

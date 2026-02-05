@@ -8,17 +8,24 @@ StewardFlow 是一个基于 FastAPI 的 ReAct + HITL（人机协作）智能体�
 
 ## Demo
 
+本案例使用的LLM为：deepseek-v3.2
+
+> 如果你没有deepseek的API Key，你有两种方式可以体验Agent项目。
+> 
+> 1. 到 `https://www.modelscope.cn/` 获取免费的API Key，支持每天免费20次模型调用
+> 2. 到 `https://bailian.console.aliyun.com/` 申请免费API Key，新用户可以获取deepseek-v3.2模型100万tokens的免费体验额度。
+
 ### 1. 打开小红书，搜索千问大模型的主页，并总结
 
-<video src="./public/demo1.mp4"></video>
+**可以观看`public/demo1.mp4`视频**
 
 ### 2. 查看当前目录有哪些文件？
 
-<video src="./public/demo2.mp4"></video>
+**可以观看`public/demo2.mp4`视频**
 
 ### 3. 使用bash工具执行dir命令，查看当前目录有什么东西
 
-<video src="./public/demo3.mp4"></video>
+**可以观看`public/demo3.mp4`视频**
 
 ## 功能概览
 - ReAct + HITL 任务编排：支持需要用户确认或补充输入的步骤
