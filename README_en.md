@@ -91,8 +91,10 @@ Default URL: http://localhost:5173
 ## Ref Retrieval Workflow
 - If an observation is `kind=ref`, only summary/preview and `ref.path` are in context.
 - Recommended retrieval chain:
-  1. Run `text_search` on `ref.path` to locate relevant lines
-  2. Run `fs_read(path, offset, length)` to read bounded snippets
+  1. Run `text_search(path=ref.path, query=..., max_matches=..., context_lines=...)` first
+  2. Use `matches[0].line` as the line anchor
+  3. Run `fs_read(path=ref.path, start_line=line-2, max_lines=40, max_bytes=...)` for bounded snippets
+  4. Use `offset/length` only as an advanced fine-tuning fallback
 - `snapshot_query` style per-tool query helpers are no longer used.
 
 ## API Endpoints

@@ -91,8 +91,10 @@ npm run dev
 ## Ref 读回机制
 - 当 observation 为 `kind=ref` 时，只会返回摘要与 `ref.path`。
 - 读回建议流程：
-  1. 用 `text_search` 在 `ref.path` 定位关键词
-  2. 用 `fs_read(path, offset, length)` 读取小片段
+  1. 用 `text_search(path=ref.path, query=..., max_matches=..., context_lines=...)` 先定位
+  2. 取 `matches[0].line` 作为行号锚点
+  3. 用 `fs_read(path=ref.path, start_line=line-2, max_lines=40, max_bytes=...)` 读取片段
+  4. 只有在仍需精细定位时，再使用 `offset/length` 作为高级微调
 - 不再使用 `snapshot_query` 这类按工具定制的查询工具。
 
 ## API 入口

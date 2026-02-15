@@ -19,7 +19,11 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - Process execution: use proc_run(program, args, ...) only (argv form).
 - Tool observations are strict JSON objects.
 - If a tool observation is `kind="ref"`, do not assume full content is in context.
-- For `kind="ref"`: first use `text_search` on `ref.path`, then use `fs_read` with bounded `offset/length`.
+- For `kind="ref"`: use this default retrieval chain:
+  1) `text_search(path=ref.path, query=..., max_matches=..., context_lines=...)`
+  2) read `matches[0].line`
+  3) `fs_read(path=ref.path, start_line=line-2, max_lines=40, max_bytes=...)`
+  4) use `offset/length` only when line-based reading still needs fine-grained adjustment.
 - Never attempt to read the entire referenced file in one call.
 
 # Output (Strict)
