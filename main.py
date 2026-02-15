@@ -19,15 +19,14 @@ from context import request_id_ctx, trace_id_ctx
 
 from utils.id_util import get_sonyflake
 from utils.screenshot_util import clean_screenshot
-from utils.snapshot_util import clear_snapshot_logs
 from utils.tool_artifacts_util import clear_tool_artifacts
 from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
+from core.tool_result_externalizer import ToolResultExternalizerConfig
 from core.tools.tool import ToolRegistry
 from core.tools.proc_run import ProcRunTool
 from core.tools.fs_tools import FsListTool, FsGlobTool, FsReadTool, FsWriteTool, FsStatTool
 from core.tools.text_search import TextSearchTool
-from core.tools.snapshot_query import SnapshotQueryTool
 from core.tools.rg_loader import ensure_rg
 from core.mcp.client import MCPClient
 
@@ -42,13 +41,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-snapshot_path = (
-        config.get("snapshot_path")
-        or config.get("snapshot_path")
-        or (config.get("snapshot") or {}).get("path")
+tool_result_config = ToolResultExternalizerConfig.from_dict(config.get("tool_result"))
+os.environ["TOOL_RESULT_ROOT_DIR"] = tool_result_config.root_dir
+os.environ["TOOL_RESULT_FS_READ_MAX_CHARS"] = str(
+    (config.get("tool_result") or {}).get("fs_read_max_chars", 4000)
 )
-if snapshot_path:
-    os.environ["SNAPSHOT_PATH"] = str(snapshot_path)
 
 
 class RequestIdFilter(logging.Filter):
@@ -86,7 +83,6 @@ def init_load_tools():
     registry.register(FsStatTool())
     registry.register(TextSearchTool())
     registry.register(ProcRunTool())
-    registry.register(SnapshotQueryTool())
     return registry
 
 
@@ -96,6 +92,7 @@ async def lifespan(app: FastAPI):
     rg_path, installed_now = ensure_rg(project_root=PROJECT_ROOT)
     app.state.rg_path = str(rg_path)
     app.state.rg_installed_now = installed_now
+    os.environ["TOOL_RESULT_RG_PATH"] = str(rg_path)
 
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
@@ -113,7 +110,14 @@ async def lifespan(app: FastAPI):
                                          base_url=llm_config.get("base_url"),
                                          build_system_prompt_fn=build_system_prompt)
 
-    task_service = TaskService(checkpoint, provider, tool_registry, ws_manager, cache_manager)
+    task_service = TaskService(
+        checkpoint,
+        provider,
+        tool_registry,
+        ws_manager,
+        cache_manager,
+        tool_result_config=tool_result_config,
+    )
 
     app.state.checkpoint = checkpoint
     app.state.tool_registry = tool_registry
@@ -126,7 +130,6 @@ async def lifespan(app: FastAPI):
     # ===== shutdown =====
     await mcp_client.close_all_sessions()
     clean_screenshot()
-    clear_snapshot_logs()
     clear_tool_artifacts()
 
 

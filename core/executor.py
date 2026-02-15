@@ -3,6 +3,7 @@ ReAct 执行引擎
 实现 Thought → Action → Observation 的循环逻辑
 """
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -14,6 +15,10 @@ from .protocol import (
 )
 from .builder.build import llm_response_schema
 from .llm import Provider
+from .tool_result_externalizer import (
+    ToolResultExternalizerConfig,
+    ToolResultExternalizerMiddleware,
+)
 from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
@@ -41,12 +46,16 @@ class TaskExecutor:
     stream: bool = False
 
     def __init__(self, checkpoint: CheckpointStore, provider: Provider, tool_registry: ToolRegistry,
-                 ws_manager: ConnectionManager, cache_manager: CacheManager):
+                 ws_manager: ConnectionManager, cache_manager: CacheManager,
+                 tool_result_config: Optional[ToolResultExternalizerConfig] = None):
         self.llm = provider
         self.tool_registry = tool_registry
         self.checkpoint = checkpoint
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
+        self.tool_result_externalizer = ToolResultExternalizerMiddleware(
+            tool_result_config or ToolResultExternalizerConfig()
+        )
 
     async def run(self, trace: Trace):
         trace.started_at = datetime.utcnow()
@@ -189,7 +198,7 @@ class TaskExecutor:
                 if action.requires_confirm:
                     continue
                 action.status = ActionStatus.RUNNING
-                observation = await self._execute_tool(trace, turn, action)
+                observation = await self._execute_tool(trace, turn, step, action)
                 step.observations.append(observation)
 
             trace.node = NodeType.OBSERVE
@@ -274,7 +283,7 @@ class TaskExecutor:
                                                               step_ids=step_ids)
 
 
-    async def _execute_tool(self, trace: Trace, turn: Turn, action: Action):
+    async def _execute_tool(self, trace: Trace, turn: Turn, step: Step, action: Action):
         tool_name = action.tool_name
         args = action.args
         screenshot_tool = None
@@ -283,24 +292,36 @@ class TaskExecutor:
         if action.confirm_status == "denied":
             # 用户拒绝执行
             action.status = ActionStatus.DONE
-            return Observation(observation_id=observation_id,
-                               action_id=action.action_id,
-                               type=ObservationType.HITL_DENIED,
-                               ok=True,
-                               content=f"The user refuses to perform the current tool call")
+            denied_payload = self.tool_result_externalizer.build_error(
+                tool_name=tool_name or "unknown_tool",
+                error_text="The user refuses to perform the current tool call",
+            )
+            return Observation(
+                observation_id=observation_id,
+                action_id=action.action_id,
+                type=ObservationType.HITL_DENIED,
+                ok=True,
+                content=json.dumps(denied_payload, ensure_ascii=False),
+            )
         tool = self.tool_registry.get(tool_name)
         if not tool:
             action.status = ActionStatus.FAILED
-            return Observation(observation_id=observation_id,
-                               action_id=action.action_id,
-                               type=ObservationType.TOOL_ERROR,
-                               ok=False,
-                               content=f"Tool '{tool_name}' not found")
+            not_found_payload = self.tool_result_externalizer.build_error(
+                tool_name=tool_name or "unknown_tool",
+                error_text=f"Tool '{tool_name}' not found",
+            )
+            return Observation(
+                observation_id=observation_id,
+                action_id=action.action_id,
+                type=ObservationType.TOOL_ERROR,
+                ok=False,
+                content=json.dumps(not_found_payload, ensure_ascii=False),
+            )
         if tool.name in DEFAULT_SCREENSHOT_FLAG:
             screenshot_tool = self.tool_registry.get("chrome-devtools_take_screenshot")
             screenshot_path = f"./.screenshots/{trace.trace_id}_screenshot.png"
         try:
-            execute_result = await tool.execute(**args)
+            execute_result = await tool.execute(**(args or {}))
             if tool_name == "chrome-devtools_wait_for" and execute_result == "wait_for response":
                 # wait_for作为响应屏障，拿到结果后直接snapshot，并返回链接，由LLM按需检索
                 snapshot_tool = self.tool_registry.get("chrome-devtools_take_snapshot")
@@ -321,19 +342,33 @@ class TaskExecutor:
                         )
                     )
 
-            return Observation(observation_id=observation_id,
-                               action_id=action.action_id,
-                               type=ObservationType.TOOL_RESULT,
-                               ok=True,
-                               content=execute_result)
+            observation_payload = self.tool_result_externalizer.externalize(
+                tool_name=tool_name or "unknown_tool",
+                raw_result=execute_result,
+                trace_id=trace.trace_id,
+                turn_id=turn.turn_id,
+                step_id=step.step_id,
+                tool_call_id=action.action_id,
+            )
+            return Observation(
+                observation_id=observation_id,
+                action_id=action.action_id,
+                type=ObservationType.TOOL_RESULT,
+                ok=True,
+                content=json.dumps(observation_payload, ensure_ascii=False),
+            )
         except Exception as e:
             action.status = ActionStatus.FAILED
+            error_payload = self.tool_result_externalizer.build_error(
+                tool_name=tool_name or "unknown_tool",
+                error_text=f"Tool '{tool_name}' executed error: {str(e)}",
+            )
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_ERROR,
                 ok=False,
-                content=f"Tool '{tool_name}' executed error: {str(e)}",
+                content=json.dumps(error_payload, ensure_ascii=False),
             )
 
     async def _request_confirm(self, client_id: str, trace_id: str, turn_id: str, pending_action_id:str, prompt: str,

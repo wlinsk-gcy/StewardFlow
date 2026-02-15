@@ -3,7 +3,6 @@ import json
 from typing import cast
 from core.tools.tool import Tool
 from mcp.types import TextContent
-from utils.snapshot_util import save_snapshot_raw
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +26,7 @@ class MCPToolProxy(Tool):
             }
 
     async def do_another(self, **kwargs) -> str:
-        if self.name == "chrome-devtools_take_snapshot":
-            try:
-                return save_snapshot_raw(kwargs.get("text"))
-            except Exception as e:
-                logger.warning(f"{self.name}' MCP Proxy Tool Result Failed to save snapshot logs: {e}")
-                raise e
-        elif self.name == "chrome-devtools_wait_for":
+        if self.name == "chrome-devtools_wait_for":
             text = cast(str, kwargs.get("text"))
             logger.info(f"'{self.name}' MCP Proxy Tool Result length: {len(text)}")
             if text.startswith("# wait_for response"):

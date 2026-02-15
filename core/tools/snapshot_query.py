@@ -617,16 +617,13 @@ class SnapshotQueryTool(Tool):
         }
 
     async def execute(self, **kwargs) -> str:
-        payload = snapshot_query_latest(
-            latest_path=kwargs.get("latest_path", DEFAULT_LATEST_PATH),
-            uid=kwargs.get("uid"),
-            keyword=kwargs.get("keyword"),
-            keywords=kwargs.get("keywords"),
-            max_lines=int(kwargs.get("max_lines", 60)),
-            context_lines=int(kwargs.get("context_lines", 2)),
-            include_ancestors=bool(kwargs.get("include_ancestors", True)),
-            search_scope=kwargs.get("search_scope", "snapshot"),
-            compact=bool(kwargs.get("compact", False)),
-            top_hits_limit=int(kwargs.get("top_hits_limit", 8)),
-        )
+        del kwargs
+        payload = {
+            "ok": False,
+            "deprecated": True,
+            "message": (
+                "snapshot_query is deprecated. Use text_search on ref.path first, "
+                "then fs_read(path, offset, length) for bounded retrieval."
+            ),
+        }
         return json.dumps(payload, ensure_ascii=False)
