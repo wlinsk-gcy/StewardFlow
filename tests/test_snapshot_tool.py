@@ -1,257 +1,134 @@
 import json
-import os
-import re
+import shutil
 import unittest
+from pathlib import Path
 
-from core.tools.snapshot_query import SnapshotQueryTool
-
-
-UID_ROLE_RE = re.compile(r'uid=([^\s]+)\s+([^\s]+)')          # uid=1_1 banner
-UID_BANNER_RE = re.compile(r'uid=([^\s]+)\s+banner')         # uid=... banner
-UID_TEXTBOX_RE = re.compile(r'uid=([^\s]+)\s+textbox')       # uid=... textbox
+from core.tool_result_externalizer import ToolResultExternalizerConfig, ToolResultExternalizerMiddleware
+from core.tools.fs_tools import FsReadTool
+from core.tools.text_search import TextSearchTool
 
 
-class TestSnapshotQueryTool(unittest.IsolatedAsyncioTestCase):
+class TestSnapshotRefFlow(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.tool = SnapshotQueryTool()
-        self.paths = {
-            "snapshot_latest.txt": os.path.join("data", "snapshot_latest.txt"),
-            "wait_for_log_latest.txt": os.path.join("data", "wait_for_log_latest.txt"),
-        }
-
-    def _skip_if_missing(self, path: str):
-        if not os.path.exists(path):
-            raise unittest.SkipTest(f"missing file: {path}")
-
-    async def _grep(self, latest_path: str, keyword: str, max_lines: int = 300, context_lines: int = 6, compact: bool = True):
-        out = await self.tool.execute(
-            **{
-                "latest_path": latest_path,
-                "keyword": keyword,
-                "max_lines": max_lines,
-                "context_lines": context_lines,
-                "search_scope": "snapshot",
-                "compact": compact,
-                "top_hits_limit": 12,
-            }
+        self.externalizer = ToolResultExternalizerMiddleware(
+            ToolResultExternalizerConfig(
+                inline_limit=80,
+                preview_limit=80,
+                root_dir="data/tool_results",
+                always_externalize_tools={"chrome-devtools_take_snapshot"},
+            )
         )
-        return json.loads(out)
 
-    def _extract_first_uid_by_regex(self, text: str, rx: re.Pattern) -> str:
-        m = rx.search(text)
-        if not m:
-            return ""
-        return m.group(1)
+    def tearDown(self):
+        test_trace_dir = Path("data/tool_results/test_trace")
+        if test_trace_dir.exists():
+            shutil.rmtree(test_trace_dir, ignore_errors=True)
 
-    def _extract_text_from_result(self, result: dict) -> str:
-        """
-        兼容两种返回：
-        - compact: result.top_hits (list[str])
-        - non-compact: result.text (str)
-        """
-        if isinstance(result.get("top_hits"), list) and result["top_hits"]:
-            return "\n".join(result["top_hits"])
-        return result.get("text", "") or ""
-
-    async def _discover_banner_uid(self, latest_path: str) -> str:
-        """
-        通过 keyword=banner 找到第一个 banner 的 uid
-        """
-        payload = await self._grep(latest_path, keyword="banner", max_lines=200, context_lines=1, compact=True)
-        result = payload["result"]
-        if not result.get("found"):
-            return ""
-        text = self._extract_text_from_result(result)
-        return self._extract_first_uid_by_regex(text, UID_BANNER_RE)
-
-    async def _discover_textbox_uid(self, latest_path: str) -> str:
-        """
-        通过 keyword=搜索小红书 找到 textbox 的 uid（更稳定）
-        """
-        payload = await self._grep(latest_path, keyword="搜索小红书", max_lines=200, context_lines=2, compact=True)
-        result = payload["result"]
-        if not result.get("found"):
-            return ""
-        text = self._extract_text_from_result(result)
-
-        # 尽量取 textbox 那行
-        uid = self._extract_first_uid_by_regex(text, UID_TEXTBOX_RE)
-        if uid:
-            return uid
-
-        # 兜底：随便取一个 uid（极少发生）
-        m = UID_ROLE_RE.search(text)
-        return m.group(1) if m else ""
-
-    async def test_uid_subtree_query_banner_both_files(self):
-        """
-        对两个文件都测试 banner 的 uid_subtree：
-        - 必须 found=True
-        - 必须包含自身 banner 行
-        - 通常应包含搜索框/创作中心等 banner 内元素（不强行写死 uid）
-        - 不应包含 banner 的同级节点（典型是 link "发现"）
-        """
-        for name, path in self.paths.items():
-            with self.subTest(file=name):
-                self._skip_if_missing(path)
-
-                banner_uid = await self._discover_banner_uid(path)
-                self.assertTrue(banner_uid, f"cannot discover banner uid from {name}")
-
-                out = await self.tool.execute(
-                    **{
-                        "latest_path": path,
-                        "uid": banner_uid,
-                        "max_lines": 250,
-                        "include_ancestors": False,
-                        "search_scope": "snapshot",
-                        # uid_subtree 不需要 compact，但传了也应该不影响
-                        "compact": True,
-                    }
-                )
-                payload = json.loads(out)
-                result = payload["result"]
-
-                self.assertTrue(result["found"], f"uid_subtree not found for banner uid={banner_uid} in {name}")
-                self.assertEqual(result["mode"], "uid_subtree")
-
-                text = result["text"]
-                self.assertIn(f"uid={banner_uid} banner", text)
-
-                self.assertTrue(
-                    ('textbox "搜索小红书"' in text) or ('button "创作中心"' in text) or ('button "业务合作"' in text),
-                    f"banner subtree seems incomplete in {name}",
-                )
-
-                # banner 的同级一般包含 “发现”，不应被包含进子树
-                self.assertNotIn('link "发现"', text)
-
-    async def test_uid_subtree_with_ancestors_both_files(self):
-        """
-        include_ancestors=True 时：
-        - 应包含 RootWebArea 祖先链（不写死 uid）
-        - 应包含目标 textbox 行（不写死 uid）
-        """
-        for name, path in self.paths.items():
-            with self.subTest(file=name):
-                self._skip_if_missing(path)
-
-                textbox_uid = await self._discover_textbox_uid(path)
-                self.assertTrue(textbox_uid, f"cannot discover textbox uid from {name}")
-
-                out = await self.tool.execute(
-                    **{
-                        "latest_path": path,
-                        "uid": textbox_uid,
-                        "max_lines": 220,
-                        "include_ancestors": True,
-                        "search_scope": "snapshot",
-                        "compact": True,
-                    }
-                )
-                payload = json.loads(out)
-                result = payload["result"]
-
-                self.assertTrue(result["found"])
-                self.assertEqual(result["mode"], "uid_subtree")
-
-                text = result["text"]
-                self.assertIn("RootWebArea", text)
-                self.assertIn(f"uid={textbox_uid} textbox", text)
-
-    async def test_keyword_query_both_files_compact(self):
-        """
-        compact=True 时：
-        - found=True
-        - mode 为 keyword_grep 或 keyword_grep_compact（兼容）
-        - matched>=1
-        - top_hits 存在且包含 >>> 命中行
-        - 命中行里应包含 textbox "搜索小红书"
-        """
-        for name, path in self.paths.items():
-            with self.subTest(file=name):
-                self._skip_if_missing(path)
-
-                payload = await self._grep(path, keyword="搜索小红书", max_lines=200, context_lines=2, compact=True)
-                result = payload["result"]
-
-                self.assertTrue(result["found"])
-                self.assertIn(result["mode"], ("keyword_grep", "keyword_grep_compact"))
-
-                self.assertGreaterEqual(result.get("matched", 0), 1)
-
-                top_hits = result.get("top_hits")
-                self.assertIsInstance(top_hits, list)
-                self.assertGreaterEqual(len(top_hits), 1)
-
-                joined = "\n".join(top_hits)
-                self.assertIn(">>>", joined)
-                self.assertIn('textbox "搜索小红书"', joined)
-
-    async def test_uid_not_found_both_files(self):
-        for name, path in self.paths.items():
-            with self.subTest(file=name):
-                self._skip_if_missing(path)
-
-                out = await self.tool.execute(
-                    **{
-                        "latest_path": path,
-                        "uid": "no_such_uid",
-                        "max_lines": 80,
-                        "search_scope": "snapshot",
-                        "compact": True,
-                    }
-                )
-                payload = json.loads(out)
-                result = payload["result"]
-                self.assertFalse(result["found"])
-                self.assertIn("uid not found", result["reason"])
-
-    async def test_keyword_truncation_both_files_compact(self):
-        """
-        max_lines 很小时：
-        - 即便 compact=True，仍应保留 truncated 字段并可能为 True
-        - top_hits 不应为空（除非真的没命中）
-        """
-        for name, path in self.paths.items():
-            with self.subTest(file=name):
-                self._skip_if_missing(path)
-
-                payload = await self._grep(path, keyword="沪ICP备", max_lines=12, context_lines=2, compact=True)
-                result = payload["result"]
-
-                self.assertTrue(result["found"])
-                # truncated 可能为 True（常见），也可能为 False（如果命中很少）
-                self.assertIn("truncated", result)
-
-                top_hits = result.get("top_hits")
-                self.assertIsInstance(top_hits, list)
-                self.assertGreaterEqual(len(top_hits), 1)
-
-    async def test_meta_found_line_wait_for(self):
-        """
-        额外验证 meta：
-        - wait_for_log_latest.txt 应该能提取到 found_line（通常是 Element with text ... found.）
-        - snapshot_latest.txt 的 found_line 通常为空（允许为空）
-        """
-        snap_path = self.paths["snapshot_latest.txt"]
-        wait_path = self.paths["wait_for_log_latest.txt"]
-
-        self._skip_if_missing(snap_path)
-        self._skip_if_missing(wait_path)
-
-        snap_payload = await self._grep(snap_path, keyword="搜索小红书", max_lines=80, context_lines=2, compact=True)
-        self.assertIn("meta", snap_payload)
-        self.assertIn("found_line", snap_payload["meta"])  # 允许为空
-
-        wait_payload = await self._grep(wait_path, keyword="搜索小红书", max_lines=80, context_lines=2, compact=True)
-        self.assertIn("meta", wait_payload)
-        self.assertIn("found_line", wait_payload["meta"])
-        self.assertTrue(
-            wait_payload["meta"]["found_line"] == "" or wait_payload["meta"]["found_line"].startswith(
-                "Element with text "),
-            f"Unexpected found_line: {wait_payload['meta']['found_line']}",
+    async def test_ref_then_text_search_then_fs_read(self):
+        large_snapshot = "\n".join(
+            [f'uid={i}_1 StaticText "row {i}"' for i in range(1, 120)]
+            + ['uid=999_1 button "TargetButton"']
         )
+
+        observation = self.externalizer.externalize(
+            tool_name="chrome-devtools_take_snapshot",
+            raw_result=large_snapshot,
+            trace_id="test_trace",
+            turn_id="turn_1",
+            step_id="step_1",
+            tool_call_id="call_1",
+        )
+
+        self.assertEqual(observation["kind"], "ref")
+        ref_path = observation["ref"]["path"]
+        self.assertTrue(Path(ref_path).exists())
+
+        text_search = TextSearchTool()
+        search_res = await text_search.execute(path=ref_path, query="TargetButton", max_matches=5)
+        search_data = json.loads(search_res)
+        self.assertTrue(search_data["ok"])
+        self.assertGreaterEqual(len(search_data["matches"]), 1)
+
+        full_text = Path(ref_path).read_text(encoding="utf-8")
+        offset = full_text.index("TargetButton")
+
+        fs_read = FsReadTool()
+        read_res = await fs_read.execute(path=ref_path, offset=offset - 20, length=80)
+        read_data = json.loads(read_res)
+        self.assertTrue(read_data["ok"])
+        self.assertIn("TargetButton", read_data["text"])
+
+
+class TestToolResultExternalizer(unittest.TestCase):
+    def setUp(self):
+        self.externalizer = ToolResultExternalizerMiddleware(
+            ToolResultExternalizerConfig(
+                inline_limit=20,
+                preview_limit=20,
+                root_dir="data/tool_results/test_ext",
+            )
+        )
+
+    def tearDown(self):
+        test_ext_dir = Path("data/tool_results/test_ext")
+        if test_ext_dir.exists():
+            shutil.rmtree(test_ext_dir, ignore_errors=True)
+
+    def test_inline_branch(self):
+        obs = self.externalizer.externalize(
+            tool_name="fs_stat",
+            raw_result='{"ok":true}',
+            trace_id="trace_a",
+            turn_id="turn_a",
+            step_id="step_a",
+            tool_call_id="call_a",
+        )
+        self.assertEqual(obs["kind"], "inline")
+        self.assertIn("content", obs)
+        self.assertNotIn("ref", obs)
+
+    def test_ref_branch_and_unique_paths(self):
+        obs1 = self.externalizer.externalize(
+            tool_name="text_search",
+            raw_result="x" * 200,
+            trace_id="trace_a",
+            turn_id="turn_a",
+            step_id="step_a",
+            tool_call_id="call_same",
+        )
+        obs2 = self.externalizer.externalize(
+            tool_name="text_search",
+            raw_result="x" * 200,
+            trace_id="trace_a",
+            turn_id="turn_a",
+            step_id="step_a",
+            tool_call_id="call_same",
+        )
+        self.assertEqual(obs1["kind"], "ref")
+        self.assertEqual(obs2["kind"], "ref")
+        self.assertTrue(Path(obs1["ref"]["path"]).exists())
+        self.assertTrue(Path(obs2["ref"]["path"]).exists())
+        self.assertNotEqual(obs1["ref"]["path"], obs2["ref"]["path"])
+
+
+class TestSandboxGuards(unittest.IsolatedAsyncioTestCase):
+    async def test_fs_read_rejects_absolute_and_parent_paths(self):
+        tool = FsReadTool()
+        abs_path = str((Path.cwd() / "README.md").resolve())
+        abs_res = await tool.execute(path=abs_path, offset=0, length=20)
+        abs_data = json.loads(abs_res)
+        self.assertFalse(abs_data["ok"])
+
+        parent_res = await tool.execute(path="../README.md", offset=0, length=20)
+        parent_data = json.loads(parent_res)
+        self.assertFalse(parent_data["ok"])
+
+    async def test_text_search_rejects_absolute_paths(self):
+        tool = TextSearchTool()
+        abs_path = str((Path.cwd() / "README.md").resolve())
+        res = await tool.execute(path=abs_path, query="StewardFlow")
+        data = json.loads(res)
+        self.assertFalse(data["ok"])
 
 
 if __name__ == "__main__":

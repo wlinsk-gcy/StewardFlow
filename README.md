@@ -29,7 +29,8 @@ StewardFlow 是一个基于 FastAPI 的 ReAct + HITL（人机协作）智能体�
 
 ## 功能概览
 - ReAct + HITL 任务编排：支持需要用户确认或补充输入的步骤
-- 工具系统：内置 `fs_list`、`fs_glob`、`fs_read`、`fs_write`、`fs_stat`、`text_search`、`snapshot_query` 等
+- 工具系统：内置 `fs_list`、`fs_glob`、`fs_read`、`fs_write`、`fs_stat`、`text_search`、`proc_run` 等
+- 统一工具结果外部化：tool observation 统一返回 `kind=inline|ref`，大结果自动落盘到 `data/tool_results/`
 - Web Search 与截图回传：前端可显示浏览器截图与检索结果
 - WebSocket 实时推送：展示 Thought/Action/Observation/Final 等执行日志
 - 前后端分离：FastAPI 后端 + Vite/React 前端工作台
@@ -82,8 +83,17 @@ npm run dev
 ### `config.yaml`
 - `app.port`：后端监听端口
 - `log.level`：日志级别（如 `info`）
-- `snapshot_path`：截图/快照存储目录（默认 `data`）
+- `tool_result.root_dir`：工具结果落盘目录（默认 `data/tool_results`）
+- `tool_result.inline_limit` / `tool_result.preview_limit`：inline 与 preview 阈值（字符数）
+- `tool_result.always_externalize_tools`：强制外部化工具白名单
 - `llm.model` / `llm.api_key` / `llm.base_url`：LLM 提供商配置
+
+## Ref 读回机制
+- 当 observation 为 `kind=ref` 时，只会返回摘要与 `ref.path`。
+- 读回建议流程：
+  1. 用 `text_search` 在 `ref.path` 定位关键词
+  2. 用 `fs_read(path, offset, length)` 读取小片段
+- 不再使用 `snapshot_query` 这类按工具定制的查询工具。
 
 ## API 入口
 - `POST /agent/run`：启动或继续一次任务

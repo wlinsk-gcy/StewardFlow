@@ -6,6 +6,15 @@ log:
 
 snapshot_path: data
 
+tool_result:
+  root_dir: data/tool_results
+  inline_limit: 500
+  preview_limit: 500
+  fs_read_max_chars: 4000
+  always_externalize_tools:
+    - chrome-devtools_take_snapshot
+    - chrome-devtools_take_screenshot
+
 llm:
   model: deepseek-v3.2
   api_key: 改成你的key

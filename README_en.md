@@ -28,7 +28,8 @@ The LLM used in this case is deepseek-v3.2
 
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
-- **Tool system**: built-in tools such as `fs_list`, `fs_glob`, `fs_read`, `fs_write`, `fs_stat`, `text_search`, `snapshot_query`, etc.
+- **Tool system**: built-in tools such as `fs_list`, `fs_glob`, `fs_read`, `fs_write`, `fs_stat`, `text_search`, `proc_run`, etc.
+- **Unified tool result externalization**: every tool observation follows `kind=inline|ref`; large outputs are stored under `data/tool_results/`.
 - **Web search & screenshot relay**: the UI can display browser screenshots and retrieval results
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
 - **Frontend-backend separation**: FastAPI backend + Vite/React frontend workspace
@@ -82,8 +83,17 @@ Default URL: http://localhost:5173
 ### `config.yaml`
 - `app.port`: backend listening port
 - `log.level`: log level (e.g., info)
-- `snapshot_path`: directory to store screenshots/snapshots (default: `data`)
+- `tool_result.root_dir`: storage root for externalized tool results (default: `data/tool_results`)
+- `tool_result.inline_limit` / `tool_result.preview_limit`: inline/preview thresholds (in chars)
+- `tool_result.always_externalize_tools`: tools that should always return `kind=ref`
 - `llm.model` / `llm.api_key` / `llm.base_url`: LLM provider settings
+
+## Ref Retrieval Workflow
+- If an observation is `kind=ref`, only summary/preview and `ref.path` are in context.
+- Recommended retrieval chain:
+  1. Run `text_search` on `ref.path` to locate relevant lines
+  2. Run `fs_read(path, offset, length)` to read bounded snippets
+- `snapshot_query` style per-tool query helpers are no longer used.
 
 ## API Endpoints
 - `POST /agent/run`: start or continue a task

@@ -17,8 +17,10 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - Never output shell/terminal command strings.
 - Files/text: use fs_list/fs_glob/fs_read/fs_write/fs_stat/text_search.
 - Process execution: use proc_run(program, args, ...) only (argv form).
-- For browser understanding, prefer snapshot_query before repeated browser actions.
-- Keep outputs bounded; prefer truncated previews + artifact_path when available.
+- Tool observations are strict JSON objects.
+- If a tool observation is `kind="ref"`, do not assume full content is in context.
+- For `kind="ref"`: first use `text_search` on `ref.path`, then use `fs_read` with bounded `offset/length`.
+- Never attempt to read the entire referenced file in one call.
 
 # Output (Strict)
 - When you are not making tool_calls, output exactly one JSON object:
