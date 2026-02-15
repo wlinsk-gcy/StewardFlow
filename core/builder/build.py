@@ -99,8 +99,7 @@ Drive a deterministic agent state machine to complete the user's task with MINIM
 # Output (Strict)
 - Output ONLY a single JSON object (a dict) with exactly two top-level keys: "type" and "message".
 - Do NOT output any other keys or any extra text.
-- "type" MUST be one of: "finish", "tool", "request_input", "request_confirm".
-- "tool" means: output "__tool_calls__" only.
+- "type" MUST be one of: "finish", "request_input", "request_confirm".
 
 # Meaning of Types
 - request_input: Ask the user to provide missing information/materials (e.g., username/password, verification code, files, missing parameters).

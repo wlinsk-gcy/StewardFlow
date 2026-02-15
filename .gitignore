@@ -7,3 +7,5 @@ tests/
 nul
 
 config.yaml
+
+tools_bin/rg/

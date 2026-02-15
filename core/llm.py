@@ -119,7 +119,7 @@ class Provider:
 
     def generate(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
-        is_thinking = context.get("is_thinking", True)
+        is_thinking = context.get("is_thinking", False)
         # TODO 针对429 Error Code做 Retry
         response = self.client.chat.completions.create(
             model=self.model,
@@ -127,7 +127,7 @@ class Provider:
             temperature=0.2,
             top_p=0.9,
             tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot","chrome-devtools_evaluate_script"]),
-            response_format=llm_response_schema,
+            # response_format=llm_response_schema,
             extra_body={"enable_thinking": is_thinking},
             parallel_tool_calls=True,
         )
@@ -174,6 +174,3 @@ class Provider:
             "total_tokens": response.usage.total_tokens
         }
         return reasoning, actions, token_info
-
-
-

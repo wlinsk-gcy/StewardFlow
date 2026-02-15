@@ -5,6 +5,7 @@ FastAPI ReAct + HITL Agent MVP
 import sys
 import asyncio
 import os
+from pathlib import Path
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -28,6 +29,7 @@ from core.tools.ls import LsTool
 from core.tools.glob import GlobTool
 from core.tools.read import ReadTool
 from core.tools.snapshot_query import SnapshotQueryTool
+from core.tools.rg_loader import ensure_rg
 from core.mcp.client import MCPClient
 
 from core.services.task_service import TaskService
@@ -36,7 +38,9 @@ from ws.connection_manager import ConnectionManager
 from core.cache_manager import InMemoryCacheManager
 from core.builder.build import build_system_prompt
 
-with open("config.yaml", "r", encoding="utf-8") as f:
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 snapshot_path = (
@@ -88,6 +92,10 @@ def init_load_tools():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ===== startup =====
+    rg_path, installed_now = ensure_rg(project_root=PROJECT_ROOT)
+    app.state.rg_path = str(rg_path)
+    app.state.rg_installed_now = installed_now
+
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
     tool_registry = init_load_tools()
@@ -188,7 +196,9 @@ async def health():
     """健康检查"""
     return {
         "status": "healthy",
-        "service": "StewardFlow healthy"
+        "service": "StewardFlow healthy",
+        "rg_path": getattr(app.state, "rg_path", None),
+        "installed_now": getattr(app.state, "rg_installed_now", None),
     }
 
 
