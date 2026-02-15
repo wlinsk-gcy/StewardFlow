@@ -22,13 +22,13 @@ The LLM used in this case is deepseek-v3.2
 
 **You can watch the 'public/demo2.mp4' video**
 
-### 3. 使用bash工具执行dir命令，查看当前目录有什么东西
+### 3. Use the `fs_list` semantic tool to inspect current workspace files
 
 **You can watch the 'public/demo3.mp4' video**
 
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
-- **Tool system**: built-in tools such as `bash`, `ls`, `grep`, `glob`, `read`, `snapshot_query`, etc.
+- **Tool system**: built-in tools such as `fs_list`, `fs_glob`, `fs_read`, `fs_write`, `fs_stat`, `text_search`, `snapshot_query`, etc.
 - **Web search & screenshot relay**: the UI can display browser screenshots and retrieval results
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
 - **Frontend-backend separation**: FastAPI backend + Vite/React frontend workspace

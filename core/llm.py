@@ -13,6 +13,13 @@ from utils.id_util import get_sonyflake
 logger = logging.getLogger(__name__)
 
 THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+ACTION_TYPE_ALIASES = {
+    "done": "finish",
+    "final": "finish",
+    "completed": "finish",
+    "complete": "finish",
+    "confirm": "request_confirm",
+}
 
 def normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     if not tool_calls:
@@ -95,6 +102,50 @@ def extract_json(s: str) -> str:
         return res if res else s
 
 
+def _coerce_content_action(content: str) -> tuple[ActionType, str, str]:
+    extracted = extract_json(content)
+    try:
+        parsed = json.loads(extracted)
+    except Exception as e:
+        logger.error(f"parse llm raw content error: {e}")
+        # 兜底：让用户补充输入，避免抛 KeyError/ValueError 打断流程
+        msg = extracted or content or ""
+        raw_ref = json.dumps({"type": "request_input", "message": msg}, ensure_ascii=False)
+        return ActionType.REQUEST_INPUT, msg, raw_ref
+
+    if not isinstance(parsed, dict):
+        # 非对象输出统一收敛为 finish，message 为文本化结果
+        msg = parsed if isinstance(parsed, str) else json.dumps(parsed, ensure_ascii=False)
+        raw_ref = json.dumps({"type": "finish", "message": msg}, ensure_ascii=False)
+        return ActionType.FINISH, msg, raw_ref
+
+    raw_ref = json.dumps(parsed, ensure_ascii=False)
+
+    action_type_raw = parsed.get("type")
+    normalized_type = None
+    if isinstance(action_type_raw, str):
+        candidate = action_type_raw.strip().lower()
+        candidate = ACTION_TYPE_ALIASES.get(candidate, candidate)
+        if candidate in {ActionType.FINISH.value, ActionType.REQUEST_INPUT.value, ActionType.REQUEST_CONFIRM.value}:
+            normalized_type = candidate
+
+    message_raw = parsed.get("message")
+    if isinstance(message_raw, str):
+        message = message_raw.strip()
+    elif message_raw is None:
+        message = ""
+    else:
+        message = json.dumps(message_raw, ensure_ascii=False)
+
+    # 没有 type/message 时，默认视为任务结果并 finish
+    if not normalized_type:
+        normalized_type = ActionType.FINISH.value
+    if not message:
+        message = json.dumps(parsed, ensure_ascii=False)
+
+    return ActionType(normalized_type), message, raw_ref
+
+
 
 class Provider:
     tool_registry: ToolRegistry
@@ -126,7 +177,7 @@ class Provider:
             messages=context.get("messages"),
             temperature=0.2,
             top_p=0.9,
-            tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot","chrome-devtools_evaluate_script"]),
+            tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot", "chrome-devtools_evaluate_script"]),
             # response_format=llm_response_schema,
             extra_body={"enable_thinking": is_thinking},
             parallel_tool_calls=True,
@@ -153,16 +204,16 @@ class Provider:
                 actions.append(action)
         else:
             logger.info(f"llm result: {content}")
-            content = extract_json(content)
-            raw = content # raw回传回LLM，把raw收敛成标准json
-            try:
-                res = json.loads(content)
-            except Exception as e:
-                logger.error(f"parse llm raw content error: {e}")
-                # 兜底 -- json解析失败，让用户自己输入新的需求
-                res = {"type": "request_input", "message": content}
-                raw = json.dumps(res,ensure_ascii=False)
-            actions.append(Action(action_id=get_sonyflake("action_"), type=ActionType(res["type"]), message=res["message"], full_ref=raw))
+            action_type, action_message, raw = _coerce_content_action(content)
+            logger.info(f"llm output json: {raw}")
+            actions.append(
+                Action(
+                    action_id=get_sonyflake("action_"),
+                    type=action_type,
+                    message=action_message,
+                    full_ref=raw,
+                )
+            )
 
         if response.usage.prompt_tokens_details:
             logger.info(f"Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")

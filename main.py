@@ -20,14 +20,13 @@ from context import request_id_ctx, trace_id_ctx
 from utils.id_util import get_sonyflake
 from utils.screenshot_util import clean_screenshot
 from utils.snapshot_util import clear_snapshot_logs
+from utils.tool_artifacts_util import clear_tool_artifacts
 from core.llm import Provider
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
-from core.tools.bash import BashTool
-from core.tools.grep import GrepTool
-from core.tools.ls import LsTool
-from core.tools.glob import GlobTool
-from core.tools.read import ReadTool
+from core.tools.proc_run import ProcRunTool
+from core.tools.fs_tools import FsListTool, FsGlobTool, FsReadTool, FsWriteTool, FsStatTool
+from core.tools.text_search import TextSearchTool
 from core.tools.snapshot_query import SnapshotQueryTool
 from core.tools.rg_loader import ensure_rg
 from core.mcp.client import MCPClient
@@ -80,11 +79,13 @@ def init_load_tools():
     registry = ToolRegistry()
     from core.tools.web_search_use_exa import WebSearch
     registry.register(WebSearch())
-    registry.register(BashTool())
-    registry.register(GrepTool())
-    registry.register(LsTool())
-    registry.register(GlobTool())
-    registry.register(ReadTool())
+    registry.register(FsListTool())
+    registry.register(FsGlobTool())
+    registry.register(FsReadTool())
+    registry.register(FsWriteTool())
+    registry.register(FsStatTool())
+    registry.register(TextSearchTool())
+    registry.register(ProcRunTool())
     registry.register(SnapshotQueryTool())
     return registry
 
@@ -126,6 +127,7 @@ async def lifespan(app: FastAPI):
     await mcp_client.close_all_sessions()
     clean_screenshot()
     clear_snapshot_logs()
+    clear_tool_artifacts()
 
 
 # 创建 FastAPI 应用

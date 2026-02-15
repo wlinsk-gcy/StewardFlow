@@ -1,9 +1,11 @@
-export interface AgentStep {
-    stepId: number;
+﻿export interface AgentStep {
+    stepId?: number;
     type: 'thought' | 'action' | 'observation' | 'final' | 'error';
     content: string;
     tool?: string;
-    toolInput?: string;
+    toolInput?: unknown;
+    actions?: Array<Record<string, unknown>>;
+    observations?: Array<Record<string, unknown>>;
     timestamp: number;
     screenshot?: string; // Base64 encoded screenshot for browser view
 }
@@ -13,7 +15,8 @@ export interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
     timestamp: number;
-    requestId?: string; // HITL confirm Ψһ��ʶ
+    msg_id?: string;
+    requestId?: string; // HITL confirm 唯一标识
     isHitl?: boolean;
     hitlType?: 'confirm' | 'request';
 }
@@ -30,5 +33,3 @@ export interface Tool {
 }
 
 export const PYTHON_REFERENCE_CODE = `# Removed in favor of Browser View implementation`;
-
-

@@ -120,6 +120,26 @@ class TaskExecutor:
         self.checkpoint.save(trace)
         return step
 
+    async def _emit_action_batch(self, trace: Trace, turn: Turn, step: Step) -> None:
+        actions = [a.to_dict() for a in (step.actions or [])]
+        if not actions:
+            return
+        data = dict(actions[0])
+        data["actions"] = actions
+        data["count"] = len(actions)
+        event = Event(EventType.ACTION, trace.trace_id, turn.turn_id, data)
+        await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+
+    async def _emit_observation_batch(self, trace: Trace, turn: Turn, step: Step) -> None:
+        observations = [o.to_dict() for o in (step.observations or [])]
+        if not observations:
+            return
+        data = dict(observations[-1])
+        data["observations"] = observations
+        data["count"] = len(observations)
+        event = Event(EventType.OBSERVATION, trace.trace_id, turn.turn_id, data)
+        await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+
     async def _decide(self, trace: Trace, turn: Turn, step: Step):
         types = [action.type for action in step.actions]
         if ActionType.FINISH in types:
@@ -145,14 +165,12 @@ class TaskExecutor:
                     tool_name=action.tool_name,
                     tool_args=action.args
                 )
-                event = Event(EventType.ACTION, trace.trace_id, turn.turn_id, action.to_dict())
-                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+                await self._emit_action_batch(trace, turn, step)
                 trace.status = AgentStatus.WAITING
                 trace.node = NodeType.HITL
             else:
                 trace.node = NodeType.EXECUTE
-                event = Event(EventType.ACTION, trace.trace_id, turn.turn_id, step.actions[-1].to_dict())  # TODO 先发送一个
-                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+                await self._emit_action_batch(trace, turn, step)
         self.checkpoint.save(trace)
 
     async def _action(self, trace: Trace, turn: Turn, step: Step):
@@ -215,11 +233,7 @@ class TaskExecutor:
             step.status = StepStatus.DONE
             step.finished_at = datetime.utcnow()
             trace.node = NodeType.THINK
-            event = Event(EventType.OBSERVATION,
-                          trace.trace_id,
-                          turn.turn_id,
-                          step.observations[-1].to_dict())
-            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            await self._emit_observation_batch(trace, turn, step)
             trace.current_step_id = None
         self.checkpoint.save(trace)
 

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+﻿import React, { useState, useRef, useEffect, useCallback } from "react";
 import { v4 as uuidv4 } from "uuid";
 import {
   Play,
@@ -121,7 +121,21 @@ export const AgentWorkbench: React.FC = () => {
     if (["thought", "action", "observation", "final"].includes(event_type)) {
       // console.log('receive execute trace', event);
       const MAX_LEN = 500;
-      const rawContent = data.content ?? "";
+      const actionBatch =
+        event_type === "action" && Array.isArray(data?.actions)
+          ? data.actions
+          : undefined;
+      const observationBatch =
+        event_type === "observation" && Array.isArray(data?.observations)
+          ? data.observations
+          : undefined;
+      const rawContent =
+        data?.content ??
+        (actionBatch
+          ? `Action batch (${actionBatch.length})`
+          : observationBatch
+            ? `Observation batch (${observationBatch.length})`
+            : "");
       const content =
         rawContent.length > MAX_LEN ? rawContent.slice(0, MAX_LEN) + "..." : rawContent;
       const newStep: AgentStep = {
@@ -129,12 +143,23 @@ export const AgentWorkbench: React.FC = () => {
         content: content,
         tool: data.tool_name,
         toolInput: data.args,
-        timestamp: timestamp,
+        actions: actionBatch,
+        observations: observationBatch,
+        timestamp: new Date(timestamp).getTime(),
       };
       setSteps((prev) => [...prev, newStep]);
 
       // 如果是 action 且涉及到浏览器（根据你的业务逻辑），可以切换 Tab
-      if (event_type === "action" && data.tool_name?.includes("browser")) {
+      if (
+        event_type === "action" &&
+        (
+          (Array.isArray(actionBatch) &&
+            actionBatch.some((a: any) =>
+              typeof a?.tool_name === "string" && a.tool_name.includes("browser"),
+            )) ||
+          data.tool_name?.includes("browser")
+        )
+      ) {
         // 这里可以根据实际 data 里的 args 解析出 URL
         // setCurrentUrl(...)
       }
@@ -213,7 +238,7 @@ export const AgentWorkbench: React.FC = () => {
         role: "assistant",
         content: data.content,
         timestamp: new Date(timestamp).getTime(),
-        // 如果是 hitl_confirm，可以在这里扩展 type 以后展示按钮
+        // 如果是 hitl_confirm，可在这里扩展 type 以便后续展示按钮
         isHitl: event_type.startsWith("hitl"),
       };
       setChatHistory((prev) => [...prev, newMessage]);
@@ -247,7 +272,7 @@ export const AgentWorkbench: React.FC = () => {
       };
 
       socket.onerror = () => {
-        // Error ????? close?????????????
+        // Error 通常会紧跟 close，这里主动关闭一次确保状态一致
         setWsStatus("offline");
         try {
           socket.close();
@@ -381,7 +406,7 @@ export const AgentWorkbench: React.FC = () => {
         {
           id: uuidv4(),
           role: "assistant",
-          content: "连接服务器失败，请稍后再试。",
+          content: "连接服务失败，请稍后再试。",
           timestamp: Date.now(),
         },
       ]);
@@ -481,10 +506,10 @@ export const AgentWorkbench: React.FC = () => {
                   <Bot className="h-10 w-10 text-indigo-500 opacity-60" />
                 </div>
                 <h3 className="mb-2 text-xl font-bold text-gray-900">
-                  你好，我是你的私人AI管家
+                  你好，我是你的私人 AI 管家
                 </h3>
                 <p className="text-sm leading-relaxed text-gray-500">
-                  一站式工具助手：网页自动化 + 文档检索 + 命令执行，输出可复现步骤，关键操作先确认。
+                  一站式工具助手：网页自动化 + 文档检索 + 程序执行，输出可复现步骤，关键操作先确认。
                 </p>
               </div>
             )}
@@ -525,7 +550,7 @@ export const AgentWorkbench: React.FC = () => {
                         <div className="mt-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3 shadow-inner">
                           <div className="flex items-center gap-2 text-[10px] font-black tracking-widest text-indigo-600 uppercase">
                             <span className="h-1.5 w-1.5 rounded-full bg-indigo-500"></span>
-                            Bash Command Confirmation
+                            Tool Call Confirmation
                           </div>
                           {getConfirmCommand(pendingConfirm) && (
                             <div className="mt-2 rounded-lg border border-slate-900 bg-slate-950 px-3 py-2 font-mono text-[11px] text-slate-100">
@@ -580,7 +605,7 @@ export const AgentWorkbench: React.FC = () => {
               <div className="relative overflow-hidden rounded-2xl border border-gray-200 bg-white transition-all focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-50">
                 <textarea
                   className="h-24 w-full resize-none bg-transparent p-4 pr-16 font-sans text-sm outline-none"
-                  placeholder="请告诉我您的需求是什么..."
+                  placeholder="请告诉我您的需求是什么？..."
                   value={goal}
                   onChange={(e) => setGoal(e.target.value)}
                   onKeyDown={handleKeyDown}
@@ -743,7 +768,7 @@ function normalizeMaybeJSON(input: unknown): unknown {
   return input;
 }
 
-// 可选：如果你确实会收到 Python dict 字符串（单引号 True/False/None）
+// 可选：如果你确实会收到 Python dict 字符串（单引号、True/False/None）
 // 注意：这不是完美解析器，但对“简单 dict/list”够用；失败则回退原字符串
 function normalizeMaybePythonDict(input: unknown): unknown {
   const v = normalizeMaybeJSON(input);
@@ -909,20 +934,75 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
         </span>
       </div>
 
-      {/* 关键：强制左对齐 + 分类型渲染 */}
+      {/* 关键：强制左对齐 + 分类渲染 */}
       <div className="overflow-x-auto p-4 !text-left font-mono text-xs leading-relaxed text-gray-700">
         {isAction ? (
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <span className="rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
-                Tool
-              </span>
-              <span className="font-bold text-indigo-700">{step.tool}</span>
+          Array.isArray(step.actions) && step.actions.length > 0 ? (
+            <div className="space-y-3">
+              {step.actions.map((action, idx) => {
+                const toolName =
+                  typeof action.tool_name === "string"
+                    ? action.tool_name
+                    : "(unknown)";
+                return (
+                  <div
+                    key={`${toolName}-${idx}`}
+                    className="rounded-xl border border-indigo-100 bg-white p-3"
+                  >
+                    <div className="mb-2 flex items-center gap-2">
+                      <span className="rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
+                        Tool #{idx + 1}
+                      </span>
+                      <span className="font-bold text-indigo-700">{toolName}</span>
+                    </div>
+                    <ContentRenderer content={action.args} />
+                  </div>
+                );
+              })}
             </div>
-
-            {/* toolInput 也统一走 ContentRenderer：支持 dict/list/string */}
-            <ContentRenderer content={step.toolInput} />
-          </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <span className="rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
+                  Tool
+                </span>
+                <span className="font-bold text-indigo-700">{step.tool}</span>
+              </div>
+              <ContentRenderer content={step.toolInput} />
+            </div>
+          )
+        ) : isObs ? (
+          Array.isArray(step.observations) && step.observations.length > 0 ? (
+            <div className="space-y-3">
+              {step.observations.map((observation, idx) => {
+                const obsType =
+                  typeof observation.type === "string"
+                    ? observation.type
+                    : "observation";
+                return (
+                  <div
+                    key={`${obsType}-${idx}`}
+                    className="rounded-xl border border-emerald-100 bg-white p-3"
+                  >
+                    <div className="mb-2 flex items-center gap-2">
+                      <span className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
+                        Obs #{idx + 1}
+                      </span>
+                      <span className="font-bold text-emerald-700">{obsType}</span>
+                      {typeof observation.action_id === "string" && (
+                        <span className="text-[10px] text-emerald-700/70">
+                          action_id={observation.action_id}
+                        </span>
+                      )}
+                    </div>
+                    <ContentRenderer content={observation.content} />
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <ContentRenderer content={step.content} />
+          )
         ) : (
           <ContentRenderer content={step.content} />
         )}
