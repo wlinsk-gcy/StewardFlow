@@ -84,7 +84,7 @@ class TaskExecutor:
         trace.current_step_id = step.step_id
         schemas = self.tool_registry.get_all_schemas(
             excludes=["chrome-devtools_take_screenshot", "chrome-devtools_evaluate_script"])
-        messages = await self.cache_manager.build_messages(trace, schemas, llm_response_schema, toolset_version="tools_v1", response_schema_version="resp_v1")
+        messages = await self.cache_manager.build_messages(trace, schemas, toolset_version="tools_v1", response_schema_version="resp_v1")
         context = {
             "trace": trace,
             "step": step,
@@ -92,7 +92,7 @@ class TaskExecutor:
             "messages": messages,
         }
         reasoning, actions, token_info = self.llm.generate(context)
-        await self.cache_manager.update_calibration(trace.trace_id, token_info["prompt_tokens"], schemas, llm_response_schema, toolset_version="tools_v1", response_schema_version="resp_v1")
+        await self.cache_manager.update_calibration(trace.trace_id, token_info["prompt_tokens"], schemas, toolset_version="tools_v1", response_schema_version="resp_v1")
         if trace.token_info:
             trace.token_info["cache_tokens"] += token_info["cache_tokens"]
             trace.token_info["prompt_tokens"] += token_info["prompt_tokens"]
