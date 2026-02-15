@@ -15,6 +15,7 @@ from .protocol import (
 )
 from .builder.build import llm_response_schema
 from .llm import Provider
+from .runtime_settings import RuntimeSettings, get_runtime_settings
 from .tool_result_externalizer import (
     ToolResultExternalizerConfig,
     ToolResultExternalizerMiddleware,
@@ -47,14 +48,21 @@ class TaskExecutor:
 
     def __init__(self, checkpoint: CheckpointStore, provider: Provider, tool_registry: ToolRegistry,
                  ws_manager: ConnectionManager, cache_manager: CacheManager,
-                 tool_result_config: Optional[ToolResultExternalizerConfig] = None):
+                 tool_result_config: Optional[ToolResultExternalizerConfig] = None,
+                 runtime_settings: RuntimeSettings | None = None):
         self.llm = provider
         self.tool_registry = tool_registry
         self.checkpoint = checkpoint
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
+        if runtime_settings is not None:
+            resolved_settings = runtime_settings
+        elif tool_result_config is not None:
+            resolved_settings = tool_result_config.to_runtime_settings()
+        else:
+            resolved_settings = get_runtime_settings()
         self.tool_result_externalizer = ToolResultExternalizerMiddleware(
-            tool_result_config or ToolResultExternalizerConfig()
+            settings=resolved_settings
         )
 
     async def run(self, trace: Trace):

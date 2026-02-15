@@ -21,8 +21,8 @@ from utils.id_util import get_sonyflake
 from utils.screenshot_util import clean_screenshot
 from utils.tool_artifacts_util import clear_tool_artifacts
 from core.llm import Provider
+from core.runtime_settings import RuntimeSettings, configure_runtime_settings
 from core.storage.checkpoint import CheckpointStore
-from core.tool_result_externalizer import ToolResultExternalizerConfig
 from core.tools.tool import ToolRegistry
 from core.tools.proc_run import ProcRunTool
 from core.tools.fs_tools import FsListTool, FsGlobTool, FsReadTool, FsWriteTool, FsStatTool
@@ -41,11 +41,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-tool_result_config = ToolResultExternalizerConfig.from_dict(config.get("tool_result"))
-os.environ["TOOL_RESULT_ROOT_DIR"] = tool_result_config.root_dir
-os.environ["TOOL_RESULT_FS_READ_MAX_CHARS"] = str(
-    (config.get("tool_result") or {}).get("fs_read_max_chars", 4000)
+runtime_settings = configure_runtime_settings(
+    raw_tool_result=config.get("tool_result") or {},
+    env=os.environ,
+    workspace_root=PROJECT_ROOT,
+    allow_env_override=True,
 )
+# Optional compatibility mirror for legacy scripts.
+os.environ["TOOL_RESULT_ROOT_DIR"] = runtime_settings.tool_result_root_dir
+os.environ["TOOL_RESULT_FS_READ_MAX_CHARS"] = str(runtime_settings.fs_read_max_chars)
 
 
 class RequestIdFilter(logging.Filter):
@@ -72,16 +76,16 @@ logger.handlers.clear()
 logger.addHandler(handler)
 
 
-def init_load_tools():
+def init_load_tools(settings: RuntimeSettings):
     registry = ToolRegistry()
     from core.tools.web_search_use_exa import WebSearch
     registry.register(WebSearch())
-    registry.register(FsListTool())
-    registry.register(FsGlobTool())
-    registry.register(FsReadTool())
-    registry.register(FsWriteTool())
-    registry.register(FsStatTool())
-    registry.register(TextSearchTool())
+    registry.register(FsListTool(settings=settings))
+    registry.register(FsGlobTool(settings=settings))
+    registry.register(FsReadTool(settings=settings))
+    registry.register(FsWriteTool(settings=settings))
+    registry.register(FsStatTool(settings=settings))
+    registry.register(TextSearchTool(settings=settings))
     registry.register(ProcRunTool())
     return registry
 
@@ -96,7 +100,7 @@ async def lifespan(app: FastAPI):
 
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
-    tool_registry = init_load_tools()
+    tool_registry = init_load_tools(runtime_settings)
     mcp_client = MCPClient(config="./mcp_config.json")
     await mcp_client.initialize(tool_registry)
     llm_config = config.get("llm")
@@ -116,7 +120,7 @@ async def lifespan(app: FastAPI):
         tool_registry,
         ws_manager,
         cache_manager,
-        tool_result_config=tool_result_config,
+        runtime_settings=runtime_settings,
     )
 
     app.state.checkpoint = checkpoint

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from core.runtime_settings import RuntimeSettings, get_runtime_settings
 from .path_sandbox import resolve_allowed_path, tool_result_root, workspace_root
 from .tool import Tool
 
@@ -15,21 +16,21 @@ DEFAULT_MAX_LINES = 200
 DEFAULT_MAX_BYTES = 16384
 DEFAULT_WRITE_MAX_BYTES = 1048576
 DEFAULT_READ_LENGTH = 2000
-HARD_MAX_READ_LENGTH = min(
-    8000,
-    max(2000, int(os.getenv("TOOL_RESULT_FS_READ_MAX_CHARS", "4000"))),
-)
 
 
-def _to_rel_display(path: Path) -> str:
-    workspace = workspace_root()
+def _to_rel_display(path: Path, settings: RuntimeSettings | None = None) -> str:
+    workspace = workspace_root(settings)
     try:
         return path.resolve().relative_to(workspace).as_posix()
     except Exception:
         try:
-            return path.resolve().relative_to(tool_result_root()).as_posix()
+            return path.resolve().relative_to(tool_result_root(settings)).as_posix()
         except Exception:
             return path.resolve().as_posix()
+
+
+def _hard_max_read_length(settings: RuntimeSettings) -> int:
+    return settings.hard_fs_read_max_chars
 
 
 def _safe_int(value: Any, default: int, min_value: int = 1) -> int:
@@ -46,7 +47,7 @@ def _build_error(error: str) -> str:
     return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
 
 
-def _item_from_path(path: Path) -> Optional[Dict[str, Any]]:
+def _item_from_path(path: Path, settings: RuntimeSettings | None = None) -> Optional[Dict[str, Any]]:
     try:
         stat = path.stat()
     except OSError:
@@ -57,7 +58,7 @@ def _item_from_path(path: Path) -> Optional[Dict[str, Any]]:
         item_type = "file"
     else:
         item_type = "other"
-    return {"path": _to_rel_display(path), "type": item_type, "size": stat.st_size}
+    return {"path": _to_rel_display(path, settings), "type": item_type, "size": stat.st_size}
 
 
 def _iter_children(target: Path, recursive: bool) -> List[Path]:
@@ -83,8 +84,9 @@ def _iter_children(target: Path, recursive: bool) -> List[Path]:
 
 
 class FsListTool(Tool):
-    def __init__(self):
+    def __init__(self, settings: RuntimeSettings | None = None):
         super().__init__()
+        self._settings = settings or get_runtime_settings()
         self.name = "fs_list"
         self.description = "List files/directories using a workspace-safe API."
 
@@ -99,7 +101,7 @@ class FsListTool(Tool):
     ) -> str:
         del kwargs
         try:
-            target = resolve_allowed_path(path, field_name="path")
+            target = resolve_allowed_path(path, field_name="path", settings=self._settings)
             limit = _safe_int(max_items, DEFAULT_MAX_ITEMS)
 
             all_items: List[Dict[str, Any]] = []
@@ -108,7 +110,7 @@ class FsListTool(Tool):
                     continue
                 if child.is_file() and not include_files:
                     continue
-                item = _item_from_path(child)
+                item = _item_from_path(child, self._settings)
                 if item:
                     all_items.append(item)
 
@@ -117,7 +119,7 @@ class FsListTool(Tool):
                 "items": all_items[:limit],
                 "truncated": len(all_items) > limit,
                 "summary": {
-                    "path": _to_rel_display(target),
+                    "path": _to_rel_display(target, self._settings),
                     "returned_items": min(len(all_items), limit),
                     "total_items": len(all_items),
                 },
@@ -149,8 +151,9 @@ class FsListTool(Tool):
 
 
 class FsGlobTool(Tool):
-    def __init__(self):
+    def __init__(self, settings: RuntimeSettings | None = None):
         super().__init__()
+        self._settings = settings or get_runtime_settings()
         self.name = "fs_glob"
         self.description = "Find workspace files/directories by glob pattern."
 
@@ -162,14 +165,14 @@ class FsGlobTool(Tool):
             if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
                 return _build_error("pattern_must_be_relative_and_without_parent_segments")
 
-            root = workspace_root()
+            root = workspace_root(self._settings)
             limit = _safe_int(max_matches, DEFAULT_MAX_ITEMS)
             matches_rel = globlib.glob(pattern, root_dir=str(root), recursive=True)
 
             all_matches: List[Dict[str, Any]] = []
             for rel in matches_rel:
-                candidate = resolve_allowed_path(rel, field_name="pattern_match")
-                item = _item_from_path(candidate)
+                candidate = resolve_allowed_path(rel, field_name="pattern_match", settings=self._settings)
+                item = _item_from_path(candidate, self._settings)
                 if item:
                     all_matches.append(item)
 
@@ -208,8 +211,9 @@ class FsGlobTool(Tool):
 
 
 class FsReadTool(Tool):
-    def __init__(self):
+    def __init__(self, settings: RuntimeSettings | None = None):
         super().__init__()
+        self._settings = settings or get_runtime_settings()
         self.name = "fs_read"
         self.description = "Read text from a relative file path with bounded offset/length."
 
@@ -228,12 +232,12 @@ class FsReadTool(Tool):
             return _build_error("path_required")
 
         try:
-            file_path = resolve_allowed_path(path, field_name="path")
+            file_path = resolve_allowed_path(path, field_name="path", settings=self._settings)
             if not file_path.exists() or not file_path.is_file():
                 return _build_error(f"not_a_file: {path}")
 
             text = file_path.read_text(encoding="utf-8", errors="replace")
-            hard_limit = HARD_MAX_READ_LENGTH
+            hard_limit = _hard_max_read_length(self._settings)
 
             if start_line is not None:
                 start = _safe_int(start_line, 1)
@@ -257,7 +261,7 @@ class FsReadTool(Tool):
                     "text": chunk,
                     "truncated": returned_chars < total_chars_from_start,
                     "summary": {
-                        "path": _to_rel_display(file_path),
+                        "path": _to_rel_display(file_path, self._settings),
                         "start_line": start,
                         "returned_chars": returned_chars,
                         "total_chars_from_start": total_chars_from_start,
@@ -282,7 +286,7 @@ class FsReadTool(Tool):
                 "text": chunk,
                 "truncated": truncated,
                 "summary": {
-                    "path": _to_rel_display(file_path),
+                    "path": _to_rel_display(file_path, self._settings),
                     "offset": safe_offset,
                     "requested_length": requested_length,
                     "returned_chars": len(chunk),
@@ -319,8 +323,9 @@ class FsReadTool(Tool):
 
 
 class FsWriteTool(Tool):
-    def __init__(self):
+    def __init__(self, settings: RuntimeSettings | None = None):
         super().__init__()
+        self._settings = settings or get_runtime_settings()
         self.name = "fs_write"
         self.description = "Write text to a relative file path with workspace guardrails and size limits."
 
@@ -342,7 +347,7 @@ class FsWriteTool(Tool):
             if len(content_bytes) > byte_limit:
                 return _build_error(f"content_exceeds_max_bytes: {len(content_bytes)} > {byte_limit}")
 
-            file_path = resolve_allowed_path(path, field_name="path")
+            file_path = resolve_allowed_path(path, field_name="path", settings=self._settings)
             if create_dirs:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
             write_mode = "a" if mode == "append" else "w"
@@ -353,7 +358,7 @@ class FsWriteTool(Tool):
                 "ok": True,
                 "bytes_written": len((content or "").encode("utf-8")),
                 "chars_written": written,
-                "path": _to_rel_display(file_path),
+                "path": _to_rel_display(file_path, self._settings),
             }
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
@@ -383,8 +388,9 @@ class FsWriteTool(Tool):
 
 
 class FsStatTool(Tool):
-    def __init__(self):
+    def __init__(self, settings: RuntimeSettings | None = None):
         super().__init__()
+        self._settings = settings or get_runtime_settings()
         self.name = "fs_stat"
         self.description = "Get stat metadata for a relative path under workspace/tool_result root."
 
@@ -393,7 +399,7 @@ class FsStatTool(Tool):
         if not path:
             return _build_error("path_required")
         try:
-            target = resolve_allowed_path(path, field_name="path")
+            target = resolve_allowed_path(path, field_name="path", settings=self._settings)
             exists = target.exists()
             size = None
             mtime = None
@@ -414,7 +420,7 @@ class FsStatTool(Tool):
                 "size": size,
                 "mtime": mtime,
                 "type": item_type,
-                "path": _to_rel_display(target),
+                "path": _to_rel_display(target, self._settings),
             }
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:

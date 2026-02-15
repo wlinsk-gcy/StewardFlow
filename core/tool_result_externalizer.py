@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .runtime_settings import RuntimeSettings, get_runtime_settings
 from .tool_result_store import ToolResultStore
 
 
@@ -11,6 +12,7 @@ class ToolResultExternalizerConfig:
     inline_limit: int = 500
     preview_limit: int = 500
     root_dir: str = "data/tool_results"
+    fs_read_max_chars: int = 4000
     always_externalize_tools: set[str] = field(
         default_factory=lambda: {
             "chrome-devtools_take_snapshot",
@@ -32,14 +34,42 @@ class ToolResultExternalizerConfig:
             inline_limit=max(1, int(raw.get("inline_limit", 500))),
             preview_limit=max(1, int(raw.get("preview_limit", 500))),
             root_dir=str(raw.get("root_dir", "data/tool_results")),
+            fs_read_max_chars=max(1, int(raw.get("fs_read_max_chars", 4000))),
             always_externalize_tools=always_set,
+        )
+
+    def to_runtime_settings(self, *, workspace_root=None) -> RuntimeSettings:
+        return RuntimeSettings(
+            workspace_root=workspace_root or get_runtime_settings().workspace_root,
+            tool_result_root_dir=self.root_dir,
+            inline_limit=self.inline_limit,
+            preview_limit=self.preview_limit,
+            fs_read_max_chars=self.fs_read_max_chars,
+            always_externalize_tools=set(self.always_externalize_tools),
         )
 
 
 class ToolResultExternalizerMiddleware:
-    def __init__(self, config: ToolResultExternalizerConfig):
-        self.config = config
-        self.store = ToolResultStore(root_dir=config.root_dir)
+    def __init__(
+        self,
+        config: ToolResultExternalizerConfig | None = None,
+        *,
+        settings: RuntimeSettings | None = None,
+    ):
+        if settings is None:
+            if config is not None:
+                settings = config.to_runtime_settings()
+            else:
+                settings = get_runtime_settings()
+        self.settings = settings
+        self.config = ToolResultExternalizerConfig(
+            inline_limit=self.settings.inline_limit,
+            preview_limit=self.settings.preview_limit,
+            root_dir=self.settings.tool_result_root_dir,
+            fs_read_max_chars=self.settings.fs_read_max_chars,
+            always_externalize_tools=set(self.settings.always_externalize_tools),
+        )
+        self.store = ToolResultStore(settings=self.settings)
 
     def _summary(self, *, tool_name: str, kind: str, chars: int, bytes_size: int) -> str:
         if kind == "ref":

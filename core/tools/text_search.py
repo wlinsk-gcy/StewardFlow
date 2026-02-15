@@ -9,11 +9,11 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from core.runtime_settings import RuntimeSettings, get_runtime_settings
 from .fs_tools import DEFAULT_MAX_ITEMS
 from .path_sandbox import (
     assert_path_in_allowed_roots,
     resolve_allowed_path,
-    tool_result_root,
     workspace_root,
 )
 from .tool import Tool
@@ -36,8 +36,8 @@ def _build_error(error: str) -> str:
     return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
 
 
-def _to_rel_display(path: Path) -> str:
-    root = workspace_root()
+def _to_rel_display(path: Path, settings: RuntimeSettings | None = None) -> str:
+    root = workspace_root(settings)
     try:
         return path.resolve().relative_to(root).as_posix()
     except Exception:
@@ -66,7 +66,13 @@ def _normalize_queries(query: Optional[str], queries: Optional[List[Any]]) -> Li
     return normalized
 
 
-def _iter_candidate_files(path: Optional[str], paths: Optional[List[str]], recursive: bool) -> List[Path]:
+def _iter_candidate_files(
+    path: Optional[str],
+    paths: Optional[List[str]],
+    recursive: bool,
+    *,
+    settings: RuntimeSettings | None = None,
+) -> List[Path]:
     candidates: List[Path] = []
     provided = []
     if path:
@@ -76,7 +82,7 @@ def _iter_candidate_files(path: Optional[str], paths: Optional[List[str]], recur
         provided = ["."]
 
     for raw in provided:
-        target = resolve_allowed_path(raw, field_name="path")
+        target = resolve_allowed_path(raw, field_name="path", settings=settings)
         if target.is_file():
             candidates.append(target)
             continue
@@ -96,8 +102,8 @@ def _iter_candidate_files(path: Optional[str], paths: Optional[List[str]], recur
     return candidates
 
 
-def _iter_glob_files(pattern: str) -> List[Path]:
-    root = workspace_root()
+def _iter_glob_files(pattern: str, *, settings: RuntimeSettings | None = None) -> List[Path]:
+    root = workspace_root(settings)
     if not pattern:
         return []
     p = Path(pattern)
@@ -106,7 +112,7 @@ def _iter_glob_files(pattern: str) -> List[Path]:
     raw_matches = globlib.glob(pattern, root_dir=str(root), recursive=True)
     files: List[Path] = []
     for m in raw_matches:
-        candidate = resolve_allowed_path(m, field_name="glob_match")
+        candidate = resolve_allowed_path(m, field_name="glob_match", settings=settings)
         if candidate.is_file():
             files.append(candidate)
     return files
@@ -215,8 +221,9 @@ def _search_with_python(
 
 
 class TextSearchTool(Tool):
-    def __init__(self):
+    def __init__(self, settings: RuntimeSettings | None = None):
         super().__init__()
+        self._settings = settings or get_runtime_settings()
         self.name = "text_search"
         self.description = "Search plain text in workspace files (ripgrep preferred, sandboxed paths only)."
 
@@ -245,13 +252,20 @@ class TextSearchTool(Tool):
 
             files: List[Path] = []
             if glob:
-                files.extend(_iter_glob_files(glob))
-            files.extend(_iter_candidate_files(path=path, paths=paths, recursive=bool(recursive)))
+                files.extend(_iter_glob_files(glob, settings=self._settings))
+            files.extend(
+                _iter_candidate_files(
+                    path=path,
+                    paths=paths,
+                    recursive=bool(recursive),
+                    settings=self._settings,
+                )
+            )
 
             unique_files: List[Path] = []
             seen_files: Set[str] = set()
             skipped_out_of_roots = 0
-            allowed_roots = (workspace_root(), tool_result_root())
+            allowed_roots = self._settings.allowed_roots
             for fp in files:
                 try:
                     resolved_fp = fp.resolve()
@@ -330,7 +344,7 @@ class TextSearchTool(Tool):
 
                 uid_match = UID_RE.search(line_text)
                 hit = {
-                    "path": _to_rel_display(file_path),
+                    "path": _to_rel_display(file_path, self._settings),
                     "line": line_no,
                     "text": snippet,
                 }

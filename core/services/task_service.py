@@ -4,6 +4,7 @@ from core.storage.checkpoint import CheckpointStore
 from ws.connection_manager import ConnectionManager
 from core.executor import TaskExecutor
 from core.cache_manager import CacheManager
+from core.runtime_settings import RuntimeSettings
 from core.tool_result_externalizer import ToolResultExternalizerConfig
 
 from core.protocol import Trace,Turn,Step,NodeType,Action,Observation,AgentStatus
@@ -12,7 +13,8 @@ class TaskService:
 
     def __init__(self, checkpoint: CheckpointStore, provider: Provider, tool_registry: ToolRegistry,
                  ws_manager: ConnectionManager, cache_manager: CacheManager,
-                 tool_result_config: ToolResultExternalizerConfig | None = None):
+                 tool_result_config: ToolResultExternalizerConfig | None = None,
+                 runtime_settings: RuntimeSettings | None = None):
         self.checkpoint = checkpoint
         self.provider = provider
         self.tool_registry = tool_registry
@@ -25,6 +27,7 @@ class TaskService:
             ws_manager,
             cache_manager,
             tool_result_config=tool_result_config,
+            runtime_settings=runtime_settings,
         )
 
     async def initialize(self, goal: str, client_id: str) -> Trace:

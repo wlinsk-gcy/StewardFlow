@@ -1,9 +1,13 @@
 import json
+import os
 import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from core.runtime_settings import RuntimeSettings, get_runtime_settings, set_runtime_settings
+from core.tools.fs_tools import FsReadTool
+from core.tools.path_sandbox import assert_path_in_allowed_roots
 from core.tools.text_search import TextSearchTool
 
 
@@ -93,6 +97,39 @@ class TestTextSearchTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["summary"]["searched_files"], 1)
         self.assertEqual(len(rg_seen["files"]), 1)
         self.assertEqual(len(py_seen["files"]), 1)
+
+    async def test_settings_injection_without_env_for_sandbox_and_fs_read_limit(self):
+        prev_settings = get_runtime_settings()
+        self.addCleanup(lambda: set_runtime_settings(prev_settings))
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TOOL_RESULT_ROOT_DIR", None)
+            os.environ.pop("TOOL_RESULT_FS_READ_MAX_CHARS", None)
+
+            settings = RuntimeSettings(
+                workspace_root=Path.cwd(),
+                tool_result_root_dir="data/tool_results/custom_injected",
+                inline_limit=500,
+                preview_limit=500,
+                fs_read_max_chars=2100,
+                always_externalize_tools=set(),
+            )
+            set_runtime_settings(settings)
+
+            outside_path = settings.workspace_root.parent / "__outside_guard__.txt"
+            with self.assertRaises(PermissionError):
+                assert_path_in_allowed_roots(outside_path, settings.allowed_roots)
+
+            large_file = self.base_dir / "big.txt"
+            large_file.write_text("x" * 5000, encoding="utf-8")
+
+            fs_read = FsReadTool(settings=settings)
+            read_res = await fs_read.execute(path="data/test_text_search/big.txt", offset=0, length=8000)
+            read_data = json.loads(read_res)
+            self.assertTrue(read_data["ok"])
+            self.assertEqual(read_data["summary"]["hard_limit_chars"], 2100)
+            self.assertEqual(len(read_data["text"]), 2100)
+            self.assertTrue(read_data["truncated"])
 
 
 if __name__ == "__main__":

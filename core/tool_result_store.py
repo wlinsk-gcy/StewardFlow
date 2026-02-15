@@ -9,10 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from core.tools.tool import Instance
-
-
-DEFAULT_TOOL_RESULT_ROOT = "data/tool_results"
+from core.runtime_settings import RuntimeSettings, get_runtime_settings
 
 
 @dataclass
@@ -61,13 +58,6 @@ def _sanitize_segment(value: str) -> str:
     return cleaned or "unknown"
 
 
-def _is_safe_relative_path(raw_path: str) -> bool:
-    p = Path(raw_path)
-    if p.is_absolute():
-        return False
-    return not any(part == ".." for part in p.parts)
-
-
 def _looks_like_json(text: str) -> bool:
     s = (text or "").strip()
     if not s:
@@ -82,15 +72,10 @@ def _looks_like_json(text: str) -> bool:
 
 
 class ToolResultStore:
-    def __init__(self, root_dir: str = DEFAULT_TOOL_RESULT_ROOT):
-        if not _is_safe_relative_path(root_dir):
-            raise ValueError(f"unsafe_tool_result_root_dir: {root_dir}")
-        workspace = Path(Instance.directory).resolve()
-        resolved_root = (workspace / Path(root_dir)).resolve()
-        if resolved_root != workspace and workspace not in resolved_root.parents:
-            raise ValueError(f"tool_result_root_outside_workspace: {root_dir}")
-        self._workspace = workspace
-        self._root = resolved_root
+    def __init__(self, settings: RuntimeSettings | None = None):
+        self._settings = settings or get_runtime_settings()
+        self._workspace = self._settings.workspace_root
+        self._root = self._settings.tool_result_root
 
     @property
     def root_dir(self) -> Path:

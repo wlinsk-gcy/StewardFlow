@@ -1,25 +1,21 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterable
 
-from .tool import Instance
+from core.runtime_settings import RuntimeSettings, get_runtime_settings
 
 
-DEFAULT_TOOL_RESULT_ROOT = "data/tool_results"
+def workspace_root(settings: RuntimeSettings | None = None) -> Path:
+    return (settings or get_runtime_settings()).workspace_root
 
 
-def workspace_root() -> Path:
-    return Path(Instance.directory).resolve()
+def tool_result_root(settings: RuntimeSettings | None = None) -> Path:
+    return (settings or get_runtime_settings()).tool_result_root
 
 
-def tool_result_root() -> Path:
-    root = os.getenv("TOOL_RESULT_ROOT_DIR", DEFAULT_TOOL_RESULT_ROOT).strip() or DEFAULT_TOOL_RESULT_ROOT
-    candidate = Path(root)
-    if candidate.is_absolute():
-        return candidate.resolve()
-    return (workspace_root() / candidate).resolve()
+def allowed_roots(settings: RuntimeSettings | None = None) -> tuple[Path, Path]:
+    return (settings or get_runtime_settings()).allowed_roots
 
 
 def _is_safe_relative(raw_path: str) -> bool:
@@ -50,8 +46,14 @@ def assert_path_in_allowed_roots(path: Path, roots: Iterable[Path]) -> None:
     raise PermissionError(f"path_outside_allowed_roots: {path}")
 
 
-def resolve_allowed_path(raw_path: str, *, field_name: str = "path") -> Path:
+def resolve_allowed_path(
+    raw_path: str,
+    *,
+    field_name: str = "path",
+    settings: RuntimeSettings | None = None,
+) -> Path:
+    resolved_settings = settings or get_runtime_settings()
     validate_relative_input(raw_path, field_name=field_name)
-    candidate = (workspace_root() / Path(raw_path)).resolve()
-    assert_path_in_allowed_roots(candidate, (workspace_root(), tool_result_root()))
+    candidate = (resolved_settings.workspace_root / Path(raw_path)).resolve()
+    assert_path_in_allowed_roots(candidate, resolved_settings.allowed_roots)
     return candidate
