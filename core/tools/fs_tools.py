@@ -3,43 +3,33 @@ from __future__ import annotations
 import glob as globlib
 import json
 import os
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .tool import Instance, Tool
+from .path_sandbox import resolve_allowed_path, tool_result_root, workspace_root
+from .tool import Tool
 
 
 DEFAULT_MAX_ITEMS = 200
 DEFAULT_MAX_LINES = 200
 DEFAULT_MAX_BYTES = 16384
 DEFAULT_WRITE_MAX_BYTES = 1048576
-ARTIFACT_DIR = Path("data") / "tool_artifacts"
-
-
-def _workspace_root() -> Path:
-    return Path(Instance.directory).resolve()
-
-
-def _resolve_workspace_path(raw_path: str) -> Path:
-    root = _workspace_root()
-    candidate = Path(raw_path or ".")
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    resolved = candidate.resolve()
-    if not Instance.contains_path(str(resolved)):
-        raise PermissionError(f"path_outside_workspace: {raw_path}")
-    if resolved != root and root not in resolved.parents:
-        raise PermissionError(f"path_outside_workspace: {raw_path}")
-    return resolved
+DEFAULT_READ_LENGTH = 2000
+HARD_MAX_READ_LENGTH = min(
+    8000,
+    max(2000, int(os.getenv("TOOL_RESULT_FS_READ_MAX_CHARS", "4000"))),
+)
 
 
 def _to_rel_display(path: Path) -> str:
-    root = _workspace_root()
+    workspace = workspace_root()
     try:
-        return path.resolve().relative_to(root).as_posix()
+        return path.resolve().relative_to(workspace).as_posix()
     except Exception:
-        return path.resolve().as_posix()
+        try:
+            return path.resolve().relative_to(tool_result_root()).as_posix()
+        except Exception:
+            return path.resolve().as_posix()
 
 
 def _safe_int(value: Any, default: int, min_value: int = 1) -> int:
@@ -52,25 +42,8 @@ def _safe_int(value: Any, default: int, min_value: int = 1) -> int:
         return default
 
 
-def _write_artifact(tool_name: str, payload: Any, extension: str = "json") -> str:
-    root = _workspace_root()
-    folder = root / ARTIFACT_DIR
-    folder.mkdir(parents=True, exist_ok=True)
-    stamp = int(time.time() * 1000)
-    file_path = folder / f"{tool_name}_{stamp}.{extension}"
-    if extension == "json":
-        file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        text_payload = payload if isinstance(payload, str) else str(payload)
-        file_path.write_text(text_payload, encoding="utf-8")
-    return _to_rel_display(file_path)
-
-
 def _build_error(error: str) -> str:
-    return json.dumps(
-        {"ok": False, "truncated": False, "artifact_path": None, "error": error},
-        ensure_ascii=False,
-    )
+    return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
 
 
 def _item_from_path(path: Path) -> Optional[Dict[str, Any]]:
@@ -113,7 +86,7 @@ class FsListTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "fs_list"
-        self.description = "List files/directories using a workspace-safe, OS-agnostic API."
+        self.description = "List files/directories using a workspace-safe API."
 
     async def execute(
         self,
@@ -126,7 +99,7 @@ class FsListTool(Tool):
     ) -> str:
         del kwargs
         try:
-            target = _resolve_workspace_path(path)
+            target = resolve_allowed_path(path, field_name="path")
             limit = _safe_int(max_items, DEFAULT_MAX_ITEMS)
 
             all_items: List[Dict[str, Any]] = []
@@ -139,23 +112,13 @@ class FsListTool(Tool):
                 if item:
                     all_items.append(item)
 
-            truncated = len(all_items) > limit
-            preview_items = all_items[:limit]
-            artifact_path = None
-            if truncated:
-                artifact_path = _write_artifact(
-                    "fs_list",
-                    {"path": _to_rel_display(target), "items": all_items},
-                )
-
             payload = {
                 "ok": True,
-                "items": preview_items,
-                "truncated": truncated,
-                "artifact_path": artifact_path,
+                "items": all_items[:limit],
+                "truncated": len(all_items) > limit,
                 "summary": {
                     "path": _to_rel_display(target),
-                    "returned_items": len(preview_items),
+                    "returned_items": min(len(all_items), limit),
                     "total_items": len(all_items),
                 },
             }
@@ -172,7 +135,7 @@ class FsListTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "default": ".", "description": "File or directory path."},
+                        "path": {"type": "string", "default": ".", "description": "Relative file or directory path."},
                         "recursive": {"type": "boolean", "default": False},
                         "max_items": {"type": "integer", "default": DEFAULT_MAX_ITEMS, "minimum": 1, "maximum": 5000},
                         "include_dirs": {"type": "boolean", "default": True},
@@ -196,36 +159,27 @@ class FsGlobTool(Tool):
         if not pattern:
             return _build_error("pattern_required")
         try:
-            root = _workspace_root()
+            if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+                return _build_error("pattern_must_be_relative_and_without_parent_segments")
+
+            root = workspace_root()
             limit = _safe_int(max_matches, DEFAULT_MAX_ITEMS)
             matches_rel = globlib.glob(pattern, root_dir=str(root), recursive=True)
 
             all_matches: List[Dict[str, Any]] = []
             for rel in matches_rel:
-                candidate = (root / rel).resolve()
-                if not Instance.contains_path(str(candidate)):
-                    continue
+                candidate = resolve_allowed_path(rel, field_name="pattern_match")
                 item = _item_from_path(candidate)
                 if item:
                     all_matches.append(item)
 
-            truncated = len(all_matches) > limit
-            preview_matches = all_matches[:limit]
-            artifact_path = None
-            if truncated:
-                artifact_path = _write_artifact(
-                    "fs_glob",
-                    {"pattern": pattern, "matches": all_matches},
-                )
-
             payload = {
                 "ok": True,
-                "matches": preview_matches,
-                "truncated": truncated,
-                "artifact_path": artifact_path,
+                "matches": all_matches[:limit],
+                "truncated": len(all_matches) > limit,
                 "summary": {
                     "pattern": pattern,
-                    "returned_matches": len(preview_matches),
+                    "returned_matches": min(len(all_matches), limit),
                     "total_matches": len(all_matches),
                 },
             }
@@ -242,7 +196,7 @@ class FsGlobTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": {"type": "string", "description": "Glob pattern like '**/*.py'."},
+                        "pattern": {"type": "string", "description": "Relative glob pattern like '**/*.py'."},
                         "max_matches": {"type": "integer", "default": DEFAULT_MAX_ITEMS, "minimum": 1, "maximum": 5000},
                     },
                     "required": ["pattern"],
@@ -257,12 +211,14 @@ class FsReadTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "fs_read"
-        self.description = "Read text from a file with bounded lines/bytes and safe truncation."
+        self.description = "Read text from a relative file path with bounded offset/length."
 
     async def execute(
         self,
         path: str,
-        start_line: int = 1,
+        offset: int = 0,
+        length: int = DEFAULT_READ_LENGTH,
+        start_line: Optional[int] = None,
         max_lines: int = DEFAULT_MAX_LINES,
         max_bytes: int = DEFAULT_MAX_BYTES,
         **kwargs,
@@ -270,44 +226,68 @@ class FsReadTool(Tool):
         del kwargs
         if not path:
             return _build_error("path_required")
+
         try:
-            file_path = _resolve_workspace_path(path)
+            file_path = resolve_allowed_path(path, field_name="path")
             if not file_path.exists() or not file_path.is_file():
                 return _build_error(f"not_a_file: {path}")
 
-            start = _safe_int(start_line, 1)
-            line_limit = _safe_int(max_lines, DEFAULT_MAX_LINES)
-            byte_limit = _safe_int(max_bytes, DEFAULT_MAX_BYTES)
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            hard_limit = HARD_MAX_READ_LENGTH
 
-            with file_path.open("r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
+            if start_line is not None:
+                start = _safe_int(start_line, 1)
+                line_limit = _safe_int(max_lines, DEFAULT_MAX_LINES)
+                byte_limit = _safe_int(max_bytes, DEFAULT_MAX_BYTES)
 
-            selected_lines = all_lines[start - 1 :] if start - 1 < len(all_lines) else []
-            full_text = "".join(selected_lines)
-            preview_text = "".join(selected_lines[:line_limit])
+                lines = text.splitlines(keepends=True)
+                selected = lines[start - 1: start - 1 + line_limit]
+                chunk = "".join(selected)
+                encoded = chunk.encode("utf-8")
+                if len(encoded) > byte_limit:
+                    chunk = encoded[:byte_limit].decode("utf-8", errors="ignore")
+                if len(chunk) > hard_limit:
+                    chunk = chunk[:hard_limit]
 
-            truncated = len(selected_lines) > line_limit
-            encoded = preview_text.encode("utf-8")
-            if len(encoded) > byte_limit:
-                preview_text = encoded[:byte_limit].decode("utf-8", errors="ignore")
-                truncated = True
-            if len(full_text.encode("utf-8")) > byte_limit:
-                truncated = True
+                returned_chars = len(chunk)
+                total_chars_from_start = len("".join(lines[start - 1:])) if start - 1 < len(lines) else 0
+                payload = {
+                    "ok": True,
+                    "mode": "line",
+                    "text": chunk,
+                    "truncated": returned_chars < total_chars_from_start,
+                    "summary": {
+                        "path": _to_rel_display(file_path),
+                        "start_line": start,
+                        "returned_chars": returned_chars,
+                        "total_chars_from_start": total_chars_from_start,
+                        "hard_limit_chars": hard_limit,
+                    },
+                }
+                return json.dumps(payload, ensure_ascii=False)
 
-            artifact_path = None
-            if truncated:
-                artifact_path = _write_artifact("fs_read", full_text, extension="txt")
+            safe_offset = max(0, int(offset or 0))
+            requested_length = _safe_int(length, DEFAULT_READ_LENGTH)
+            safe_length = min(requested_length, hard_limit)
+
+            if safe_offset >= len(text):
+                chunk = ""
+            else:
+                chunk = text[safe_offset: safe_offset + safe_length]
+            truncated = safe_offset + len(chunk) < len(text) or safe_length < requested_length
 
             payload = {
                 "ok": True,
-                "text": preview_text,
+                "mode": "offset",
+                "text": chunk,
                 "truncated": truncated,
-                "artifact_path": artifact_path,
                 "summary": {
                     "path": _to_rel_display(file_path),
-                    "start_line": start,
-                    "returned_lines": min(len(selected_lines), line_limit),
-                    "total_lines_from_start": len(selected_lines),
+                    "offset": safe_offset,
+                    "requested_length": requested_length,
+                    "returned_chars": len(chunk),
+                    "total_chars": len(text),
+                    "hard_limit_chars": hard_limit,
                 },
             }
             return json.dumps(payload, ensure_ascii=False)
@@ -323,8 +303,10 @@ class FsReadTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "Target file path."},
-                        "start_line": {"type": "integer", "default": 1, "minimum": 1},
+                        "path": {"type": "string", "description": "Relative target file path."},
+                        "offset": {"type": "integer", "default": 0, "minimum": 0},
+                        "length": {"type": "integer", "default": DEFAULT_READ_LENGTH, "minimum": 1, "maximum": 8000},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "Legacy line-based mode."},
                         "max_lines": {"type": "integer", "default": DEFAULT_MAX_LINES, "minimum": 1, "maximum": 5000},
                         "max_bytes": {"type": "integer", "default": DEFAULT_MAX_BYTES, "minimum": 1, "maximum": 1048576},
                     },
@@ -340,7 +322,7 @@ class FsWriteTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "fs_write"
-        self.description = "Write text to a file with workspace guardrails and size limits."
+        self.description = "Write text to a relative file path with workspace guardrails and size limits."
 
     async def execute(
         self,
@@ -360,7 +342,7 @@ class FsWriteTool(Tool):
             if len(content_bytes) > byte_limit:
                 return _build_error(f"content_exceeds_max_bytes: {len(content_bytes)} > {byte_limit}")
 
-            file_path = _resolve_workspace_path(path)
+            file_path = resolve_allowed_path(path, field_name="path")
             if create_dirs:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
             write_mode = "a" if mode == "append" else "w"
@@ -372,8 +354,6 @@ class FsWriteTool(Tool):
                 "bytes_written": len((content or "").encode("utf-8")),
                 "chars_written": written,
                 "path": _to_rel_display(file_path),
-                "truncated": False,
-                "artifact_path": None,
             }
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
@@ -406,14 +386,14 @@ class FsStatTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "fs_stat"
-        self.description = "Get stat metadata for a workspace path."
+        self.description = "Get stat metadata for a relative path under workspace/tool_result root."
 
     async def execute(self, path: str, **kwargs) -> str:
         del kwargs
         if not path:
             return _build_error("path_required")
         try:
-            target = _resolve_workspace_path(path)
+            target = resolve_allowed_path(path, field_name="path")
             exists = target.exists()
             size = None
             mtime = None
@@ -435,8 +415,6 @@ class FsStatTool(Tool):
                 "mtime": mtime,
                 "type": item_type,
                 "path": _to_rel_display(target),
-                "truncated": False,
-                "artifact_path": None,
             }
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
@@ -457,4 +435,3 @@ class FsStatTool(Tool):
                 "strict": True,
             },
         }
-

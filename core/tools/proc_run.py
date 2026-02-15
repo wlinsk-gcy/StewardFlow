@@ -9,7 +9,6 @@ import json
 import os
 import platform
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -106,14 +105,6 @@ def _to_rel(path: Path) -> str:
         return path.resolve().as_posix()
 
 
-def _new_artifact_path() -> Path:
-    root = _workspace_root()
-    out_dir = root / "data" / "tool_artifacts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = int(time.time() * 1000)
-    return out_dir / f"proc_run_{stamp}.json"
-
-
 class _StreamCapture:
     def __init__(self, max_bytes: int, max_lines: int, full_cap_bytes: int):
         self.max_bytes = max_bytes
@@ -201,19 +192,21 @@ class _StreamCapture:
 def _build_response(
     ok: bool,
     exit_code: Optional[int],
+    stdout: str = "",
+    stderr: str = "",
     stdout_preview: str = "",
     stderr_preview: str = "",
     truncated: bool = False,
-    artifact_path: Optional[str] = None,
     error: Optional[str] = None,
 ) -> str:
     payload = {
         "ok": ok,
         "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
         "stdout_preview": stdout_preview,
         "stderr_preview": stderr_preview,
         "truncated": truncated,
-        "artifact_path": artifact_path,
         "error": error,
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -399,31 +392,15 @@ class ProcRunTool(Tool):
             or out_state.full_capped
             or err_state.full_capped
         )
-        artifact_path: Optional[str] = None
-        if truncated:
-            artifact_file = _new_artifact_path()
-            artifact_payload = {
-                "program": program,
-                "args": args,
-                "cwd": _to_rel(cwd_path),
-                "stdout": out_state.full(),
-                "stderr": err_state.full(),
-                "stdout_total_bytes": out_state.total_bytes,
-                "stderr_total_bytes": err_state.total_bytes,
-                "stdout_total_lines": out_state.total_lines,
-                "stderr_total_lines": err_state.total_lines,
-                "capture_capped": bool(out_state.full_capped or err_state.full_capped),
-            }
-            artifact_file.write_text(json.dumps(artifact_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            artifact_path = _to_rel(artifact_file)
 
         return _build_response(
             ok=(not timed_out and exit_code == 0),
             exit_code=exit_code,
+            stdout=out_state.full(),
+            stderr=err_state.full(),
             stdout_preview=out_state.preview(),
             stderr_preview=err_state.preview(),
             truncated=truncated,
-            artifact_path=artifact_path,
             error=error_msg,
         )
 

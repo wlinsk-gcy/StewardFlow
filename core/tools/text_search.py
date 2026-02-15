@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import glob as globlib
 import json
 import os
 import re
-import glob as globlib
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .fs_tools import DEFAULT_MAX_ITEMS, _build_error, _resolve_workspace_path, _to_rel_display, _write_artifact
-from .tool import Instance, Tool
+from .fs_tools import DEFAULT_MAX_ITEMS
+from .path_sandbox import resolve_allowed_path, workspace_root
+from .tool import Tool
 
 
 UID_RE = re.compile(r"\buid=([A-Za-z0-9_:-]+)\b")
@@ -24,6 +27,18 @@ def _safe_int(value: Any, default: int, min_value: int = 0) -> int:
         return default
 
 
+def _build_error(error: str) -> str:
+    return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
+
+
+def _to_rel_display(path: Path) -> str:
+    root = workspace_root()
+    try:
+        return path.resolve().relative_to(root).as_posix()
+    except Exception:
+        return path.resolve().as_posix()
+
+
 def _normalize_queries(query: Optional[str], queries: Optional[List[Any]]) -> List[str]:
     out: List[str] = []
     if query and isinstance(query, str):
@@ -36,7 +51,6 @@ def _normalize_queries(query: Optional[str], queries: Optional[List[Any]]) -> Li
         q = item.strip()
         if q:
             out.append(q)
-    # Keep stable order while deduplicating.
     seen: Set[str] = set()
     normalized: List[str] = []
     for q in out:
@@ -57,7 +71,7 @@ def _iter_candidate_files(path: Optional[str], paths: Optional[List[str]], recur
         provided = ["."]
 
     for raw in provided:
-        target = _resolve_workspace_path(raw)
+        target = resolve_allowed_path(raw, field_name="path")
         if target.is_file():
             candidates.append(target)
             continue
@@ -78,25 +92,128 @@ def _iter_candidate_files(path: Optional[str], paths: Optional[List[str]], recur
 
 
 def _iter_glob_files(pattern: str) -> List[Path]:
-    root = Path(Instance.directory).resolve()
+    root = workspace_root()
     if not pattern:
         return []
+    p = Path(pattern)
+    if p.is_absolute() or ".." in p.parts:
+        raise PermissionError("glob_must_be_relative_and_without_parent_segments")
     raw_matches = globlib.glob(pattern, root_dir=str(root), recursive=True)
     files: List[Path] = []
     for m in raw_matches:
-        p = (root / m).resolve()
-        if not Instance.contains_path(str(p)):
-            continue
-        if p.is_file():
-            files.append(p)
+        candidate = resolve_allowed_path(m, field_name="glob_match")
+        if candidate.is_file():
+            files.append(candidate)
     return files
+
+
+def _find_rg_binary() -> Optional[str]:
+    env_path = os.getenv("TOOL_RESULT_RG_PATH")
+    if env_path and Path(env_path).exists():
+        return env_path
+    resolved = shutil.which("rg")
+    return resolved
+
+
+def _search_with_rg(
+    *,
+    files: List[Path],
+    normalized_queries: List[str],
+    is_regex: bool,
+    case_sensitive: bool,
+) -> List[Tuple[Path, int, str]]:
+    rg_path = _find_rg_binary()
+    if not rg_path:
+        raise RuntimeError("rg_not_found")
+
+    cmd = [rg_path, "--json", "--line-number", "--color", "never"]
+    if not case_sensitive:
+        cmd.append("-i")
+    if not is_regex:
+        cmd.append("-F")
+    for q in normalized_queries:
+        cmd.extend(["-e", q])
+    cmd.append("--")
+    cmd.extend(str(f) for f in files)
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if proc.returncode not in (0, 1):
+        stderr = (proc.stderr or "").strip()
+        raise RuntimeError(f"rg_failed: {stderr}" if stderr else "rg_failed")
+
+    hits: List[Tuple[Path, int, str]] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") != "match":
+            continue
+        data = obj.get("data") or {}
+        line_no = int(data.get("line_number") or 0)
+        if line_no <= 0:
+            continue
+        path_text = ((data.get("path") or {}).get("text") or "").strip()
+        if not path_text:
+            continue
+        line_text = ((data.get("lines") or {}).get("text") or "").rstrip("\n")
+        hits.append((Path(path_text).resolve(), line_no, line_text))
+    return hits
+
+
+def _search_with_python(
+    *,
+    files: List[Path],
+    normalized_queries: List[str],
+    is_regex: bool,
+    case_sensitive: bool,
+) -> List[Tuple[Path, int, str]]:
+    flags = 0 if case_sensitive else re.IGNORECASE
+    patterns: List[Tuple[str, Optional[re.Pattern[str]]]] = []
+    if is_regex:
+        for q in normalized_queries:
+            patterns.append((q, re.compile(q, flags)))
+    else:
+        for q in normalized_queries:
+            patterns.append((q if case_sensitive else q.lower(), None))
+
+    hits: List[Tuple[Path, int, str]] = []
+    for file_path in files:
+        try:
+            with file_path.open("r", encoding="utf-8", errors="replace") as f:
+                for idx, line in enumerate(f, start=1):
+                    line_for_match = line if case_sensitive else line.lower()
+                    matched = False
+                    for pattern_text, compiled in patterns:
+                        if compiled is not None:
+                            if compiled.search(line):
+                                matched = True
+                                break
+                        else:
+                            if pattern_text in line_for_match:
+                                matched = True
+                                break
+                    if matched:
+                        hits.append((file_path.resolve(), idx, line.rstrip("\n")))
+        except OSError:
+            continue
+    return hits
 
 
 class TextSearchTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "text_search"
-        self.description = "Search plain text in workspace files using semantic, OS-agnostic parameters."
+        self.description = "Search plain text in workspace files (ripgrep preferred, sandboxed paths only)."
 
     async def execute(
         self,
@@ -129,86 +246,93 @@ class TextSearchTool(Tool):
             unique_files: List[Path] = []
             seen_files: Set[str] = set()
             for fp in files:
-                key = str(fp)
+                key = str(fp.resolve())
                 if key in seen_files:
                     continue
                 seen_files.add(key)
-                unique_files.append(fp)
+                unique_files.append(fp.resolve())
 
-            flags = 0 if case_sensitive else re.IGNORECASE
-            patterns: List[Tuple[str, Optional[re.Pattern[str]]]] = []
-            if is_regex:
-                for q in normalized_queries:
-                    patterns.append((q, re.compile(q, flags)))
-            else:
-                for q in normalized_queries:
-                    patterns.append((q if case_sensitive else q.lower(), None))
+            if not unique_files:
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "matches": [],
+                        "truncated": False,
+                        "summary": {
+                            "queries": normalized_queries,
+                            "searched_files": 0,
+                            "returned_matches": 0,
+                            "total_matches": 0,
+                            "engine": "none",
+                        },
+                    },
+                    ensure_ascii=False,
+                )
 
+            engine = "rg"
+            try:
+                raw_hits = _search_with_rg(
+                    files=unique_files,
+                    normalized_queries=normalized_queries,
+                    is_regex=bool(is_regex),
+                    case_sensitive=bool(case_sensitive),
+                )
+            except Exception:
+                engine = "python"
+                raw_hits = _search_with_python(
+                    files=unique_files,
+                    normalized_queries=normalized_queries,
+                    is_regex=bool(is_regex),
+                    case_sensitive=bool(case_sensitive),
+                )
+
+            # Deduplicate by (path, line)
+            deduped_hits: List[Tuple[Path, int, str]] = []
+            seen_hit_keys: Set[Tuple[str, int]] = set()
+            for fp, line_no, line_text in raw_hits:
+                key = (str(fp), line_no)
+                if key in seen_hit_keys:
+                    continue
+                seen_hit_keys.add(key)
+                deduped_hits.append((fp, line_no, line_text))
+
+            file_cache: Dict[str, List[str]] = {}
             all_matches: List[Dict[str, Any]] = []
 
-            for file_path in unique_files:
-                try:
-                    with file_path.open("r", encoding="utf-8", errors="replace") as f:
-                        lines = f.readlines()
-                except OSError:
-                    continue
-
+            for file_path, line_no, line_text in deduped_hits:
+                path_key = str(file_path)
+                if path_key not in file_cache:
+                    try:
+                        with file_path.open("r", encoding="utf-8", errors="replace") as f:
+                            file_cache[path_key] = f.readlines()
+                    except OSError:
+                        file_cache[path_key] = []
+                lines = file_cache[path_key]
                 total = len(lines)
-                for idx, line in enumerate(lines, start=1):
-                    line_for_match = line if case_sensitive else line.lower()
-                    matched = False
-                    for pattern_text, compiled in patterns:
-                        if compiled is not None:
-                            if compiled.search(line):
-                                matched = True
-                                break
-                        else:
-                            if pattern_text in line_for_match:
-                                matched = True
-                                break
-                    if not matched:
-                        continue
+                start_idx = max(1, line_no - ctx)
+                end_idx = min(total, line_no + ctx)
+                snippet = "".join(lines[start_idx - 1: end_idx]).rstrip("\n")
 
-                    start_idx = max(1, idx - ctx)
-                    end_idx = min(total, idx + ctx)
-                    snippet = "".join(lines[start_idx - 1 : end_idx]).rstrip("\n")
-                    uid_match = UID_RE.search(line)
-
-                    hit = {
-                        "path": _to_rel_display(file_path),
-                        "line": idx,
-                        "text": snippet,
-                    }
-                    if uid_match:
-                        hit["uid"] = uid_match.group(1)
-                    all_matches.append(hit)
-
-            truncated = len(all_matches) > limit
-            preview_matches = all_matches[:limit]
-
-            artifact_path = None
-            if truncated:
-                artifact_path = _write_artifact(
-                    "text_search",
-                    {
-                        "queries": normalized_queries,
-                        "path": path,
-                        "paths": paths,
-                        "glob": glob,
-                        "matches": all_matches,
-                    },
-                )
+                uid_match = UID_RE.search(line_text)
+                hit = {
+                    "path": _to_rel_display(file_path),
+                    "line": line_no,
+                    "text": snippet,
+                }
+                if uid_match:
+                    hit["uid"] = uid_match.group(1)
+                all_matches.append(hit)
 
             payload = {
                 "ok": True,
-                "matches": preview_matches,
-                "truncated": truncated,
-                "artifact_path": artifact_path,
+                "matches": all_matches[:limit],
+                "truncated": len(all_matches) > limit,
                 "summary": {
                     "queries": normalized_queries,
                     "searched_files": len(unique_files),
-                    "returned_matches": len(preview_matches),
+                    "returned_matches": min(len(all_matches), limit),
                     "total_matches": len(all_matches),
+                    "engine": engine,
                 },
             }
             return json.dumps(payload, ensure_ascii=False)
@@ -226,9 +350,9 @@ class TextSearchTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "Single file/directory path."},
-                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Multiple paths."},
-                        "glob": {"type": "string", "description": "Glob pattern to collect files first."},
+                        "path": {"type": "string", "description": "Single relative file/directory path."},
+                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Multiple relative paths."},
+                        "glob": {"type": "string", "description": "Relative glob pattern to collect files first."},
                         "query": {"type": "string", "description": "Single query."},
                         "queries": {"type": "array", "items": {"type": "string"}, "description": "Batch queries."},
                         "is_regex": {"type": "boolean", "default": False},
