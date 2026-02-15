@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .fs_tools import DEFAULT_MAX_ITEMS
-from .path_sandbox import resolve_allowed_path, workspace_root
+from .path_sandbox import (
+    assert_path_in_allowed_roots,
+    resolve_allowed_path,
+    tool_result_root,
+    workspace_root,
+)
 from .tool import Tool
 
 
@@ -245,12 +250,21 @@ class TextSearchTool(Tool):
 
             unique_files: List[Path] = []
             seen_files: Set[str] = set()
+            skipped_out_of_roots = 0
+            allowed_roots = (workspace_root(), tool_result_root())
             for fp in files:
-                key = str(fp.resolve())
+                try:
+                    resolved_fp = fp.resolve()
+                    assert_path_in_allowed_roots(resolved_fp, allowed_roots)
+                except Exception:
+                    skipped_out_of_roots += 1
+                    continue
+
+                key = str(resolved_fp)
                 if key in seen_files:
                     continue
                 seen_files.add(key)
-                unique_files.append(fp.resolve())
+                unique_files.append(resolved_fp)
 
             if not unique_files:
                 return json.dumps(
@@ -264,6 +278,7 @@ class TextSearchTool(Tool):
                             "returned_matches": 0,
                             "total_matches": 0,
                             "engine": "none",
+                            "skipped_out_of_roots": skipped_out_of_roots,
                         },
                     },
                     ensure_ascii=False,
@@ -333,6 +348,7 @@ class TextSearchTool(Tool):
                     "returned_matches": min(len(all_matches), limit),
                     "total_matches": len(all_matches),
                     "engine": engine,
+                    "skipped_out_of_roots": skipped_out_of_roots,
                 },
             }
             return json.dumps(payload, ensure_ascii=False)
