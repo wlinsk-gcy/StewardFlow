@@ -21,6 +21,65 @@ ACTION_TYPE_ALIASES = {
     "confirm": "request_confirm",
 }
 
+
+def _parse_json_dict(s: str) -> Optional[dict]:
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _repair_json_structure(s: str) -> Optional[str]:
+    text = (s or "").strip()
+    if not text.startswith("{"):
+        return None
+
+    in_str = False
+    escape = False
+    stack: list[str] = []
+    out: list[str] = []
+
+    for ch in text:
+        if in_str:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            out.append(ch)
+            continue
+        if ch in "}]":
+            expected = "{" if ch == "}" else "["
+            # Recover cases like missing "]" before a trailing "}".
+            while stack and stack[-1] != expected:
+                missing_open = stack.pop()
+                out.append("}" if missing_open == "{" else "]")
+            if stack and stack[-1] == expected:
+                stack.pop()
+                out.append(ch)
+            # Ignore unmatched closing bracket.
+            continue
+        out.append(ch)
+
+    if in_str:
+        return None
+    while stack:
+        missing_open = stack.pop()
+        out.append("}" if missing_open == "{" else "]")
+    repaired = "".join(out).strip()
+    return repaired if repaired.startswith("{") else None
+
 def normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     if not tool_calls:
         return []
@@ -40,19 +99,32 @@ def normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
 def safe_parse_tool_args(arg_str: str) -> dict:
     s = (arg_str or "").strip()
     if not s:
-        return {}  # 空参就当成 {}
-    try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else {}
-    except json.JSONDecodeError:
-        # 兜底：记录前 200 字符，方便定位模型到底回了什么
-        logger.warning("Invalid tool arguments JSON: %r", s[:200])
-        return {}  # 或 raise，看你是否愿意 fail fast
+        return {}
+
+    direct = _parse_json_dict(s)
+    if direct is not None:
+        return direct
+
+    balanced = _extract_first_balanced_json_object(s)
+    if balanced:
+        parsed = _parse_json_dict(balanced)
+        if parsed is not None:
+            return parsed
+
+    repaired = _repair_json_structure(s)
+    if repaired and repaired != s:
+        parsed = _parse_json_dict(repaired)
+        if parsed is not None:
+            logger.warning("Recovered malformed tool arguments JSON by structural repair: %r", s[:200])
+            return parsed
+
+    logger.warning("Invalid tool arguments JSON: %r", s[:200])
+    return {}
 
 def _extract_first_balanced_json_object(text: str) -> Optional[str]:
     """
     从 text 中抽取第一个“完整配对”的 JSON 对象：{ ... }。
-    关键：忽略字符串中的花括号，并处理转义字符。
+    关键点：忽略字符串中的花括号，并处理转义字符。
     """
     start = text.find("{")
     if start < 0:
@@ -155,7 +227,7 @@ class Provider:
     model: str
 
     def __init__(self, model:str, api_key: str, base_url: str, tool_registry: ToolRegistry, ws_manager: ConnectionManager, context_config: dict | None = None):
-        self.model = model # NVIDIA的免费API接口测试：QWEN系列模型不支持function call
+        self.model = model # NVIDIA 免费 API 接口测试：QWEN 系列模型不支持 function call
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key
@@ -171,7 +243,7 @@ class Provider:
     def generate(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
         is_thinking = context.get("is_thinking", False)
-        # TODO 针对429 Error Code做 Retry
+        # TODO 针对 429 Error Code 做重试
         response = self.client.chat.completions.create(
             model=self.model,
             messages=context.get("messages"),
@@ -215,8 +287,12 @@ class Provider:
             )
 
         if response.usage.prompt_tokens_details:
-            logger.info(f"Cache Tokens：{response.usage.prompt_tokens_details.cached_tokens}")
-        logger.info(f"Prompt Token：{response.usage.prompt_tokens}, Completion Token：{response.usage.completion_tokens}, Total Token：{response.usage.total_tokens}")
+            logger.info(f"Cache Tokens: {response.usage.prompt_tokens_details.cached_tokens}")
+        logger.info(
+            f"Prompt Token: {response.usage.prompt_tokens}, "
+            f"Completion Token: {response.usage.completion_tokens}, "
+            f"Total Token: {response.usage.total_tokens}"
+        )
         token_info = {
             "cache_tokens": response.usage.prompt_tokens_details.cached_tokens if response.usage.prompt_tokens_details else 0,
             "prompt_tokens": response.usage.prompt_tokens,
@@ -224,3 +300,4 @@ class Provider:
             "total_tokens": response.usage.total_tokens
         }
         return reasoning, actions, token_info
+
