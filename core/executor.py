@@ -266,14 +266,16 @@ class TaskExecutor:
             step.status = StepStatus.WAITING_CONFIRM
             action.status = ActionStatus.WAITING_CONFIRM
             await self._request_confirm(trace.client_id, trace.trace_id, turn.turn_id, action.action_id, action.message, action.tool_name, action.args)
-            # if not tream
-            event = Event(EventType.HITL_CONFIRM, trace.trace_id, turn.turn_id, {"content": action.message})
-            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
         elif action.type == ActionType.REQUEST_INPUT:
             step.status = StepStatus.WAITING_INPUT
             action.status = ActionStatus.WAITING_INPUT
-            # if not tream
-            event = Event(EventType.HITL_REQUEST, trace.trace_id, turn.turn_id, {"content": action.message})
+            # if not stream
+            event = Event(
+                EventType.HITL_REQUEST,
+                trace.trace_id,
+                action.action_id,
+                {"content": action.message},
+            )
             await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
         else:
             # error
@@ -478,7 +480,7 @@ class TaskExecutor:
         event = Event(
             EventType.HITL_CONFIRM,
             trace_id,
-            turn_id,
+            pending_action_id or turn_id,
             {
                 "request_id": pending_action_id,
                 "prompt": prompt_text,

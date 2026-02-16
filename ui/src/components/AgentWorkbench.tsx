@@ -170,15 +170,24 @@ export const AgentWorkbench: React.FC = () => {
       // console.log('receive answer or hitl_request');
       setIsRunning((prev) => (prev ? false : prev));
       setChatHistory((prev) => {
-        // 查找是否已经存在相同 msg_id 且角色为 assistant 的消息
-        const existingMsgIndex = prev.findIndex(
-          (m) => m.msg_id === msg_id && m.role === "assistant",
-        );
-        if (existingMsgIndex !== -1) {
-          // 如果消息已存在，在原有内容基础上追加 text
+        const isHitlRequest = event_type === "hitl_request";
+        const lastIndex = prev.length - 1;
+        const lastMessage = lastIndex >= 0 ? prev[lastIndex] : undefined;
+        const canAppendToLast =
+          !!msg_id &&
+          !!lastMessage &&
+          lastMessage.role === "assistant" &&
+          lastMessage.msg_id === msg_id &&
+          (
+            (isHitlRequest && lastMessage.hitlType === "request") ||
+            (!isHitlRequest && !lastMessage.isHitl)
+          );
+
+        // 仅当连续分片到达且目标是最后一条 assistant 消息时才拼接
+        if (canAppendToLast && lastMessage) {
           const newHistory = [...prev];
-          const targetMsg = newHistory[existingMsgIndex];
-          newHistory[existingMsgIndex] = {
+          const targetMsg = newHistory[lastIndex];
+          newHistory[lastIndex] = {
             ...targetMsg,
             content: targetMsg.content + (data.content || ""),
             // 如果是 hitl_request，确保标记状态
