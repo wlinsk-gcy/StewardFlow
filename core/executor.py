@@ -5,17 +5,18 @@ ReAct 执行引擎
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from .protocol import (
     AgentStatus, NodeType,
     ActionType, Event, EventType,
     Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus
 )
-from .builder.build import llm_response_schema
 from .llm import Provider
 from .runtime_settings import RuntimeSettings, get_runtime_settings
+from .trace_event_logger import bind_event_context, emit_trace_event
 from .tool_result_externalizer import (
     ToolResultExternalizerConfig,
     ToolResultExternalizerMiddleware,
@@ -42,6 +43,34 @@ DEFAULT_SCREENSHOT_FLAG = ["chrome-devtools_click",
                            "chrome-devtools_navigate_page",
                            "chrome-devtools_new_page",
                            "chrome-devtools_select_page"]
+
+
+def _extract_tool_args_keys(raw_args: Any) -> list[str]:
+    if isinstance(raw_args, dict):
+        return sorted(str(k) for k in raw_args.keys())
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except Exception:
+            return []
+        if isinstance(parsed, dict):
+            return sorted(str(k) for k in parsed.keys())
+    return []
+
+
+def _summarize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summarized: list[dict[str, Any]] = []
+    for tc in tool_calls or []:
+        function = tc.get("function") if isinstance(tc, dict) else {}
+        function = function if isinstance(function, dict) else {}
+        summarized.append(
+            {
+                "tool_call_id": tc.get("id") if isinstance(tc, dict) else None,
+                "name": function.get("name"),
+                "args_keys": _extract_tool_args_keys(function.get("arguments")),
+            }
+        )
+    return summarized
 
 class TaskExecutor:
     stream: bool = False
@@ -123,6 +152,15 @@ class TaskExecutor:
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
         step.thought = reasoning
         step.actions = actions
+        emit_trace_event(
+            logger,
+            event="llm_response",
+            trace_id=trace.trace_id,
+            turn_id=turn.turn_id,
+            step_id=step.step_id,
+            action_count=len(actions or []),
+            tool_calls=_summarize_tool_calls(step.tool_calls or []),
+        )
         action = actions[0]
         # 这里是 not Stream才发送的
         if actions[0].type != ActionType.TOOL:
@@ -205,6 +243,8 @@ class TaskExecutor:
                 # 同一批Actions存在多个需要Confirm的工具，每次处理一个，执行一个, execute_hitl后requires_confirm = False
                 if action.requires_confirm:
                     continue
+                if action.status != ActionStatus.PLANNED:
+                    continue
                 action.status = ActionStatus.RUNNING
                 observation = await self._execute_tool(trace, turn, step, action)
                 step.observations.append(observation)
@@ -243,7 +283,13 @@ class TaskExecutor:
     async def _observe(self, trace: Trace, turn: Turn, step: Step):
 
         # 如果当前Step还存在没有Done的Action，继续执行，可能是因为WaitConfirm
-        actions = [action for action in step.actions if action.status != ActionStatus.DONE]
+        pending_statuses = {
+            ActionStatus.PLANNED,
+            ActionStatus.RUNNING,
+            ActionStatus.WAITING_CONFIRM,
+            ActionStatus.WAITING_INPUT,
+        }
+        actions = [action for action in step.actions if action.status in pending_statuses]
         if actions:
             trace.node = NodeType.THINK
         else:
@@ -294,6 +340,10 @@ class TaskExecutor:
     async def _execute_tool(self, trace: Trace, turn: Turn, step: Step, action: Action):
         tool_name = action.tool_name
         args = action.args
+        trace_id = trace.trace_id
+        turn_id = turn.turn_id
+        step_id = step.step_id
+        tool_call_id = action.action_id
         screenshot_tool = None
         screenshot_path = None
         observation_id = get_sonyflake("observation_")
@@ -328,8 +378,28 @@ class TaskExecutor:
         if tool.name in DEFAULT_SCREENSHOT_FLAG:
             screenshot_tool = self.tool_registry.get("chrome-devtools_take_screenshot")
             screenshot_path = f"./.screenshots/{trace.trace_id}_screenshot.png"
+        started_at = time.perf_counter()
+        tool_ok = False
+        emit_trace_event(
+            logger,
+            event="tool_start",
+            trace_id=trace_id,
+            turn_id=turn_id,
+            step_id=step_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name or "unknown_tool",
+            elapsed_ms=0,
+            ok=None,
+        )
         try:
-            execute_result = await tool.execute(**(args or {}))
+            with bind_event_context(
+                trace_id=trace_id,
+                turn_id=turn_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name or "unknown_tool",
+            ):
+                execute_result = await tool.execute(**(args or {}))
             if tool_name == "chrome-devtools_wait_for" and execute_result == "wait_for response":
                 # wait_for作为响应屏障，拿到结果后直接snapshot，并返回链接，由LLM按需检索
                 snapshot_tool = self.tool_registry.get("chrome-devtools_take_snapshot")
@@ -350,14 +420,22 @@ class TaskExecutor:
                         )
                     )
 
-            observation_payload = self.tool_result_externalizer.externalize(
+            with bind_event_context(
+                trace_id=trace_id,
+                turn_id=turn_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
                 tool_name=tool_name or "unknown_tool",
-                raw_result=execute_result,
-                trace_id=trace.trace_id,
-                turn_id=turn.turn_id,
-                step_id=step.step_id,
-                tool_call_id=action.action_id,
-            )
+            ):
+                observation_payload = self.tool_result_externalizer.externalize(
+                    tool_name=tool_name or "unknown_tool",
+                    raw_result=execute_result,
+                    trace_id=trace.trace_id,
+                    turn_id=turn.turn_id,
+                    step_id=step.step_id,
+                    tool_call_id=action.action_id,
+                )
+            tool_ok = True
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
@@ -367,6 +445,7 @@ class TaskExecutor:
             )
         except Exception as e:
             action.status = ActionStatus.FAILED
+            tool_ok = False
             error_payload = self.tool_result_externalizer.build_error(
                 tool_name=tool_name or "unknown_tool",
                 error_text=f"Tool '{tool_name}' executed error: {str(e)}",
@@ -377,6 +456,19 @@ class TaskExecutor:
                 type=ObservationType.TOOL_ERROR,
                 ok=False,
                 content=json.dumps(error_payload, ensure_ascii=False),
+            )
+        finally:
+            elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+            emit_trace_event(
+                logger,
+                event="tool_end",
+                trace_id=trace_id,
+                turn_id=turn_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name or "unknown_tool",
+                elapsed_ms=elapsed_ms,
+                ok=bool(tool_ok),
             )
 
     async def _request_confirm(self, client_id: str, trace_id: str, turn_id: str, pending_action_id:str, prompt: str,

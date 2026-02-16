@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob as globlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.runtime_settings import RuntimeSettings, get_runtime_settings
+from core.trace_event_logger import emit_trace_event
 from .fs_tools import DEFAULT_MAX_ITEMS
 from .path_sandbox import (
     assert_path_in_allowed_roots,
@@ -20,6 +22,7 @@ from .tool import Tool
 
 
 UID_RE = re.compile(r"\buid=([A-Za-z0-9_:-]+)\b")
+logger = logging.getLogger(__name__)
 
 
 def _safe_int(value: Any, default: int, min_value: int = 0) -> int:
@@ -281,24 +284,33 @@ class TextSearchTool(Tool):
                 unique_files.append(resolved_fp)
 
             if not unique_files:
-                return json.dumps(
-                    {
-                        "ok": True,
-                        "matches": [],
-                        "truncated": False,
-                        "summary": {
-                            "queries": normalized_queries,
-                            "searched_files": 0,
-                            "returned_matches": 0,
-                            "total_matches": 0,
-                            "engine": "none",
-                            "skipped_out_of_roots": skipped_out_of_roots,
-                        },
+                payload = {
+                    "ok": True,
+                    "matches": [],
+                    "truncated": False,
+                    "summary": {
+                        "queries": normalized_queries,
+                        "searched_files": 0,
+                        "returned_matches": 0,
+                        "total_matches": 0,
+                        "engine": "none",
+                        "skipped_out_of_roots": skipped_out_of_roots,
                     },
-                    ensure_ascii=False,
+                }
+                emit_trace_event(
+                    logger,
+                    event="text_search",
+                    engine="none",
+                    searched_files=0,
+                    returned_matches=0,
+                    total_matches=0,
+                    skipped_out_of_roots=skipped_out_of_roots,
+                    fallback_reason=None,
                 )
+                return json.dumps(payload, ensure_ascii=False)
 
             engine = "rg"
+            fallback_reason = None
             try:
                 raw_hits = _search_with_rg(
                     files=unique_files,
@@ -306,8 +318,9 @@ class TextSearchTool(Tool):
                     is_regex=bool(is_regex),
                     case_sensitive=bool(case_sensitive),
                 )
-            except Exception:
+            except Exception as exc:
                 engine = "python"
+                fallback_reason = str(exc)
                 raw_hits = _search_with_python(
                     files=unique_files,
                     normalized_queries=normalized_queries,
@@ -365,10 +378,40 @@ class TextSearchTool(Tool):
                     "skipped_out_of_roots": skipped_out_of_roots,
                 },
             }
+            emit_trace_event(
+                logger,
+                event="text_search",
+                engine=engine,
+                searched_files=len(unique_files),
+                returned_matches=min(len(all_matches), limit),
+                total_matches=len(all_matches),
+                skipped_out_of_roots=skipped_out_of_roots,
+                fallback_reason=fallback_reason,
+            )
             return json.dumps(payload, ensure_ascii=False)
         except re.error as exc:
+            emit_trace_event(
+                logger,
+                event="text_search",
+                engine="python",
+                searched_files=0,
+                returned_matches=0,
+                total_matches=0,
+                skipped_out_of_roots=0,
+                fallback_reason=f"invalid_regex:{str(exc)}",
+            )
             return _build_error(f"invalid_regex: {str(exc)}")
         except Exception as exc:
+            emit_trace_event(
+                logger,
+                event="text_search",
+                engine="error",
+                searched_files=0,
+                returned_matches=0,
+                total_matches=0,
+                skipped_out_of_roots=0,
+                fallback_reason=str(exc),
+            )
             return _build_error(str(exc))
 
     def schema(self) -> dict:

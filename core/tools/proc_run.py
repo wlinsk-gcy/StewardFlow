@@ -8,6 +8,7 @@ import codecs
 import json
 import os
 import platform
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -103,6 +104,29 @@ def _to_rel(path: Path) -> str:
         return path.resolve().relative_to(root).as_posix()
     except Exception:
         return path.resolve().as_posix()
+
+
+def _resolve_program_alias(program: str) -> str:
+    raw = (program or "").strip()
+    if not raw:
+        return raw
+
+    # Keep explicit paths unchanged.
+    if os.path.isabs(raw) or any(sep in raw for sep in ("/", "\\")):
+        return raw
+
+    if shutil.which(raw):
+        return raw
+
+    lowered = raw.lower()
+    if lowered not in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        return raw
+
+    for candidate in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        if shutil.which(candidate):
+            return candidate
+
+    return raw
 
 
 class _StreamCapture:
@@ -238,6 +262,7 @@ class ProcRunTool(Tool):
             return _build_response(ok=False, exit_code=None, error="invalid_program")
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             return _build_response(ok=False, exit_code=None, error="invalid_args")
+        program_to_run = _resolve_program_alias(program)
 
         try:
             cwd_path = _resolve_workspace_path(cwd or Instance.directory)
@@ -273,7 +298,7 @@ class ProcRunTool(Tool):
         stderr_file_path: Optional[str] = None
 
         try:
-            proc = await asyncio.create_subprocess_exec(program, *args, **spawn_kwargs)
+            proc = await asyncio.create_subprocess_exec(program_to_run, *args, **spawn_kwargs)
         except PermissionError as exc:
             # Some Windows runtime/sandbox environments deny asyncio PIPE handles.
             # Fallback still uses create_subprocess_exec, but redirects stdout/stderr to temp files.
@@ -291,7 +316,7 @@ class ProcRunTool(Tool):
                 fallback_kwargs = dict(spawn_kwargs)
                 fallback_kwargs["stdout"] = stdout_file_handle
                 fallback_kwargs["stderr"] = stderr_file_handle
-                proc = await asyncio.create_subprocess_exec(program, *args, **fallback_kwargs)
+                proc = await asyncio.create_subprocess_exec(program_to_run, *args, **fallback_kwargs)
                 use_file_fallback = True
             except Exception as fallback_exc:
                 if stdout_file_handle:

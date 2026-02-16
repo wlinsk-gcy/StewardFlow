@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import glob as globlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.runtime_settings import RuntimeSettings, get_runtime_settings
+from core.trace_event_logger import emit_trace_event
 from .path_sandbox import resolve_allowed_path, tool_result_root, workspace_root
 from .tool import Tool
 
@@ -16,6 +18,7 @@ DEFAULT_MAX_LINES = 200
 DEFAULT_MAX_BYTES = 16384
 DEFAULT_WRITE_MAX_BYTES = 1048576
 DEFAULT_READ_LENGTH = 2000
+logger = logging.getLogger(__name__)
 
 
 def _to_rel_display(path: Path, settings: RuntimeSettings | None = None) -> str:
@@ -268,6 +271,17 @@ class FsReadTool(Tool):
                         "hard_limit_chars": hard_limit,
                     },
                 }
+                emit_trace_event(
+                    logger,
+                    event="fs_read",
+                    mode="line",
+                    start_line=start,
+                    offset=None,
+                    requested=byte_limit,
+                    returned=returned_chars,
+                    hard_limit=hard_limit,
+                    truncated=payload["truncated"],
+                )
                 return json.dumps(payload, ensure_ascii=False)
 
             safe_offset = max(0, int(offset or 0))
@@ -294,6 +308,17 @@ class FsReadTool(Tool):
                     "hard_limit_chars": hard_limit,
                 },
             }
+            emit_trace_event(
+                logger,
+                event="fs_read",
+                mode="offset",
+                start_line=None,
+                offset=safe_offset,
+                requested=requested_length,
+                returned=len(chunk),
+                hard_limit=hard_limit,
+                truncated=truncated,
+            )
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
             return _build_error(str(exc))

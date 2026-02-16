@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterable
 
 from core.runtime_settings import RuntimeSettings, get_runtime_settings
+from core.trace_event_logger import emit_trace_event
+
+logger = logging.getLogger(__name__)
 
 
 def workspace_root(settings: RuntimeSettings | None = None) -> Path:
@@ -27,10 +31,40 @@ def _is_safe_relative(raw_path: str) -> bool:
     return not any(part == ".." for part in p.parts)
 
 
-def validate_relative_input(raw_path: str, *, field_name: str = "path") -> None:
+def _allowed_roots_summary(roots: Iterable[Path]) -> list[str]:
+    return [str(Path(root).resolve()) for root in roots]
+
+
+def validate_relative_input(
+    raw_path: str,
+    *,
+    field_name: str = "path",
+    settings: RuntimeSettings | None = None,
+) -> None:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise PermissionError(f"{field_name}_required")
-    if not _is_safe_relative(raw_path):
+
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        resolved_settings = settings or get_runtime_settings()
+        emit_trace_event(
+            logger,
+            event="sandbox_reject",
+            reason="abs",
+            path=raw_path,
+            allowed_roots=_allowed_roots_summary(resolved_settings.allowed_roots),
+        )
+        raise PermissionError(f"{field_name}_must_be_relative_and_without_parent_segments")
+
+    if any(part == ".." for part in candidate.parts):
+        resolved_settings = settings or get_runtime_settings()
+        emit_trace_event(
+            logger,
+            event="sandbox_reject",
+            reason="dotdot",
+            path=raw_path,
+            allowed_roots=_allowed_roots_summary(resolved_settings.allowed_roots),
+        )
         raise PermissionError(f"{field_name}_must_be_relative_and_without_parent_segments")
 
 
@@ -41,8 +75,16 @@ def _is_under_root(path: Path, root: Path) -> bool:
 
 
 def assert_path_in_allowed_roots(path: Path, roots: Iterable[Path]) -> None:
-    if any(_is_under_root(path, root) for root in roots):
+    roots_list = list(roots)
+    if any(_is_under_root(path, root) for root in roots_list):
         return
+    emit_trace_event(
+        logger,
+        event="sandbox_reject",
+        reason="out_of_roots",
+        path=str(path),
+        allowed_roots=_allowed_roots_summary(roots_list),
+    )
     raise PermissionError(f"path_outside_allowed_roots: {path}")
 
 
@@ -53,7 +95,7 @@ def resolve_allowed_path(
     settings: RuntimeSettings | None = None,
 ) -> Path:
     resolved_settings = settings or get_runtime_settings()
-    validate_relative_input(raw_path, field_name=field_name)
+    validate_relative_input(raw_path, field_name=field_name, settings=resolved_settings)
     candidate = (resolved_settings.workspace_root / Path(raw_path)).resolve()
     assert_path_in_allowed_roots(candidate, resolved_settings.allowed_roots)
     return candidate

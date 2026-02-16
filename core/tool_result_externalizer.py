@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from .runtime_settings import RuntimeSettings, get_runtime_settings
+from .trace_event_logger import emit_trace_event
 from .tool_result_store import ToolResultStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,6 +113,22 @@ class ToolResultExternalizerMiddleware:
                 tool_call_id=tool_call_id,
                 normalized=normalized,
             )
+            emit_trace_event(
+                logger,
+                event="externalize",
+                trace_id=trace_id,
+                turn_id=turn_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                kind="ref",
+                chars=normalized.chars,
+                bytes=normalized.bytes_size,
+                lines=normalized.lines,
+                truncated=bool(preview_truncated),
+                force_ref=bool(force_ref),
+                ref_path=ref.path,
+            )
             return {
                 "kind": "ref",
                 "tool_name": tool_name,
@@ -123,6 +143,22 @@ class ToolResultExternalizerMiddleware:
                 "ref": ref.to_dict(),
             }
 
+        emit_trace_event(
+            logger,
+            event="externalize",
+            trace_id=trace_id,
+            turn_id=turn_id,
+            step_id=step_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            kind="inline",
+            chars=normalized.chars,
+            bytes=normalized.bytes_size,
+            lines=normalized.lines,
+            truncated=bool(preview_truncated),
+            force_ref=bool(force_ref),
+            ref_path=None,
+        )
         return {
             "kind": "inline",
             "tool_name": tool_name,

@@ -72,8 +72,16 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 handler.addFilter(RequestIdFilter())
 
+default_log_file = PROJECT_ROOT / "data" / "logs" / "stewardflow.log"
+log_file_path = Path(os.getenv("STEWARDFLOW_LOG_FILE", str(default_log_file)))
+log_file_path.parent.mkdir(parents=True, exist_ok=True)
+file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+file_handler.setFormatter(formatter)
+file_handler.addFilter(RequestIdFilter())
+
 logger.handlers.clear()
 logger.addHandler(handler)
+logger.addHandler(file_handler)
 
 
 def init_load_tools(settings: RuntimeSettings):
