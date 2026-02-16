@@ -40,9 +40,6 @@ class Tool:
     async def execute(self, **kwargs) -> str:
         raise NotImplementedError
 
-    async def do_another(self, **kwargs) -> str:
-        pass
-
 
 class ToolRegistry:
     def __init__(self):

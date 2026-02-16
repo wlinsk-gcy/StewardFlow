@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional, cast
 from openai import OpenAI,AsyncOpenAI
 from .tools.tool import ToolRegistry
 
-from .builder.build import build_system_prompt, llm_response_schema
+from .builder.build import build_system_prompt
 from ws.connection_manager import ConnectionManager
 from .protocol import Action,ActionType,Step
 from utils.id_util import get_sonyflake
@@ -249,7 +249,7 @@ class Provider:
             messages=context.get("messages"),
             temperature=0.2,
             top_p=0.9,
-            tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot", "chrome-devtools_evaluate_script"]),
+            tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot"]),
             extra_body={"enable_thinking": is_thinking},
             parallel_tool_calls=True,
         )

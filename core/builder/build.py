@@ -37,34 +37,3 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 """
 
 
-# 接口文档：https://platform.openai.com/docs/api-reference/chat
-llm_response_schema = ResponseFormatJSONSchema(
-    type="json_schema",
-    json_schema=JSONSchema(
-        name="agent",
-        description="""
-Control-only output for the deterministic agent engine.
-
-Tools are expressed ONLY via tool_calls.
-The assistant content must be a single dict with keys: type, message.
-""",
-        strict=True,
-        schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["type", "message"],
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["finish", "request_input", "request_confirm"]
-                },
-                "message": {
-                    "type": "string",
-                    "minLength": 1
-                }
-            }
-        }
-    )
-)
-
-

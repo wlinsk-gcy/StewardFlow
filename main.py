@@ -6,6 +6,7 @@ import sys
 import asyncio
 import os
 from pathlib import Path
+from typing import Tuple
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -84,6 +85,81 @@ logger.addHandler(handler)
 logger.addHandler(file_handler)
 
 
+def _is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _close_data_file_handlers(data_root: Path) -> None:
+    root_logger = logging.getLogger()
+    for log_handler in list(root_logger.handlers):
+        file_name = getattr(log_handler, "baseFilename", None)
+        if not file_name:
+            continue
+        if not _is_within_root(Path(file_name), data_root):
+            continue
+        root_logger.removeHandler(log_handler)
+        try:
+            log_handler.close()
+        except Exception as exc:
+            logger.warning("Failed to close log handler '%s': %s", file_name, exc)
+
+
+def _clear_data_files(data_root: Path) -> Tuple[int, int]:
+    target_root = data_root.resolve()
+    if not target_root.exists():
+        return 0, 0
+    if target_root != (PROJECT_ROOT / "data").resolve():
+        raise RuntimeError(f"Refusing to clear unexpected data root: {target_root}")
+
+    deleted = 0
+    failed = 0
+    for target in target_root.rglob("*"):
+        if not target.is_file() and not target.is_symlink():
+            continue
+        try:
+            target.unlink()
+            deleted += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("Failed to delete data file '%s': %s", target, exc)
+    return deleted, failed
+
+
+def _prune_empty_data_dirs(data_root: Path) -> Tuple[int, int]:
+    target_root = data_root.resolve()
+    if not target_root.exists():
+        return 0, 0
+    if target_root != (PROJECT_ROOT / "data").resolve():
+        raise RuntimeError(f"Refusing to prune unexpected data root: {target_root}")
+
+    removed = 0
+    failed = 0
+    dirs = [p for p in target_root.rglob("*") if p.is_dir()]
+    dirs.sort(key=lambda p: len(p.parts), reverse=True)
+    for directory in dirs:
+        if directory == target_root:
+            continue
+        try:
+            # 仅删除空目录
+            next(directory.iterdir())
+            continue
+        except StopIteration:
+            try:
+                directory.rmdir()
+                removed += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("Failed to delete empty data dir '%s': %s", directory, exc)
+        except Exception as exc:
+            failed += 1
+            logger.warning("Failed to inspect data dir '%s': %s", directory, exc)
+    return removed, failed
+
+
 def init_load_tools(settings: RuntimeSettings):
     registry = ToolRegistry()
     from core.tools.web_search_use_exa import WebSearch
@@ -143,6 +219,19 @@ async def lifespan(app: FastAPI):
     await mcp_client.close_all_sessions()
     clean_screenshot()
     clear_tool_artifacts()
+    data_root = PROJECT_ROOT / "data"
+    _close_data_file_handlers(data_root)
+    deleted_count, failed_count = _clear_data_files(data_root)
+    removed_dirs, failed_dirs = _prune_empty_data_dirs(data_root)
+    logger.info(
+        "Shutdown data cleanup completed: deleted_files=%s failed_files=%s "
+        "removed_empty_dirs=%s failed_empty_dirs=%s root=%s",
+        deleted_count,
+        failed_count,
+        removed_dirs,
+        failed_dirs,
+        data_root,
+    )
 
 
 # 创建 FastAPI 应用

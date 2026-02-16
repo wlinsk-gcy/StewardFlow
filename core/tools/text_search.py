@@ -69,6 +69,40 @@ def _normalize_queries(query: Optional[str], queries: Optional[List[Any]]) -> Li
     return normalized
 
 
+def _looks_like_regex(query_text: str) -> bool:
+    q = (query_text or "").strip()
+    if not q:
+        return False
+    regex_hints = (
+        ".*",
+        ".+",
+        ".?",
+        "(?",
+        "[",
+        "]",
+        "|",
+        "\\d",
+        "\\D",
+        "\\w",
+        "\\W",
+        "\\s",
+        "\\S",
+        "\\b",
+        "\\B",
+        "\\A",
+        "\\Z",
+    )
+    if any(token in q for token in regex_hints):
+        return True
+    return q.startswith("^") or q.endswith("$")
+
+
+def _should_auto_enable_regex(is_regex: bool, normalized_queries: List[str]) -> bool:
+    if is_regex:
+        return False
+    return any(_looks_like_regex(q) for q in normalized_queries)
+
+
 def _iter_candidate_files(
     path: Optional[str],
     paths: Optional[List[str]],
@@ -249,6 +283,10 @@ class TextSearchTool(Tool):
             normalized_queries = _normalize_queries(query=query, queries=queries)
             if not normalized_queries:
                 return _build_error("query_or_queries_required")
+            # 兼容逻辑：当调用方遗漏 is_regex=true，但 query 明显包含正则语法（如 .*、(?<=...)、\d）时，
+            # 自动按正则执行，避免“看起来是正则、实际按字面量”导致的误判。
+            auto_regex = _should_auto_enable_regex(bool(is_regex), normalized_queries)
+            effective_is_regex = bool(is_regex) or auto_regex
 
             limit = _safe_int(max_matches, DEFAULT_MAX_ITEMS, min_value=1)
             ctx = _safe_int(context_lines, 0, min_value=0)
@@ -315,7 +353,7 @@ class TextSearchTool(Tool):
                 raw_hits = _search_with_rg(
                     files=unique_files,
                     normalized_queries=normalized_queries,
-                    is_regex=bool(is_regex),
+                    is_regex=effective_is_regex,
                     case_sensitive=bool(case_sensitive),
                 )
             except Exception as exc:
@@ -324,7 +362,7 @@ class TextSearchTool(Tool):
                 raw_hits = _search_with_python(
                     files=unique_files,
                     normalized_queries=normalized_queries,
-                    is_regex=bool(is_regex),
+                    is_regex=effective_is_regex,
                     case_sensitive=bool(case_sensitive),
                 )
 
@@ -375,6 +413,8 @@ class TextSearchTool(Tool):
                     "returned_matches": min(len(all_matches), limit),
                     "total_matches": len(all_matches),
                     "engine": engine,
+                    "is_regex": effective_is_regex,
+                    "auto_regex": auto_regex,
                     "skipped_out_of_roots": skipped_out_of_roots,
                 },
             }
@@ -382,6 +422,8 @@ class TextSearchTool(Tool):
                 logger,
                 event="text_search",
                 engine=engine,
+                is_regex=effective_is_regex,
+                auto_regex=auto_regex,
                 searched_files=len(unique_files),
                 returned_matches=min(len(all_matches), limit),
                 total_matches=len(all_matches),

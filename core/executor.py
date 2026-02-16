@@ -129,7 +129,7 @@ class TaskExecutor:
         turn.steps.append(step)
         trace.current_step_id = step.step_id
         schemas = self.tool_registry.get_all_schemas(
-            excludes=["chrome-devtools_take_screenshot", "chrome-devtools_evaluate_script"])
+            excludes=["chrome-devtools_take_screenshot"])
         messages = await self.cache_manager.build_messages(trace, schemas, toolset_version="tools_v1", response_schema_version="resp_v1")
         context = {
             "trace": trace,
@@ -402,10 +402,6 @@ class TaskExecutor:
                 tool_name=tool_name or "unknown_tool",
             ):
                 execute_result = await tool.execute(**(args or {}))
-            if tool_name == "chrome-devtools_wait_for" and execute_result == "wait_for response":
-                # wait_for作为响应屏障，拿到结果后直接snapshot，并返回链接，由LLM按需检索
-                snapshot_tool = self.tool_registry.get("chrome-devtools_take_snapshot")
-                execute_result = await snapshot_tool.execute()
             action.status = ActionStatus.DONE
             if screenshot_tool:
                 # 手动截图会存在一个问题，页面还未完全响应，就截图了，导致前端的浏览器视图里的图片没有完全响应。

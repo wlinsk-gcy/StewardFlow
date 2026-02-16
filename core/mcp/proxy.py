@@ -25,16 +25,6 @@ class MCPToolProxy(Tool):
                 }
             }
 
-    async def do_another(self, **kwargs) -> str:
-        if self.name == "chrome-devtools_wait_for":
-            text = cast(str, kwargs.get("text"))
-            logger.info(f"'{self.name}' MCP Proxy Tool Result length: {len(text)}")
-            if text.startswith("# wait_for response"):
-                return "wait_for response"
-            else:
-                return text
-        else:
-            return ""
 
 
     async def execute(self, **kwargs) -> str:
@@ -42,7 +32,5 @@ class MCPToolProxy(Tool):
         res = await self._call_fn(kwargs)
         content = res.content
         if content and isinstance(content[0], TextContent):
-            text = content[0].text
-            do_another_result = await self.do_another(text=text)
-            return do_another_result if do_another_result else text
+            return content[0].text
         return json.dumps(res)
