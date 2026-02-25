@@ -294,7 +294,7 @@ class Provider:
             f"Total Token: {response.usage.total_tokens}"
         )
         token_info = {
-            "cache_tokens": response.usage.prompt_tokens_details.cached_tokens if response.usage.prompt_tokens_details else 0,
+            "cache_tokens": response.usage.prompt_tokens_details.cached_tokens if (response.usage.prompt_tokens_details and response.usage.prompt_tokens_details.cached_tokens) else 0,
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens

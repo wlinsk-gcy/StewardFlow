@@ -362,7 +362,7 @@ class CacheManager(abc.ABC):
         )
 
         # Maybe compact (possibly multiple rounds to reach target_after_tokens)
-        await self._maybe_compact(ctx)
+        # await self._maybe_compact(ctx) # TODO 暂时不压缩上下文
 
         ctx.updated_at = time.time()
         await self._save_ctx(ctx)
