@@ -47,6 +47,7 @@ class EventType(str, Enum):
     OBSERVATION = "observation"   # execution trace - 展示执行结果
     FINAL = "final"               # execution trace - 展示最终回复
     SCREENSHOT = "screenshot"     # browser view - base64 screenshot
+    VNC_VIEW = "vnc_view"         # browser view - daytona vnc url
     TOKEN_INFO = "token_info"     # token消耗详情
 
     HITL_REQUEST = "hitl_request" # 当需要HITL用户输入时，向用户输出的提示词

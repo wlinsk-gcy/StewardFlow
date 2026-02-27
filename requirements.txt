@@ -6,3 +6,4 @@ PyYAML==6.0.3
 Requests==2.32.5
 sonyflake==2.0.2
 uvicorn==0.40.0
+daytona==0.40.6

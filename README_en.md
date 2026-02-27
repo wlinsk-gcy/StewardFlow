@@ -29,6 +29,7 @@ The LLM used in this case is deepseek-v3.2
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
 - **Tool system**: built-in tools such as `fs_list`, `fs_glob`, `fs_read`, `fs_write`, `fs_stat`, `text_search`, `proc_run`, etc.
+- **Daytona sandbox integration**: trace-scoped sandbox reuse with Git/file-system/computer-use capabilities and Daytona VNC in Browser View
 - **Unified tool result externalization**: every tool observation follows `kind=inline|ref`; large outputs are stored under `data/tool_results/`.
 - **Web search & screenshot relay**: the UI can display browser screenshots and retrieval results
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
@@ -87,6 +88,11 @@ Default URL: http://localhost:5173
 - `tool_result.inline_limit` / `tool_result.preview_limit`: inline/preview thresholds (in chars)
 - `tool_result.always_externalize_tools`: tools that should always return `kind=ref`
 - `llm.model` / `llm.api_key` / `llm.base_url`: LLM provider settings
+- `integrations.daytona_enabled`: enable Daytona tools (default `true`)
+- `integrations.builtin_tools_enabled`: register built-in local tools (default `false`)
+- `integrations.mcp_enabled`: register MCP tools (default `false`)
+- `daytona.auto_stop_minutes`: sandbox idle auto-stop window (default `15`)
+- `daytona.vnc_port`: noVNC port for Browser View (default `6080`)
 
 ## Ref Retrieval Workflow
 - If an observation is `kind=ref`, only summary/preview and `ref.path` are in context.

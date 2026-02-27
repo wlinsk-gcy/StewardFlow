@@ -16,6 +16,19 @@ tool_result:
     - chrome-devtools_take_screenshot
 
 llm:
-  model: deepseek-v3.2
+  model: qwen3.5-plus
   api_key: 改成你的key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+integrations:
+  daytona_enabled: true
+  builtin_tools_enabled: false
+  mcp_enabled: false
+
+daytona:
+  api_key: "" # daytone的api key
+  target: "" # sandbox的区域 us / eu
+  server_url: "" # daytone的host
+  auto_stop_minutes: 15
+  vnc_port: 6080
+  vnc_url_ttl_seconds: 3600

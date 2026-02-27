@@ -29,7 +29,6 @@ from core.tools.proc_run import ProcRunTool
 from core.tools.fs_tools import FsListTool, FsGlobTool, FsReadTool, FsWriteTool, FsStatTool
 from core.tools.text_search import TextSearchTool
 from core.tools.rg_loader import ensure_rg
-from core.mcp.client import MCPClient
 
 from core.services.task_service import TaskService
 from api.routes import router as agent_router
@@ -160,17 +159,45 @@ def _prune_empty_data_dirs(data_root: Path) -> Tuple[int, int]:
     return removed, failed
 
 
+def _to_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 def init_load_tools(settings: RuntimeSettings):
     registry = ToolRegistry()
-    from core.tools.web_search_use_exa import WebSearch
-    registry.register(WebSearch())
-    registry.register(FsListTool(settings=settings))
-    registry.register(FsGlobTool(settings=settings))
-    registry.register(FsReadTool(settings=settings))
-    registry.register(FsWriteTool(settings=settings))
-    registry.register(FsStatTool(settings=settings))
-    registry.register(TextSearchTool(settings=settings))
-    registry.register(ProcRunTool())
+    integrations = config.get("integrations") or {}
+
+    daytona_enabled = _to_bool(integrations.get("daytona_enabled"), True)
+    builtin_tools_enabled = _to_bool(integrations.get("builtin_tools_enabled"), False)
+
+    if daytona_enabled:
+        from core.tools.daytona_tools import register_daytona_tools
+
+        register_daytona_tools(registry, config.get("daytona") or {})
+
+    if builtin_tools_enabled:
+        from core.tools.web_search_use_exa import WebSearch
+
+        registry.register(WebSearch())
+        registry.register(FsListTool(settings=settings))
+        registry.register(FsGlobTool(settings=settings))
+        registry.register(FsReadTool(settings=settings))
+        registry.register(FsWriteTool(settings=settings))
+        registry.register(FsStatTool(settings=settings))
+        registry.register(TextSearchTool(settings=settings))
+        registry.register(ProcRunTool())
+
+    if not registry.get_tool_name():
+        logger.warning("No tools registered. Check integrations config.")
+
     return registry
 
 
@@ -185,8 +212,15 @@ async def lifespan(app: FastAPI):
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
     tool_registry = init_load_tools(runtime_settings)
-    mcp_client = MCPClient(config="./mcp_config.json")
-    await mcp_client.initialize(tool_registry)
+    integrations = config.get("integrations") or {}
+    mcp_enabled = _to_bool(integrations.get("mcp_enabled", False), False)
+
+    mcp_client = None
+    if mcp_enabled:
+        from core.mcp.client import MCPClient
+
+        mcp_client = MCPClient(config="./mcp_config.json")
+        await mcp_client.initialize(tool_registry)
     llm_config = config.get("llm")
     provider = Provider(llm_config.get("model"),
                         llm_config.get("api_key"),
@@ -216,7 +250,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # ===== shutdown =====
-    await mcp_client.close_all_sessions()
+    if mcp_enabled:
+        await mcp_client.close_all_sessions()
     clean_screenshot()
     clear_tool_artifacts()
     data_root = PROJECT_ROOT / "data"

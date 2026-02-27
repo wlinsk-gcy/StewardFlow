@@ -70,6 +70,7 @@ export const AgentWorkbench: React.FC = () => {
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [activeTab, setActiveTab] = useState<"runner" | "browser">("runner");
   const [currentUrl, setCurrentUrl] = useState("about:blank");
+  const [currentVncUrl, setCurrentVncUrl] = useState<string | null>(null);
   const [currentScreenshot, setCurrentScreenshot] = useState<string | null>(
     null,
   );
@@ -92,11 +93,36 @@ export const AgentWorkbench: React.FC = () => {
   const socketRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const traceScrollRef = useRef<HTMLDivElement>(null);
+  const currentVncUrlRef = useRef<string | null>(null);
+  const currentVncSandboxIdRef = useRef<string | null>(null);
 
   // --- 新增：初始化 WebSocket ---
   const handleIncomingEvent = useCallback((event: any) => {
     const { event_type, data, timestamp, msg_id } = event;
     // console.log('incoming event', event);
+    if (event_type === "vnc_view") {
+      const vncUrl = data?.vnc_url ?? data?.url;
+      const sandboxId =
+        typeof data?.sandbox_id === "string" ? data.sandbox_id.trim() : "";
+      if (typeof vncUrl === "string" && vncUrl.trim()) {
+        const normalizedVncUrl = vncUrl.trim();
+        const isSameSandbox =
+          !!sandboxId &&
+          !!currentVncSandboxIdRef.current &&
+          sandboxId === currentVncSandboxIdRef.current;
+        const isSameUrl = normalizedVncUrl === currentVncUrlRef.current;
+        if (isSameSandbox || isSameUrl) {
+          return;
+        }
+        currentVncUrlRef.current = normalizedVncUrl;
+        if (sandboxId) currentVncSandboxIdRef.current = sandboxId;
+        setCurrentVncUrl(normalizedVncUrl);
+        setCurrentUrl(normalizedVncUrl);
+        setActiveTab("browser");
+      }
+      return;
+    }
+
     if (event_type === "screenshot") {
       console.log("[ws] screenshot event", data);
       if (data?.content) {
@@ -438,6 +464,9 @@ export const AgentWorkbench: React.FC = () => {
     setGoal("");
     setTokenInfo(null);
     setTraceId(null);
+    setCurrentVncUrl(null);
+    currentVncUrlRef.current = null;
+    currentVncSandboxIdRef.current = null;
     setCurrentScreenshot(null);
     setCurrentUrl("about:blank");
     setActiveTab("runner");
@@ -711,7 +740,14 @@ export const AgentWorkbench: React.FC = () => {
               </div>
               {/* Browser Viewport */}
               <div className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner">
-                {currentScreenshot ? (
+                {currentVncUrl ? (
+                  <iframe
+                    src={currentVncUrl}
+                    title="Daytona VNC View"
+                    className="h-full w-full border-0 bg-black"
+                    allow="clipboard-read; clipboard-write; fullscreen"
+                  />
+                ) : currentScreenshot ? (
                   <img
                     src={currentScreenshot}
                     alt="Browser View"
@@ -726,8 +762,8 @@ export const AgentWorkbench: React.FC = () => {
                       Waiting for Navigation
                     </h4>
                     <p className="mt-2 text-[11px] text-gray-400">
-                      The agent will render the webpage view here once it uses
-                      the browser tool.
+                      The Daytona noVNC screen will appear here once computer
+                      use starts for this trace.
                     </p>
                   </div>
                 )}

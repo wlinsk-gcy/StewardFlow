@@ -17,6 +17,8 @@ from .protocol import (
 from .llm import Provider
 from .runtime_settings import RuntimeSettings, get_runtime_settings
 from .trace_event_logger import bind_event_context, emit_trace_event
+from .daytona.context import daytona_trace_id_ctx
+from .daytona.vnc_policy import extract_vnc_payload, should_emit_vnc_view_event
 from .tool_result_externalizer import (
     ToolResultExternalizerConfig,
     ToolResultExternalizerMiddleware,
@@ -71,6 +73,14 @@ def _summarize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, An
             }
         )
     return summarized
+
+
+def _extract_vnc_payload(raw_result: Any) -> dict[str, Any] | None:
+    return extract_vnc_payload(raw_result)
+
+
+def _should_emit_vnc_view_event(tool_name: str | None, raw_result: Any) -> bool:
+    return should_emit_vnc_view_event(tool_name, raw_result)
 
 class TaskExecutor:
     stream: bool = False
@@ -401,8 +411,21 @@ class TaskExecutor:
                 tool_call_id=tool_call_id,
                 tool_name=tool_name or "unknown_tool",
             ):
-                execute_result = await tool.execute(**(args or {}))
+                trace_token = daytona_trace_id_ctx.set(trace_id)
+                try:
+                    execute_result = await tool.execute(**(args or {}))
+                finally:
+                    daytona_trace_id_ctx.reset(trace_token)
             action.status = ActionStatus.DONE
+            vnc_payload = _extract_vnc_payload(execute_result)
+            if vnc_payload and _should_emit_vnc_view_event(tool_name, execute_result):
+                event = Event(
+                    EventType.VNC_VIEW,
+                    trace.trace_id,
+                    turn.turn_id,
+                    vnc_payload,
+                )
+                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
             if screenshot_tool:
                 # 手动截图会存在一个问题，页面还未完全响应，就截图了，导致前端的浏览器视图里的图片没有完全响应。
                 screenshot_result = await screenshot_tool.execute(filePath=screenshot_path)

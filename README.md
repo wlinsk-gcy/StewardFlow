@@ -30,6 +30,7 @@ StewardFlow 是一个基于 FastAPI 的 ReAct + HITL（人机协作）智能体�
 ## 功能概览
 - ReAct + HITL 任务编排：支持需要用户确认或补充输入的步骤
 - 工具系统：内置 `fs_list`、`fs_glob`、`fs_read`、`fs_write`、`fs_stat`、`text_search`、`proc_run` 等
+- Daytona 沙箱集成：按 Trace 复用沙箱，支持 Git/文件系统/Computer Use，并在 Browser View 展示 Daytona VNC
 - 统一工具结果外部化：tool observation 统一返回 `kind=inline|ref`，大结果自动落盘到 `data/tool_results/`
 - Web Search 与截图回传：前端可显示浏览器截图与检索结果
 - WebSocket 实时推送：展示 Thought/Action/Observation/Final 等执行日志
@@ -87,6 +88,11 @@ npm run dev
 - `tool_result.inline_limit` / `tool_result.preview_limit`：inline 与 preview 阈值（字符数）
 - `tool_result.always_externalize_tools`：强制外部化工具白名单
 - `llm.model` / `llm.api_key` / `llm.base_url`：LLM 提供商配置
+- `integrations.daytona_enabled`：是否启用 Daytona 工具（默认 `true`）
+- `integrations.builtin_tools_enabled`：是否注册内置本地工具（默认 `false`）
+- `integrations.mcp_enabled`：是否注册 MCP 工具（默认 `false`）
+- `daytona.auto_stop_minutes`：沙箱空闲自动释放时间（默认 `15` 分钟）
+- `daytona.vnc_port`：VNC/noVNC 端口（默认 `6080`）
 
 ## Ref 读回机制
 - 当 observation 为 `kind=ref` 时，只会返回摘要与 `ref.path`。
