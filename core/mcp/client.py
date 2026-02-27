@@ -354,87 +354,6 @@ class MCPClient:
         else:
             logger.debug("All sessions closed successfully")
 
-    async def search_tools(self, query: str = "", detail_level: str = "full") -> dict[str, Any]:
-        """Search available MCP tools across all active sessions.
-
-        Args:
-            query: Search query to filter tools by name or description.
-            detail_level: Level of detail to return:
-                - "names": Only tool names and server
-                - "descriptions": Names, server, and descriptions
-                - "full": Complete tool information including schemas
-
-        Returns:
-            Dictionary with:
-            - meta: Dictionary containing total_tools, namespaces, and result_count
-            - results: List of tool information dictionaries matching the query
-        Example:
-            ```python
-            # Search for GitHub-related tools
-            result = await client.search_tools("github pull")
-            print(f"Found {result['meta']['result_count']} tools out of {result['meta']['total_tools']} total")
-            for tool in result['results']:
-                print(f"{tool['server']}.{tool['name']}: {tool['description']}")
-            ```
-        """
-        all_tools = []
-        all_namespaces = set()
-        query_lower = query.lower()
-
-        # First pass: collect all tools and namespaces
-        for server_name, session in self.sessions.items():
-            try:
-                tools = await session.list_tools()
-                if tools:
-                    all_namespaces.add(server_name)
-
-                for tool in tools:
-                    # Build tool info based on detail level (before filtering)
-                    if detail_level == "names":
-                        tool_info = {
-                            "name": tool.name,
-                            "server": server_name,
-                        }
-                    elif detail_level == "descriptions":
-                        tool_info = {
-                            "name": tool.name,
-                            "server": server_name,
-                            "description": getattr(tool, "description", ""),
-                        }
-                    else:  # full
-                        tool_info = {
-                            "name": tool.name,
-                            "server": server_name,
-                            "description": getattr(tool, "description", ""),
-                            "input_schema": getattr(tool, "inputSchema", {}),
-                        }
-
-                    all_tools.append(tool_info)
-
-            except Exception as e:
-                logger.error(f"Failed to list tools for server {server_name}: {e}")
-
-        # Filter by query if provided
-        filtered_tools = all_tools
-        if query:
-            filtered_tools = []
-            for tool_info in all_tools:
-                tool_name_match = query_lower in tool_info["name"].lower()
-                desc_match = query_lower in tool_info.get("description", "").lower()
-                server_match = query_lower in tool_info["server"].lower()
-                if tool_name_match or desc_match or server_match:
-                    filtered_tools.append(tool_info)
-
-        # Return metadata along with results
-        return {
-            "meta": {
-                "total_tools": len(all_tools),
-                "namespaces": sorted(list(all_namespaces)),
-                "result_count": len(filtered_tools),
-            },
-            "results": filtered_tools,
-        }
-
 
 if __name__ == '__main__':
     import asyncio
@@ -472,10 +391,6 @@ if __name__ == '__main__':
                 "context7": {
                     "command": "npx",
                     "args": ["-y", "@upstash/context7-mcp", "--api-key", "YOUR_API_KEY"]
-                },
-                "chrome-devtools": {
-                    "command": "npx",
-                    "args": ["-y", "chrome-devtools-mcp@latest"]
                 }
             }
         }

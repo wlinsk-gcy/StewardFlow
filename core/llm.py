@@ -249,7 +249,7 @@ class Provider:
             messages=context.get("messages"),
             temperature=0.2,
             top_p=0.9,
-            tools=self.tool_registry.get_all_schemas(excludes=["chrome-devtools_take_screenshot"]),
+            tools=self.tool_registry.get_all_schemas(),
             extra_body={"enable_thinking": is_thinking},
             parallel_tool_calls=True,
         )

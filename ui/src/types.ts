@@ -7,7 +7,6 @@
     actions?: Array<Record<string, unknown>>;
     observations?: Array<Record<string, unknown>>;
     timestamp: number;
-    screenshot?: string; // Base64 encoded screenshot for browser view
 }
 
 export interface ChatMessage {

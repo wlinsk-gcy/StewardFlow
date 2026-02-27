@@ -30,7 +30,8 @@ The LLM used in this case is deepseek-v3.2
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
 - **Tool system**: built-in tools such as `fs_list`, `fs_glob`, `fs_read`, `fs_write`, `fs_stat`, `text_search`, `proc_run`, etc.
 - **Unified tool result externalization**: every tool observation follows `kind=inline|ref`; large outputs are stored under `data/tool_results/`.
-- **Web search & screenshot relay**: the UI can display browser screenshots and retrieval results
+- **AgentRun browser sandbox**: create browser sandbox by template name, with VNC desktop sharing and browser automation tools
+- **Web search & VNC browser view**: the UI can display real-time desktop sharing and retrieval results
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
 - **Frontend-backend separation**: FastAPI backend + Vite/React frontend workspace
 
@@ -86,6 +87,9 @@ Default URL: http://localhost:5173
 - `tool_result.root_dir`: storage root for externalized tool results (default: `data/tool_results`)
 - `tool_result.inline_limit` / `tool_result.preview_limit`: inline/preview thresholds (in chars)
 - `tool_result.always_externalize_tools`: tools that should always return `kind=ref`
+- `agentrun.template_name`: template name used to create browser-sandbox
+- `agentrun.account_id` / `agentrun.access_key_id` / `agentrun.access_key_secret` / `agentrun.region_id`: AgentRun auth/region settings (can be overridden by env vars)
+- `agentrun.vnc_api_key`: upstream auth key for VNC proxy. When set, backend forwards both `X-API-Key` and `X-API-KEY` headers
 - `llm.model` / `llm.api_key` / `llm.base_url`: LLM provider settings
 
 ## Ref Retrieval Workflow

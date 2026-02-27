@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VNC Lite</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: #f8fafc;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
+          "Apple Color Emoji", "Segoe UI Emoji";
+      }
+
+      #app {
+        position: relative;
+        width: 100%;
+        height: 100%;
+      }
+
+      #screen {
+        width: 100%;
+        height: 100%;
+        background: #0f172a;
+      }
+
+      #status {
+        position: absolute;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        padding: 6px 10px;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.92);
+        color: #334155;
+        font-size: 12px;
+        letter-spacing: 0.02em;
+      }
+
+      #status.error {
+        border-color: #fecaca;
+        color: #991b1b;
+        background: rgba(254, 242, 242, 0.96);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="status">Initializing noVNC...</div>
+      <div id="screen"></div>
+    </div>
+
+    <script type="module">
+      import RFB from "https://cdn.jsdelivr.net/gh/novnc/noVNC@v1.6.0/core/rfb.js";
+
+      const statusEl = document.getElementById("status");
+      const screenEl = document.getElementById("screen");
+
+      const setStatus = (text, error = false) => {
+        statusEl.textContent = text;
+        statusEl.className = error ? "error" : "";
+      };
+
+      const params = new URLSearchParams(window.location.search);
+      const wsParam = params.get("ws");
+
+      if (!wsParam) {
+        setStatus("Missing ws query parameter.", true);
+        throw new Error("Missing ws query parameter");
+      }
+
+      if (!/^wss?:\/\//i.test(wsParam)) {
+        setStatus("Invalid websocket URL.", true);
+        throw new Error("Invalid websocket URL");
+      }
+
+      const toProxyWsUrl = (targetWsUrl) => {
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const host = window.location.hostname || "localhost";
+        return `${wsProto}//${host}:8000/ws-vnc-proxy?target=${encodeURIComponent(targetWsUrl)}`;
+      };
+
+      try {
+        const rfb = new RFB(screenEl, toProxyWsUrl(wsParam), { shared: true });
+        rfb.scaleViewport = true;
+        rfb.resizeSession = true;
+        rfb.showDotCursor = true;
+        rfb.viewOnly = false;
+
+        const requestRemoteResize = () => {
+          try {
+            if (typeof rfb._requestRemoteResize === "function") {
+              rfb._requestRemoteResize();
+            }
+          } catch {
+            // no-op
+          }
+        };
+
+        setStatus("Connecting...");
+
+        rfb.addEventListener("connect", () => {
+          requestRemoteResize();
+          setStatus("Connected.");
+        });
+
+        rfb.addEventListener("disconnect", (evt) => {
+          const clean = Boolean(evt?.detail?.clean);
+          setStatus(clean ? "Disconnected." : "Connection closed unexpectedly.", !clean);
+        });
+
+        rfb.addEventListener("credentialsrequired", () => {
+          setStatus("VNC credentials are required.", true);
+        });
+
+        rfb.addEventListener("securityfailure", (evt) => {
+          const reason = String(evt?.detail?.reason || "Security negotiation failed.");
+          setStatus(reason, true);
+        });
+
+        const resizeObserver = new ResizeObserver(() => {
+          requestRemoteResize();
+        });
+        resizeObserver.observe(screenEl);
+
+        window.addEventListener("beforeunload", () => {
+          try {
+            resizeObserver.disconnect();
+          } catch {
+            // no-op
+          }
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setStatus(msg || "Failed to initialize noVNC.", true);
+      }
+    </script>
+  </body>
+</html>

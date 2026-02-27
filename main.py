@@ -6,7 +6,7 @@ import sys
 import asyncio
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -19,7 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from context import request_id_ctx, trace_id_ctx
 
 from utils.id_util import get_sonyflake
-from utils.screenshot_util import clean_screenshot
 from utils.tool_artifacts_util import clear_tool_artifacts
 from core.llm import Provider
 from core.runtime_settings import RuntimeSettings, configure_runtime_settings
@@ -29,7 +28,9 @@ from core.tools.proc_run import ProcRunTool
 from core.tools.fs_tools import FsListTool, FsGlobTool, FsReadTool, FsWriteTool, FsStatTool
 from core.tools.text_search import TextSearchTool
 from core.tools.rg_loader import ensure_rg
+from core.tools.agentrun_browser_tools import register_agentrun_browser_tools
 from core.mcp.client import MCPClient
+from core.vnc_proxy import build_vnc_proxy_headers, build_ws_connect_kwargs
 
 from core.services.task_service import TaskService
 from api.routes import router as agent_router
@@ -83,6 +84,16 @@ file_handler.addFilter(RequestIdFilter())
 logger.handlers.clear()
 logger.addHandler(handler)
 logger.addHandler(file_handler)
+
+
+def _resolve_ws_connect():
+    """Resolve websocket client connect() across websockets package versions."""
+    try:
+        from websockets.asyncio.client import connect as ws_connect  # type: ignore
+        return ws_connect
+    except Exception:
+        from websockets import connect as ws_connect  # type: ignore
+        return ws_connect
 
 
 def _is_within_root(path: Path, root: Path) -> bool:
@@ -162,6 +173,7 @@ def _prune_empty_data_dirs(data_root: Path) -> Tuple[int, int]:
 
 def init_load_tools(settings: RuntimeSettings):
     registry = ToolRegistry()
+    browser_manager = None
     from core.tools.web_search_use_exa import WebSearch
     registry.register(WebSearch())
     registry.register(FsListTool(settings=settings))
@@ -171,7 +183,12 @@ def init_load_tools(settings: RuntimeSettings):
     registry.register(FsStatTool(settings=settings))
     registry.register(TextSearchTool(settings=settings))
     registry.register(ProcRunTool())
-    return registry
+    browser_manager = register_agentrun_browser_tools(
+        registry=registry,
+        raw_config=config.get("agentrun") or {},
+        env=os.environ,
+    )
+    return registry, browser_manager
 
 
 @asynccontextmanager
@@ -184,7 +201,7 @@ async def lifespan(app: FastAPI):
 
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
-    tool_registry = init_load_tools(runtime_settings)
+    tool_registry, browser_manager = init_load_tools(runtime_settings)
     mcp_client = MCPClient(config="./mcp_config.json")
     await mcp_client.initialize(tool_registry)
     llm_config = config.get("llm")
@@ -211,13 +228,19 @@ async def lifespan(app: FastAPI):
     app.state.tool_registry = tool_registry
     app.state.provider = provider
     app.state.ws_manager = ws_manager
+    app.state.browser_manager = browser_manager
+    app.state.vnc_proxy_headers = build_vnc_proxy_headers(
+        raw_cfg=config.get("agentrun") or {},
+        env=os.environ,
+    )
 
     app.state.task_service = task_service
     yield
 
     # ===== shutdown =====
+    if browser_manager is not None:
+        await browser_manager.shutdown()
     await mcp_client.close_all_sessions()
-    clean_screenshot()
     clear_tool_artifacts()
     data_root = PROJECT_ROOT / "data"
     _close_data_file_handlers(data_root)
@@ -280,6 +303,77 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     except WebSocketDisconnect:
         ws_manager.disconnect(client_id)
         logger.info(f"Disconnected from client: {client_id}")
+
+
+@app.websocket("/ws-vnc-proxy")
+async def websocket_vnc_proxy(websocket: WebSocket):
+    """Proxy websocket frames between browser noVNC client and AgentRun VNC endpoint."""
+    await websocket.accept()
+    target = (websocket.query_params.get("target") or "").strip()
+    if not target.startswith(("ws://", "wss://")):
+        await websocket.close(code=1008, reason="invalid target websocket url")
+        return
+
+    try:
+        ws_connect = _resolve_ws_connect()
+    except Exception as exc:
+        logger.error("websockets package import failed: %s", exc)
+        await websocket.close(code=1011, reason="server missing websockets dependency")
+        return
+
+    logger.info("Opening VNC proxy websocket to target=%s", target)
+    try:
+        proxy_headers = getattr(app.state, "vnc_proxy_headers", None)
+        connect_kwargs = build_ws_connect_kwargs(
+            ws_connect,
+            headers=proxy_headers,
+            max_size=None,
+            open_timeout=10,
+            close_timeout=5,
+        )
+        async with ws_connect(target, **connect_kwargs) as upstream:
+            async def browser_to_upstream():
+                while True:
+                    message = await websocket.receive()
+                    msg_type = message.get("type")
+                    if msg_type == "websocket.disconnect":
+                        break
+                    payload_bytes = message.get("bytes")
+                    if payload_bytes is not None:
+                        await upstream.send(payload_bytes)
+                        continue
+                    payload_text = message.get("text")
+                    if payload_text is not None:
+                        await upstream.send(payload_text)
+
+            async def upstream_to_browser():
+                while True:
+                    upstream_msg: Any = await upstream.recv()
+                    if isinstance(upstream_msg, (bytes, bytearray)):
+                        await websocket.send_bytes(bytes(upstream_msg))
+                    else:
+                        await websocket.send_text(str(upstream_msg))
+
+            task_down = asyncio.create_task(browser_to_upstream(), name="vnc_proxy_downstream")
+            task_up = asyncio.create_task(upstream_to_browser(), name="vnc_proxy_upstream")
+            done, pending = await asyncio.wait(
+                {task_down, task_up},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+    except WebSocketDisconnect:
+        logger.info("Browser disconnected from VNC proxy")
+    except Exception as exc:
+        logger.warning("VNC proxy closed with error: %s", exc)
+        try:
+            await websocket.close(code=1011, reason="vnc proxy upstream closed")
+        except Exception:
+            pass
 
 
 # 根路径

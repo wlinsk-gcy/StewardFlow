@@ -31,7 +31,8 @@ StewardFlow 是一个基于 FastAPI 的 ReAct + HITL（人机协作）智能体�
 - ReAct + HITL 任务编排：支持需要用户确认或补充输入的步骤
 - 工具系统：内置 `fs_list`、`fs_glob`、`fs_read`、`fs_write`、`fs_stat`、`text_search`、`proc_run` 等
 - 统一工具结果外部化：tool observation 统一返回 `kind=inline|ref`，大结果自动落盘到 `data/tool_results/`
-- Web Search 与截图回传：前端可显示浏览器截图与检索结果
+- AgentRun Browser Sandbox：按模板名创建浏览器沙箱，支持 VNC 桌面共享与浏览器自动化工具
+- Web Search 与 VNC 浏览视图：前端可显示实时桌面共享与检索结果
 - WebSocket 实时推送：展示 Thought/Action/Observation/Final 等执行日志
 - 前后端分离：FastAPI 后端 + Vite/React 前端工作台
 
@@ -86,6 +87,9 @@ npm run dev
 - `tool_result.root_dir`：工具结果落盘目录（默认 `data/tool_results`）
 - `tool_result.inline_limit` / `tool_result.preview_limit`：inline 与 preview 阈值（字符数）
 - `tool_result.always_externalize_tools`：强制外部化工具白名单
+- `agentrun.template_name`：用于创建 browser-sandbox 的模板名
+- `agentrun.account_id` / `agentrun.access_key_id` / `agentrun.access_key_secret` / `agentrun.region_id`：AgentRun 认证与地域配置（可用环境变量覆盖）
+- `agentrun.vnc_api_key`：VNC 代理上游鉴权 key。配置后，后端转发时会附带 `X-API-Key` 与 `X-API-KEY` 请求头
 - `llm.model` / `llm.api_key` / `llm.base_url`：LLM 提供商配置
 
 ## Ref 读回机制

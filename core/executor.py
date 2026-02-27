@@ -1,8 +1,7 @@
 """
-ReAct 执行引擎
-实现 Thought → Action → Observation 的循环逻辑
+ReAct execution engine.
+Implements the Thought -> Action -> Observation loop.
 """
-import asyncio
 import json
 import logging
 import time
@@ -24,26 +23,10 @@ from .tool_result_externalizer import (
 from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
-from utils.screenshot_util import wait_and_emit_screenshot_event
 from ws.connection_manager import ConnectionManager
 from core.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_SCREENSHOT_FLAG = ["chrome-devtools_click",
-                           "chrome-devtools_drag",
-                           "chrome-devtools_fill",
-                           "chrome-devtools_fill_form",
-                           "chrome-devtools_handle_dialog",
-                           "chrome-devtools_hover",
-                           "chrome-devtools_press_key",
-                           "chrome-devtools_upload_file",
-                           "chrome-devtools_close_page",
-                           "chrome-devtools_list_pages",
-                           "chrome-devtools_navigate_page",
-                           "chrome-devtools_new_page",
-                           "chrome-devtools_select_page"]
-
 
 def _extract_tool_args_keys(raw_args: Any) -> list[str]:
     if isinstance(raw_args, dict):
@@ -128,8 +111,7 @@ class TaskExecutor:
         step = Step(index=len(turn.steps) + 1)
         turn.steps.append(step)
         trace.current_step_id = step.step_id
-        schemas = self.tool_registry.get_all_schemas(
-            excludes=["chrome-devtools_take_screenshot"])
+        schemas = self.tool_registry.get_all_schemas()
         messages = await self.cache_manager.build_messages(trace, schemas, toolset_version="tools_v1", response_schema_version="resp_v1")
         context = {
             "trace": trace,
@@ -162,7 +144,7 @@ class TaskExecutor:
             tool_calls=_summarize_tool_calls(step.tool_calls or []),
         )
         action = actions[0]
-        # 这里是 not Stream才发送的
+        # Non-stream mode: emit answer/end events directly.
         if actions[0].type != ActionType.TOOL:
             type = actions[0].type
             if type == ActionType.FINISH:
@@ -202,13 +184,13 @@ class TaskExecutor:
             action.status = ActionStatus.DONE
             trace.node = NodeType.END
         elif ActionType.REQUEST_INPUT in types or ActionType.REQUEST_CONFIRM in types:
-            trace.node = NodeType.HITL  # LLM也只会返回一个
+            trace.node = NodeType.HITL  # LLM currently returns one HITL action.
         else:
-            # 否则就是只有工具执行，可能有多个工具需要确认，确认一个执行一个
+            # Tool execution path: confirm one action at a time if needed.
             action_list = [action for action in step.actions if
                            action.status == ActionStatus.PLANNED and action.requires_confirm]
             if action_list:
-                action = action_list[0]  # 每次只处理一个
+                action = action_list[0]  # Handle one confirmation at a time.
                 trace.pending_action_id = action.action_id
                 action.status = ActionStatus.WAITING_CONFIRM
                 step.status = StepStatus.WAITING_CONFIRM
@@ -237,10 +219,10 @@ class TaskExecutor:
                                       content=finish_action.message)
             finish_action.status = ActionStatus.DONE
             step.observations.append(observation)
-            trace.node = NodeType.END  # 流程结束
+            trace.node = NodeType.END  # End workflow.
         else:
             for action in step.actions:
-                # 同一批Actions存在多个需要Confirm的工具，每次处理一个，执行一个, execute_hitl后requires_confirm = False
+                # Execute only planned non-confirm actions in current step.
                 if action.requires_confirm:
                     continue
                 if action.status != ActionStatus.PLANNED:
@@ -261,8 +243,7 @@ class TaskExecutor:
         trace.pending_action_id = action.action_id
 
         if action.type == ActionType.REQUEST_CONFIRM:
-            # 目前的逻辑，如果是Tool写死的requireConfirm，不会走这里
-            # 只有LLM返回的request_confirm才走这里
+            # For LLM-issued request_confirm action.
             step.status = StepStatus.WAITING_CONFIRM
             action.status = ActionStatus.WAITING_CONFIRM
             await self._request_confirm(trace.client_id, trace.trace_id, turn.turn_id, action.action_id, action.message, action.tool_name, action.args)
@@ -284,7 +265,7 @@ class TaskExecutor:
 
     async def _observe(self, trace: Trace, turn: Turn, step: Step):
 
-        # 如果当前Step还存在没有Done的Action，继续执行，可能是因为WaitConfirm
+        # Continue loop if there are pending actions in current step.
         pending_statuses = {
             ActionStatus.PLANNED,
             ActionStatus.RUNNING,
@@ -346,11 +327,9 @@ class TaskExecutor:
         turn_id = turn.turn_id
         step_id = step.step_id
         tool_call_id = action.action_id
-        screenshot_tool = None
-        screenshot_path = None
         observation_id = get_sonyflake("observation_")
         if action.confirm_status == "denied":
-            # 用户拒绝执行
+            # User denied this tool action.
             action.status = ActionStatus.DONE
             denied_payload = self.tool_result_externalizer.build_error(
                 tool_name=tool_name or "unknown_tool",
@@ -377,9 +356,6 @@ class TaskExecutor:
                 ok=False,
                 content=json.dumps(not_found_payload, ensure_ascii=False),
             )
-        if tool.name in DEFAULT_SCREENSHOT_FLAG:
-            screenshot_tool = self.tool_registry.get("chrome-devtools_take_screenshot")
-            screenshot_path = f"./.screenshots/{trace.trace_id}_screenshot.png"
         started_at = time.perf_counter()
         tool_ok = False
         emit_trace_event(
@@ -403,21 +379,6 @@ class TaskExecutor:
             ):
                 execute_result = await tool.execute(**(args or {}))
             action.status = ActionStatus.DONE
-            if screenshot_tool:
-                # 手动截图会存在一个问题，页面还未完全响应，就截图了，导致前端的浏览器视图里的图片没有完全响应。
-                screenshot_result = await screenshot_tool.execute(filePath=screenshot_path)
-                if screenshot_result:
-                    asyncio.create_task(
-                        wait_and_emit_screenshot_event(
-                            self.ws_manager,
-                            client_id=trace.client_id,
-                            agent_id=trace.trace_id,
-                            turn_id=turn.turn_id,
-                            img_path=screenshot_path,
-                            timeout_s=10.0,
-                        )
-                    )
-
             with bind_event_context(
                 trace_id=trace_id,
                 turn_id=turn_id,
@@ -491,11 +452,11 @@ class TaskExecutor:
         step = [step for step in turn.steps if step.step_id == trace.current_step_id][0]
         action = [action for action in step.actions if action.action_id == trace.pending_action_id][0]
         if action.type == ActionType.REQUEST_INPUT:
-            # 当前状态 AgentStatus.WAITING  NodeType.HITL
+            # Current state: AgentStatus.WAITING + NodeType.HITL.
             action.request_input = request_input
             action.status = ActionStatus.DONE
 
-            # 开启下一轮Step
+            # Start next step.
             trace.status = AgentStatus.RUNNING
             trace.node = NodeType.THINK
 
@@ -506,11 +467,11 @@ class TaskExecutor:
             trace.current_step_id = None
 
         elif action.type == ActionType.REQUEST_CONFIRM:
-            # 需要判断两种，一种是LLM的Confirm，一种是工具的Confirm
+            # Handle LLM confirmation response.
             accepted = self._parse_confirmation(request_input)
             action.request_input = "I've followed your instructions to complete the operation, please start the next step" if accepted else "I refuse to do the current action, skip it, and if you can't skip it, terminate the process"
 
-            # 开启下一轮Step
+            # Start next step.
             trace.status = AgentStatus.RUNNING
             trace.node = NodeType.THINK
 

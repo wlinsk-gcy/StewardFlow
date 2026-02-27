@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 class MCPToolProxy(Tool):
     def __init__(self, fq_name: str, description: str, input_schema: dict, call_fn):
         super().__init__()
-        self.name = fq_name  # e.g. "chrome-devtools_click"
+        self.name = fq_name  # e.g. "server_tool"
         self.description = description
         self._input_schema = input_schema
         self._call_fn = call_fn  # async (args) -> result

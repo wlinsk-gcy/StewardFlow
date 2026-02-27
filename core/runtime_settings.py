@@ -13,8 +13,7 @@ DEFAULT_INLINE_LIMIT = 500
 DEFAULT_PREVIEW_LIMIT = 500
 DEFAULT_FS_READ_MAX_CHARS = 4000
 DEFAULT_ALWAYS_EXTERNALIZE_TOOLS = {
-    "chrome-devtools_take_snapshot",
-    "chrome-devtools_take_screenshot",
+    "browser_html_content",
 }
 
 

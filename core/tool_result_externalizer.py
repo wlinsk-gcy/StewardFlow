@@ -19,8 +19,7 @@ class ToolResultExternalizerConfig:
     fs_read_max_chars: int = 4000
     always_externalize_tools: set[str] = field(
         default_factory=lambda: {
-            "chrome-devtools_take_snapshot",
-            "chrome-devtools_take_screenshot",
+            "browser_html_content",
         }
     )
 

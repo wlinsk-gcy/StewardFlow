@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect, useCallback } from "react";
+﻿import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { v4 as uuidv4 } from "uuid";
 import {
   Play,
@@ -11,8 +11,6 @@ import {
   Globe,
   User,
   Bot,
-  Search,
-  ExternalLink,
 } from "lucide-react";
 import { type AgentStep, type ChatMessage } from "../types";
 
@@ -69,10 +67,7 @@ export const AgentWorkbench: React.FC = () => {
   const [isRunning, setIsRunning] = useState(false);
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [activeTab, setActiveTab] = useState<"runner" | "browser">("runner");
-  const [currentUrl, setCurrentUrl] = useState("about:blank");
-  const [currentScreenshot, setCurrentScreenshot] = useState<string | null>(
-    null,
-  );
+  const [vncUrl, setVncUrl] = useState<string | null>(null);
   const [tokenInfo, setTokenInfo] = useState<{
     cache_tokens: number;
     prompt_tokens: number;
@@ -93,18 +88,99 @@ export const AgentWorkbench: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const traceScrollRef = useRef<HTMLDivElement>(null);
 
+  const safeParseJSON = useCallback((value: unknown) => {
+    if (typeof value !== "string") return value;
+    const text = value.trim();
+    if (!(text.startsWith("{") || text.startsWith("["))) return value;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return value;
+    }
+  }, []);
+
+  const findUrlByHint = useCallback((input: unknown, hint: RegExp): string | null => {
+    const seen = new Set<unknown>();
+    const walk = (node: unknown): string | null => {
+      if (!node || typeof node !== "object") return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+      if (Array.isArray(node)) {
+        for (const item of node) {
+          const hit = walk(item);
+          if (hit) return hit;
+        }
+        return null;
+      }
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        if (typeof v === "string") {
+          const vv = v.trim();
+          if (/^(https?|wss?):\/\//i.test(vv) && (hint.test(k) || hint.test(vv))) {
+            return vv;
+          }
+        } else if (v && typeof v === "object") {
+          const hit = walk(v);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    };
+    return walk(input);
+  }, []);
+
+  const extractBrowserSessionInfo = useCallback((eventData: any) => {
+    const candidateContents: unknown[] = [];
+    if (typeof eventData?.content === "string") candidateContents.push(eventData.content);
+    if (Array.isArray(eventData?.observations)) {
+      for (const obs of eventData.observations) {
+        if (typeof obs?.content === "string") candidateContents.push(obs.content);
+      }
+    }
+
+    for (const raw of candidateContents) {
+      const level1 = safeParseJSON(raw);
+      if (!level1 || typeof level1 !== "object") continue;
+      const l1 = level1 as Record<string, unknown>;
+      const toolName = String(l1.tool_name || "");
+      if (!toolName.startsWith("browser_")) continue;
+
+      const innerRaw =
+        typeof l1.content === "string"
+          ? l1.content
+          : typeof l1.preview === "string"
+            ? l1.preview
+            : null;
+      const level2 = innerRaw ? safeParseJSON(innerRaw) : null;
+      const source = level2 && typeof level2 === "object" ? level2 : l1;
+
+      const nextVnc =
+        findUrlByHint(source, /(vnc|novnc|viewer)/i) ||
+        findUrlByHint(source, /(session|connect)/i);
+      return { nextVnc };
+    }
+
+    return { nextVnc: null as string | null };
+  }, [findUrlByHint, safeParseJSON]);
+
+  const normalizedVncWsUrl = useMemo(() => {
+    if (!vncUrl) return null;
+    const candidate = vncUrl.trim();
+    if (!/^wss?:\/\//i.test(candidate)) return null;
+    return candidate;
+  }, [vncUrl]);
+
+  const localVncViewerUrl = useMemo(() => {
+    if (!normalizedVncWsUrl) return null;
+    const query = new URLSearchParams({
+      ws: normalizedVncWsUrl,
+    });
+    return `/vnc-lite.html?${query.toString()}`;
+  }, [normalizedVncWsUrl]);
+
   // --- 新增：初始化 WebSocket ---
   const handleIncomingEvent = useCallback((event: any) => {
     const { event_type, data, timestamp, msg_id } = event;
     // console.log('incoming event', event);
-    if (event_type === "screenshot") {
-      console.log("[ws] screenshot event", data);
-      if (data?.content) {
-        setCurrentScreenshot(data.content);
-        setActiveTab("browser");
-      }
-      return;
-    }
 
     if (event_type === "token_info") {
       setTokenInfo({
@@ -149,6 +225,14 @@ export const AgentWorkbench: React.FC = () => {
       };
       setSteps((prev) => [...prev, newStep]);
 
+      if (event_type === "observation") {
+        const { nextVnc } = extractBrowserSessionInfo(data);
+        if (nextVnc) {
+          setVncUrl(nextVnc);
+          setActiveTab("browser");
+        }
+      }
+
       // 如果是 action 且涉及到浏览器（根据你的业务逻辑），可以切换 Tab
       if (
         event_type === "action" &&
@@ -160,8 +244,7 @@ export const AgentWorkbench: React.FC = () => {
           data.tool_name?.includes("browser")
         )
       ) {
-        // 这里可以根据实际 data 里的 args 解析出 URL
-        // setCurrentUrl(...)
+        // 可按需扩展浏览器相关状态
       }
     }
 
@@ -258,7 +341,7 @@ export const AgentWorkbench: React.FC = () => {
     //     // console.log('stop running')
     //     setIsRunning(false);
     // }
-  }, []);
+  }, [extractBrowserSessionInfo]);
 
   useEffect(() => {
     let closedByUser = false;
@@ -438,8 +521,7 @@ export const AgentWorkbench: React.FC = () => {
     setGoal("");
     setTokenInfo(null);
     setTraceId(null);
-    setCurrentScreenshot(null);
-    setCurrentUrl("about:blank");
+    setVncUrl(null);
     setActiveTab("runner");
   };
 
@@ -646,94 +728,88 @@ export const AgentWorkbench: React.FC = () => {
         </div>
 
         {/* Right Column: Dynamic View */}
-        <div className="flex w-1/2 flex-col bg-gray-50/50">
-          {activeTab === "runner" ? (
-            <div className="flex h-full flex-col overflow-hidden">
-              <div className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-4">
-                <div className="flex items-center gap-2">
-                  <Terminal className="h-4 w-4 text-indigo-500" />
-                  <h3 className="text-sm font-bold tracking-tight text-gray-700 uppercase">
-                    执行日志
-                  </h3>
-                </div>
-                <div className="flex items-center gap-2">
-                  {tokenInfo && (
-                    <div className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
-                      <span>Cache {tokenInfo.cache_tokens}</span>
-                      <span className="text-indigo-300">/</span>
-                      <span>Prompt {tokenInfo.prompt_tokens}</span>
-                      <span className="text-indigo-300">/</span>
-                      <span>Completion {tokenInfo.completion_tokens}</span>
-                      <span className="text-indigo-300">/</span>
-                      <span>Total {tokenInfo.total_tokens}</span>
-                    </div>
-                  )}
-                  <span className="rounded-full bg-indigo-500 px-2 py-0.5 text-[10px] font-black text-white">
-                    {steps.length} LOGS
-                  </span>
-                </div>
+        <div className="relative flex w-1/2 flex-col bg-gray-50/50">
+          <div
+            className={`absolute inset-0 flex h-full flex-col overflow-hidden transition-opacity duration-150 ${
+              activeTab === "runner"
+                ? "pointer-events-auto opacity-100"
+                : "pointer-events-none opacity-0"
+            }`}
+          >
+            <div className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-4">
+              <div className="flex items-center gap-2">
+                <Terminal className="h-4 w-4 text-indigo-500" />
+                <h3 className="text-sm font-bold tracking-tight text-gray-700 uppercase">
+                  执行日志
+                </h3>
               </div>
-              <div
-                ref={traceScrollRef}
-                className="flex-1 space-y-4 overflow-y-auto p-6"
-              >
-                {steps.length === 0 ? (
-                  <div className="flex h-full flex-col items-center justify-center opacity-20 grayscale select-none">
-                    <Layers className="mb-4 h-16 w-16" />
-                    <p className="text-sm font-bold tracking-widest uppercase">
-                      Trace visualization inactive
-                    </p>
-                  </div>
-                ) : (
-                  steps.map((step, idx) => <StepCard key={idx} step={step} />)
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="flex h-full flex-col overflow-hidden bg-gray-200">
-              {/* Browser Chrome UI */}
-              <div className="flex flex-col border-b border-gray-300 bg-[#e0e0e0]">
-                <div className="flex items-center gap-2 p-2">
-                  <div className="ml-1 flex gap-1.5">
-                    <div className="h-3 w-3 rounded-full bg-red-400"></div>
-                    <div className="h-3 w-3 rounded-full bg-yellow-400"></div>
-                    <div className="h-3 w-3 rounded-full bg-green-400"></div>
-                  </div>
-                  <div className="mx-4 flex flex-1 items-center justify-between rounded-md bg-white px-3 py-1 text-xs text-gray-500 shadow-inner">
-                    <div className="flex max-w-[80%] items-center gap-2 truncate">
-                      <Globe className="h-3 w-3" />
-                      <span className="truncate">{currentUrl}</span>
-                    </div>
-                    <Search className="h-3 w-3" />
-                  </div>
-                  <ExternalLink className="mr-2 h-4 w-4 text-gray-400" />
-                </div>
-              </div>
-              {/* Browser Viewport */}
-              <div className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner">
-                {currentScreenshot ? (
-                  <img
-                    src={currentScreenshot}
-                    alt="Browser View"
-                    className="animate-in fade-in h-full w-full object-contain duration-700"
-                  />
-                ) : (
-                  <div className="max-w-sm p-10 text-center">
-                    <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-gray-100">
-                      <Globe className="h-8 w-8 text-gray-300" />
-                    </div>
-                    <h4 className="text-xs font-bold tracking-widest text-gray-400 uppercase">
-                      Waiting for Navigation
-                    </h4>
-                    <p className="mt-2 text-[11px] text-gray-400">
-                      The agent will render the webpage view here once it uses
-                      the browser tool.
-                    </p>
+              <div className="flex items-center gap-2">
+                {tokenInfo && (
+                  <div className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                    <span>Cache {tokenInfo.cache_tokens}</span>
+                    <span className="text-indigo-300">/</span>
+                    <span>Prompt {tokenInfo.prompt_tokens}</span>
+                    <span className="text-indigo-300">/</span>
+                    <span>Completion {tokenInfo.completion_tokens}</span>
+                    <span className="text-indigo-300">/</span>
+                    <span>Total {tokenInfo.total_tokens}</span>
                   </div>
                 )}
+                <span className="rounded-full bg-indigo-500 px-2 py-0.5 text-[10px] font-black text-white">
+                  {steps.length} LOGS
+                </span>
               </div>
             </div>
-          )}
+            <div
+              ref={traceScrollRef}
+              className="flex-1 space-y-4 overflow-y-auto p-6"
+            >
+              {steps.length === 0 ? (
+                <div className="flex h-full flex-col items-center justify-center opacity-20 grayscale select-none">
+                  <Layers className="mb-4 h-16 w-16" />
+                  <p className="text-sm font-bold tracking-widest uppercase">
+                    Trace visualization inactive
+                  </p>
+                </div>
+              ) : (
+                steps.map((step, idx) => <StepCard key={idx} step={step} />)
+              )}
+            </div>
+          </div>
+
+          <div
+            className={`absolute inset-0 flex h-full flex-col overflow-hidden bg-gray-200 transition-opacity duration-150 ${
+              activeTab === "browser"
+                ? "pointer-events-auto opacity-100"
+                : "pointer-events-none opacity-0"
+            }`}
+          >
+            {/* Browser Viewport */}
+            <div className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner">
+              {localVncViewerUrl ? (
+                <iframe
+                  src={localVncViewerUrl}
+                  title="VNC Browser View"
+                  className="h-full w-full border-0"
+                  allow="clipboard-read; clipboard-write; fullscreen"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <div className="max-w-sm p-10 text-center">
+                  <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-gray-100">
+                    <Globe className="h-8 w-8 text-gray-300" />
+                  </div>
+                  <h4 className="text-xs font-bold tracking-widest text-gray-400 uppercase">
+                    Waiting for VNC Session
+                  </h4>
+                  <p className="mt-2 text-[11px] text-gray-400">
+                    Browser tools will populate AgentRun session info, then VNC
+                    will render here in real time.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1019,3 +1095,4 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
     </div>
   );
 };
+
