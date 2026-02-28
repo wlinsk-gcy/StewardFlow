@@ -30,6 +30,7 @@ from core.tools.text_search import TextSearchTool
 from core.tools.rg_loader import ensure_rg
 from core.tools.agentrun_browser_tools import register_agentrun_browser_tools
 from core.mcp.client import MCPClient
+from core.mcp.startup import start_mcp_initialization, stop_mcp_initialization
 from core.vnc_proxy import build_vnc_proxy_headers, build_ws_connect_kwargs
 
 from core.services.task_service import TaskService
@@ -202,7 +203,14 @@ async def lifespan(app: FastAPI):
     checkpoint = CheckpointStore()
     tool_registry, browser_manager = init_load_tools(runtime_settings)
     mcp_client = MCPClient(config="./mcp_config.json")
-    await mcp_client.initialize(tool_registry)
+    mcp_cfg = config.get("mcp") or {}
+    startup_wait_seconds = float(mcp_cfg.get("startup_wait_seconds", 2.0))
+    mcp_init_task = await start_mcp_initialization(
+        mcp_client=mcp_client,
+        tool_registry=tool_registry,
+        startup_wait_seconds=startup_wait_seconds,
+        logger=logger,
+    )
     llm_config = config.get("llm")
     provider = Provider(llm_config.get("model"),
                         llm_config.get("api_key"),
@@ -234,12 +242,17 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.task_service = task_service
+    app.state.mcp_client = mcp_client
+    app.state.mcp_init_task = mcp_init_task
     yield
 
     # ===== shutdown =====
     if browser_manager is not None:
         await browser_manager.shutdown()
-    await mcp_client.close_all_sessions()
+    await stop_mcp_initialization(getattr(app.state, "mcp_init_task", None), logger)
+    app_mcp_client = getattr(app.state, "mcp_client", None)
+    if app_mcp_client is not None:
+        await app_mcp_client.close_all_sessions()
     clear_tool_artifacts()
     data_root = PROJECT_ROOT / "data"
     _close_data_file_handlers(data_root)

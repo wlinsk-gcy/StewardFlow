@@ -80,6 +80,7 @@ class BaseConnector(ABC):
         self.elicitation_callback = elicitation_callback
         self.message_handler = message_handler
         self.logging_callback = logging_callback
+        self.client_info = Implementation(name="StewardFlow", version="0.1.0")
         self.capabilities: ServerCapabilities | None = None
 
         # Roots support - always advertise roots capability
@@ -383,12 +384,24 @@ class BaseConnector(ABC):
             logger.debug(f"Tool '{name}' called with result: {result}")
             return result
         except Exception as e:
+            if self.auto_reconnect and not self.is_connected:
+                logger.debug("Tool '%s' failed after connection loss; retrying once after reconnect.", name)
+                await self.connect()
+                try:
+                    return await self.client_session.call_tool(name, arguments, read_timeout_seconds)
+                except Exception as retry_error:
+                    if not self.is_connected:
+                        raise RuntimeError(
+                            f"Tool call '{name}' failed due to connection loss after retry: {retry_error}"
+                        ) from retry_error
+                    raise
+
             # Check if the error might be due to connection loss
             if not self.is_connected:
                 raise RuntimeError(f"Tool call '{name}' failed due to connection loss: {e}") from e
-            else:
-                # Re-raise the original error if it's not connection-related
-                raise
+
+            # Re-raise the original error if it's not connection-related
+            raise
 
     async def list_tools(self) -> list[Tool]:
         """List all available tools from the MCP implementation."""

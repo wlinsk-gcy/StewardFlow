@@ -12,6 +12,7 @@ from mcp.types import Root
 
 from core.mcp.connectors.base import BaseConnector
 from core.mcp.connectors.stdio import StdioConnector
+from core.mcp.connectors.http import HttpConnector
 
 
 def is_stdio_server(server_config: dict[str, Any]) -> bool:
@@ -69,6 +70,22 @@ def create_connector_from_config(
             elicitation_callback=elicitation_callback,
             message_handler=message_handler,
             logging_callback=logging_callback,
+            roots=roots,
+            list_roots_callback=list_roots_callback,
+        )
+    # HTTP connector
+    elif "url" in server_config:
+        return HttpConnector(
+            base_url=server_config["url"],
+            headers=server_config.get("headers", None),
+            auth=server_config.get("auth"),
+            timeout=server_config.get("timeout", 5),
+            sse_read_timeout=server_config.get("sse_read_timeout", 60 * 5),
+            sampling_callback=sampling_callback,
+            elicitation_callback=elicitation_callback,
+            message_handler=message_handler,
+            logging_callback=logging_callback,
+            verify=verify,
             roots=roots,
             list_roots_callback=list_roots_callback,
         )
