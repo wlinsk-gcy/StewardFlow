@@ -173,7 +173,6 @@ def _prune_empty_data_dirs(data_root: Path) -> Tuple[int, int]:
 
 def init_load_tools(settings: RuntimeSettings):
     registry = ToolRegistry()
-    browser_manager = None
     from core.tools.web_search_use_exa import WebSearch
     registry.register(WebSearch())
     registry.register(FsListTool(settings=settings))
