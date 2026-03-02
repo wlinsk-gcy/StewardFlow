@@ -31,4 +31,27 @@ export interface Tool {
     execute: (input: string) => Promise<string>;
 }
 
+export interface RegistryToolItem {
+    name: string;
+    description: string;
+}
+
+export interface RegistryMcpServer {
+    name: string;
+    connected: boolean;
+    tool_count: number;
+    tools: RegistryToolItem[];
+}
+
+export interface RegistrySummary {
+    built_in_tools: RegistryToolItem[];
+    mcp_servers: RegistryMcpServer[];
+    counts: {
+        built_in_tools: number;
+        mcp_servers: number;
+        mcp_tools: number;
+        all_tools: number;
+    };
+}
+
 export const PYTHON_REFERENCE_CODE = `# Removed in favor of Browser View implementation`;

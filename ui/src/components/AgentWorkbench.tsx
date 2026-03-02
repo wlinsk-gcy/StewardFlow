@@ -11,8 +11,16 @@ import {
   Globe,
   User,
   Bot,
+  Wrench,
+  Server,
+  X,
+  RefreshCw,
 } from "lucide-react";
-import { type AgentStep, type ChatMessage } from "../types";
+import {
+  type AgentStep,
+  type ChatMessage,
+  type RegistrySummary,
+} from "../types";
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -61,6 +69,12 @@ function getConfirmCommand(pending: PendingConfirm | null): string | null {
   return null;
 }
 
+function truncateWithEllipsis(text: string, maxChars = 48): string {
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, maxChars).join("")}...`;
+}
+
 export const AgentWorkbench: React.FC = () => {
   const [goal, setGoal] = useState("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
@@ -78,6 +92,12 @@ export const AgentWorkbench: React.FC = () => {
     "offline",
   );
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
+    null,
+  );
+  const [registryOpen, setRegistryOpen] = useState(false);
+  const [registryLoading, setRegistryLoading] = useState(false);
+  const [registryError, setRegistryError] = useState<string | null>(null);
+  const [registrySummary, setRegistrySummary] = useState<RegistrySummary | null>(
     null,
   );
 
@@ -343,6 +363,26 @@ export const AgentWorkbench: React.FC = () => {
     // }
   }, [extractBrowserSessionInfo]);
 
+  const fetchRegistrySummary = useCallback(async () => {
+    setRegistryLoading(true);
+    setRegistryError(null);
+    try {
+      const response = await fetch("http://localhost:8000/agent/registry-summary");
+      if (!response.ok) throw new Error("Failed to fetch tool registry summary");
+      const data = (await response.json()) as RegistrySummary;
+      setRegistrySummary(data);
+    } catch (error) {
+      console.error(error);
+      setRegistryError("工具清单加载失败");
+    } finally {
+      setRegistryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchRegistrySummary();
+  }, [fetchRegistrySummary]);
+
   useEffect(() => {
     let closedByUser = false;
     let retryCount = 0;
@@ -525,8 +565,12 @@ export const AgentWorkbench: React.FC = () => {
     setActiveTab("runner");
   };
 
+  const builtInCount = registrySummary?.counts.built_in_tools ?? 0;
+  const mcpServerCount = registrySummary?.counts.mcp_servers ?? 0;
+  const mcpToolCount = registrySummary?.counts.mcp_tools ?? 0;
+
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
+    <div className="relative flex h-full flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
       {/* Tab Header */}
       <div className="flex shrink-0 items-center justify-between border-b border-gray-100 bg-white px-6 py-4">
         <div className="flex items-center gap-3">
@@ -691,6 +735,187 @@ export const AgentWorkbench: React.FC = () => {
 
           {/* Chat Input */}
           <div className="border-t border-gray-100 bg-white p-6">
+            <div className="relative mb-3 flex justify-end">
+              <button
+                onClick={() => {
+                  setRegistryOpen((prev) => !prev);
+                  if (!registrySummary && !registryLoading) {
+                    void fetchRegistrySummary();
+                  }
+                }}
+                className={`flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-[11px] font-bold tracking-wide shadow-sm backdrop-blur-sm transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:outline-none ${
+                  registryOpen
+                    ? "border-indigo-300/80 bg-indigo-100/80 text-indigo-800"
+                    : "border-indigo-200/80 bg-indigo-50/70 text-indigo-700 hover:bg-indigo-100/75"
+                }`}
+              >
+                <Wrench className="h-4 w-4" />
+                <span>Tool {builtInCount}</span>
+                <span className="text-indigo-300">|</span>
+                <span>MCP {mcpServerCount}</span>
+              </button>
+
+              {registryOpen && (
+                <div className="absolute right-0 bottom-full z-40 mb-2 w-[22rem] max-w-[calc(100vw-3rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+                  <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="flex items-center gap-2 text-[11px] font-bold text-slate-700">
+                      <Server className="h-3.5 w-3.5" />
+                      <span>已注册工具与 MCP</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => void fetchRegistrySummary()}
+                        className="cursor-pointer rounded-md px-2 py-1 text-[10px] font-semibold text-slate-600 transition-colors hover:bg-slate-200"
+                        title="刷新"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={() => setRegistryOpen(false)}
+                        className="cursor-pointer rounded-md px-2 py-1 text-[10px] font-semibold text-slate-600 transition-colors hover:bg-slate-200"
+                        title="关闭"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="max-h-[60vh] space-y-4 overflow-y-auto p-4 text-xs">
+                    {registryLoading ? (
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-600">
+                        正在加载工具清单...
+                      </div>
+                    ) : registryError ? (
+                      <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-rose-700">
+                        {registryError}
+                      </div>
+                    ) : registrySummary ? (
+                      <>
+                        <div className="grid grid-cols-3 gap-2 text-center">
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                            <div className="text-[10px] text-slate-500">内置工具</div>
+                            <div className="mt-1 font-mono text-sm font-bold text-slate-800">
+                              {builtInCount}
+                            </div>
+                          </div>
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                            <div className="text-[10px] text-slate-500">MCP 服务</div>
+                            <div className="mt-1 font-mono text-sm font-bold text-slate-800">
+                              {mcpServerCount}
+                            </div>
+                          </div>
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                            <div className="text-[10px] text-slate-500">MCP 工具</div>
+                            <div className="mt-1 font-mono text-sm font-bold text-slate-800">
+                              {mcpToolCount}
+                            </div>
+                          </div>
+                        </div>
+
+                        <section className="space-y-2">
+                          <div className="text-[11px] font-black tracking-wide text-slate-600 uppercase">
+                            内置工具
+                          </div>
+                          {registrySummary.built_in_tools.length === 0 ? (
+                            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-slate-500">
+                              暂无内置工具
+                            </div>
+                          ) : (
+                            registrySummary.built_in_tools.map((tool) => (
+                              <div
+                                key={`builtin-${tool.name}`}
+                                className="rounded-lg border border-slate-200 bg-white p-2"
+                              >
+                                <div className="font-mono text-[11px] font-bold text-slate-800">
+                                  {tool.name}
+                                </div>
+                                {tool.description && (
+                                  <div
+                                    className="mt-1 text-[10px] leading-relaxed text-slate-500"
+                                    title={tool.description}
+                                  >
+                                    {truncateWithEllipsis(tool.description, 48)}
+                                  </div>
+                                )}
+                              </div>
+                            ))
+                          )}
+                        </section>
+
+                        <section className="space-y-2">
+                          <div className="text-[11px] font-black tracking-wide text-slate-600 uppercase">
+                            MCP
+                          </div>
+                          {registrySummary.mcp_servers.length === 0 ? (
+                            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-slate-500">
+                              暂无 MCP 配置
+                            </div>
+                          ) : (
+                            registrySummary.mcp_servers.map((server) => (
+                              <div
+                                key={`mcp-${server.name}`}
+                                className="rounded-lg border border-slate-200 bg-white p-2"
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="font-mono text-[11px] font-bold text-slate-800">
+                                    {server.name}
+                                  </div>
+                                  <div className="flex items-center gap-2 text-[10px]">
+                                    <span
+                                      className={`h-2 w-2 rounded-full ${
+                                        server.connected
+                                          ? "bg-emerald-500"
+                                          : "bg-slate-300"
+                                      }`}
+                                    ></span>
+                                    <span className="text-slate-500">
+                                      {server.connected ? "已连接" : "未连接"}
+                                    </span>
+                                    <span className="font-mono text-slate-600">
+                                      {server.tool_count} tools
+                                    </span>
+                                  </div>
+                                </div>
+                                {server.tools.length > 0 && (
+                                  <div className="mt-2 space-y-1">
+                                    {server.tools.map((tool) => (
+                                      <div
+                                        key={`mcp-${server.name}-${tool.name}`}
+                                        className="rounded bg-slate-50 px-2 py-1"
+                                      >
+                                        <div className="font-mono text-[10px] font-bold text-slate-700">
+                                          {tool.name}
+                                        </div>
+                                        {tool.description && (
+                                          <div
+                                            className="mt-0.5 text-[10px] leading-relaxed text-slate-500"
+                                            title={tool.description}
+                                          >
+                                            {truncateWithEllipsis(
+                                              tool.description,
+                                              48,
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))
+                          )}
+                        </section>
+                      </>
+                    ) : (
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-500">
+                        暂无工具数据
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="group relative">
               <div className="absolute -inset-1 rounded-2xl bg-gradient-to-r from-indigo-500 to-purple-500 opacity-10 blur transition duration-1000 group-focus-within:opacity-25"></div>
               <div className="relative overflow-hidden rounded-2xl border border-gray-200 bg-white transition-all focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-50">

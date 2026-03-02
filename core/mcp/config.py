@@ -5,6 +5,7 @@ This module provides functionality to load MCP configuration from JSON files.
 """
 
 import json
+import re
 from typing import Any
 
 from mcp.client.session import ElicitationFnT, ListRootsFnT, LoggingFnT, MessageHandlerFnT, SamplingFnT
@@ -13,6 +14,25 @@ from mcp.types import Root
 from core.mcp.connectors.base import BaseConnector
 from core.mcp.connectors.stdio import StdioConnector
 from core.mcp.connectors.http import HttpConnector
+
+API_KEY_HEADER_RE = re.compile(r"api[^a-z0-9]*key", re.IGNORECASE)
+
+
+def _normalize_http_server_config(server_config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize HTTP server config by deriving bearer auth from API_KEY headers."""
+    normalized = dict(server_config)
+    headers = dict(normalized.get("headers") or {})
+    auth = None
+
+    # Keep headers untouched; derive auth from the first API_KEY-like header.
+    for key, value in headers.items():
+        if API_KEY_HEADER_RE.search(str(key)) and isinstance(value, str) and value.strip():
+            auth = f"bearer {value.strip()}"
+            break
+
+    normalized["headers"] = headers
+    normalized["auth"] = auth
+    return normalized
 
 
 def is_stdio_server(server_config: dict[str, Any]) -> bool:
@@ -75,12 +95,13 @@ def create_connector_from_config(
         )
     # HTTP connector
     elif "url" in server_config:
+        normalized = _normalize_http_server_config(server_config)
         return HttpConnector(
-            base_url=server_config["url"],
-            headers=server_config.get("headers", None),
-            auth=server_config.get("auth"),
-            timeout=server_config.get("timeout", 5),
-            sse_read_timeout=server_config.get("sse_read_timeout", 60 * 5),
+            base_url=normalized["url"],
+            headers=normalized.get("headers", None),
+            auth=normalized.get("auth"),
+            timeout=normalized.get("timeout", 5),
+            sse_read_timeout=normalized.get("sse_read_timeout", 60 * 5),
             sampling_callback=sampling_callback,
             elicitation_callback=elicitation_callback,
             message_handler=message_handler,

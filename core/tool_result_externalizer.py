@@ -97,12 +97,7 @@ class ToolResultExternalizerMiddleware:
         use_ref = force_ref or normalized.chars > self.config.inline_limit
 
         preview, preview_truncated = self.store.preview(normalized.text, self.config.preview_limit)
-        stats = {
-            "bytes": normalized.bytes_size,
-            "lines": normalized.lines,
-            "chars": normalized.chars,
-            "truncated": bool(preview_truncated),
-        }
+        truncated = bool(preview_truncated)
 
         if use_ref:
             ref = self.store.persist(
@@ -138,7 +133,7 @@ class ToolResultExternalizerMiddleware:
                     bytes_size=normalized.bytes_size,
                 ),
                 "preview": preview,
-                "stats": stats,
+                "truncated": truncated,
                 "ref": ref.to_dict(),
             }
 
@@ -158,7 +153,7 @@ class ToolResultExternalizerMiddleware:
             force_ref=bool(force_ref),
             ref_path=None,
         )
-        return {
+        inline_payload = {
             "kind": "inline",
             "tool_name": tool_name,
             "summary": self._summary(
@@ -167,23 +162,24 @@ class ToolResultExternalizerMiddleware:
                 chars=normalized.chars,
                 bytes_size=normalized.bytes_size,
             ),
-            "preview": preview,
             "content": normalized.text,
-            "stats": stats,
+            "truncated": truncated,
         }
+        # Avoid duplicate fields when preview == content.
+        if truncated:
+            inline_payload["preview"] = preview
+        return inline_payload
 
     def build_error(self, *, tool_name: str, error_text: str) -> dict[str, Any]:
         preview, preview_truncated = self.store.preview(error_text or "", self.config.preview_limit)
-        return {
+        truncated = bool(preview_truncated)
+        error_payload = {
             "kind": "inline",
             "tool_name": tool_name,
             "summary": f"Tool '{tool_name}' execution failed.",
-            "preview": preview,
             "content": error_text or "",
-            "stats": {
-                "bytes": len((error_text or "").encode("utf-8")),
-                "lines": 0 if not error_text else (error_text.count("\n") + 1),
-                "chars": len(error_text or ""),
-                "truncated": bool(preview_truncated),
-            },
+            "truncated": truncated,
         }
+        if truncated:
+            error_payload["preview"] = preview
+        return error_payload
