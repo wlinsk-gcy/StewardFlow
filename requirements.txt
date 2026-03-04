@@ -8,4 +8,4 @@ Requests==2.32.5
 sonyflake==2.0.2
 uvicorn==0.41.0
 websockets==15.0.1
-agentrun-sdk==0.0.21
+docker==7.1.0

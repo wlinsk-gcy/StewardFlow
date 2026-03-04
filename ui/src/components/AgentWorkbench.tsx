@@ -52,10 +52,23 @@ type PendingConfirm = {
   msgId?: string;
 };
 
+type SandboxListItem = {
+  sandbox_id: string;
+  status?: string;
+  urls?: {
+    novnc?: string | null;
+  };
+};
+
+type SandboxListResponse = {
+  count: number;
+  items: SandboxListItem[];
+};
+
 function getConfirmCommand(pending: PendingConfirm | null): string | null {
   if (!pending) return null;
   const args = pending.args as { command?: unknown } | undefined;
-  if (pending.toolName === "bash" && typeof args?.command === "string") {
+  if (pending.toolName === "exec" && typeof args?.command === "string") {
     return args.command;
   }
   if (typeof pending.args === "string") return pending.args;
@@ -76,12 +89,28 @@ function truncateWithEllipsis(text: string, maxChars = 48): string {
 }
 
 export const AgentWorkbench: React.FC = () => {
+  const apiBase = useMemo(() => {
+    const configured = import.meta.env.VITE_API_BASE as string | undefined;
+    const base = configured?.trim() ? configured.trim() : "http://localhost:8000";
+    return base.endsWith("/") ? base.slice(0, -1) : base;
+  }, []);
+
+  const wsBase = useMemo(() => {
+    try {
+      const parsed = new URL(apiBase);
+      const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+      return `${protocol}//${parsed.host}`;
+    } catch {
+      return "ws://localhost:8000";
+    }
+  }, [apiBase]);
+
   const [goal, setGoal] = useState("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [activeTab, setActiveTab] = useState<"runner" | "browser">("runner");
-  const [vncUrl, setVncUrl] = useState<string | null>(null);
+  const [novncUrl, setNovncUrl] = useState<string | null>(null);
   const [tokenInfo, setTokenInfo] = useState<{
     cache_tokens: number;
     prompt_tokens: number;
@@ -107,95 +136,26 @@ export const AgentWorkbench: React.FC = () => {
   const socketRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const traceScrollRef = useRef<HTMLDivElement>(null);
-
-  const safeParseJSON = useCallback((value: unknown) => {
-    if (typeof value !== "string") return value;
-    const text = value.trim();
-    if (!(text.startsWith("{") || text.startsWith("["))) return value;
-    try {
-      return JSON.parse(text);
-    } catch {
-      return value;
-    }
-  }, []);
-
-  const findUrlByHint = useCallback((input: unknown, hint: RegExp): string | null => {
-    const seen = new Set<unknown>();
-    const walk = (node: unknown): string | null => {
-      if (!node || typeof node !== "object") return null;
-      if (seen.has(node)) return null;
-      seen.add(node);
-      if (Array.isArray(node)) {
-        for (const item of node) {
-          const hit = walk(item);
-          if (hit) return hit;
-        }
-        return null;
-      }
-      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-        if (typeof v === "string") {
-          const vv = v.trim();
-          if (/^(https?|wss?):\/\//i.test(vv) && (hint.test(k) || hint.test(vv))) {
-            return vv;
-          }
-        } else if (v && typeof v === "object") {
-          const hit = walk(v);
-          if (hit) return hit;
-        }
-      }
-      return null;
-    };
-    return walk(input);
-  }, []);
-
-  const extractBrowserSessionInfo = useCallback((eventData: any) => {
-    const candidateContents: unknown[] = [];
-    if (typeof eventData?.content === "string") candidateContents.push(eventData.content);
-    if (Array.isArray(eventData?.observations)) {
-      for (const obs of eventData.observations) {
-        if (typeof obs?.content === "string") candidateContents.push(obs.content);
-      }
-    }
-
-    for (const raw of candidateContents) {
-      const level1 = safeParseJSON(raw);
-      if (!level1 || typeof level1 !== "object") continue;
-      const l1 = level1 as Record<string, unknown>;
-      const toolName = String(l1.tool_name || "");
-      if (!toolName.startsWith("browser_")) continue;
-
-      const innerRaw =
-        typeof l1.content === "string"
-          ? l1.content
-          : typeof l1.preview === "string"
-            ? l1.preview
-            : null;
-      const level2 = innerRaw ? safeParseJSON(innerRaw) : null;
-      const source = level2 && typeof level2 === "object" ? level2 : l1;
-
-      const nextVnc =
-        findUrlByHint(source, /(vnc|novnc|viewer)/i) ||
-        findUrlByHint(source, /(session|connect)/i);
-      return { nextVnc };
-    }
-
-    return { nextVnc: null as string | null };
-  }, [findUrlByHint, safeParseJSON]);
-
-  const normalizedVncWsUrl = useMemo(() => {
-    if (!vncUrl) return null;
-    const candidate = vncUrl.trim();
-    if (!/^wss?:\/\//i.test(candidate)) return null;
+  const normalizedNoVncUrl = useMemo(() => {
+    if (!novncUrl) return null;
+    const candidate = novncUrl.trim();
+    if (!/^https?:\/\//i.test(candidate)) return null;
     return candidate;
-  }, [vncUrl]);
+  }, [novncUrl]);
 
-  const localVncViewerUrl = useMemo(() => {
-    if (!normalizedVncWsUrl) return null;
-    const query = new URLSearchParams({
-      ws: normalizedVncWsUrl,
-    });
-    return `/vnc-lite.html?${query.toString()}`;
-  }, [normalizedVncWsUrl]);
+  const refreshNoVncUrl = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase}/sandboxes?include_exited=false`);
+      if (!response.ok) return;
+      const payload = (await response.json()) as SandboxListResponse;
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      const running = items.find((item) => item.status === "running") || items[0];
+      const next = running?.urls?.novnc?.trim() || null;
+      setNovncUrl(next);
+    } catch {
+      // ignore transient fetch errors for browser panel URL refresh.
+    }
+  }, [apiBase]);
 
   // --- 新增：初始化 WebSocket ---
   const handleIncomingEvent = useCallback((event: any) => {
@@ -246,10 +206,19 @@ export const AgentWorkbench: React.FC = () => {
       setSteps((prev) => [...prev, newStep]);
 
       if (event_type === "observation") {
-        const { nextVnc } = extractBrowserSessionInfo(data);
-        if (nextVnc) {
-          setVncUrl(nextVnc);
+        const obsHasBrowserAction =
+          typeof data?.tool_name === "string"
+            ? data.tool_name.startsWith("browser_")
+            : false;
+        const batchHasBrowserAction =
+          Array.isArray(observationBatch) &&
+          observationBatch.some(
+            (item: any) =>
+              typeof item?.tool_name === "string" && item.tool_name.startsWith("browser_"),
+          );
+        if (obsHasBrowserAction || batchHasBrowserAction) {
           setActiveTab("browser");
+          void refreshNoVncUrl();
         }
       }
 
@@ -259,12 +228,13 @@ export const AgentWorkbench: React.FC = () => {
         (
           (Array.isArray(actionBatch) &&
             actionBatch.some((a: any) =>
-              typeof a?.tool_name === "string" && a.tool_name.includes("browser"),
+              typeof a?.tool_name === "string" && a.tool_name.startsWith("browser_"),
             )) ||
-          data.tool_name?.includes("browser")
+          (typeof data?.tool_name === "string" && data.tool_name.startsWith("browser_"))
         )
       ) {
-        // 可按需扩展浏览器相关状态
+        setActiveTab("browser");
+        void refreshNoVncUrl();
       }
     }
 
@@ -361,13 +331,13 @@ export const AgentWorkbench: React.FC = () => {
     //     // console.log('stop running')
     //     setIsRunning(false);
     // }
-  }, [extractBrowserSessionInfo]);
+  }, [refreshNoVncUrl]);
 
   const fetchRegistrySummary = useCallback(async () => {
     setRegistryLoading(true);
     setRegistryError(null);
     try {
-      const response = await fetch("http://localhost:8000/agent/registry-summary");
+      const response = await fetch(`${apiBase}/agent/registry-summary`);
       if (!response.ok) throw new Error("Failed to fetch tool registry summary");
       const data = (await response.json()) as RegistrySummary;
       setRegistrySummary(data);
@@ -377,7 +347,7 @@ export const AgentWorkbench: React.FC = () => {
     } finally {
       setRegistryLoading(false);
     }
-  }, []);
+  }, [apiBase]);
 
   useEffect(() => {
     void fetchRegistrySummary();
@@ -389,7 +359,7 @@ export const AgentWorkbench: React.FC = () => {
     let retryTimer: number | undefined;
 
     const connect = () => {
-      const socket = new WebSocket(`ws://localhost:8000/ws/${clientId}`);
+      const socket = new WebSocket(`${wsBase}/ws/${clientId}`);
       socketRef.current = socket;
 
       socket.onopen = () => {
@@ -437,7 +407,13 @@ export const AgentWorkbench: React.FC = () => {
         socketRef.current.close();
       }
     };
-  }, [clientId, handleIncomingEvent]);
+  }, [clientId, handleIncomingEvent, wsBase]);
+
+  useEffect(() => {
+    if (activeTab === "browser") {
+      void refreshNoVncUrl();
+    }
+  }, [activeTab, refreshNoVncUrl]);
 
   useEffect(() => {
     if (chatScrollRef.current) {
@@ -467,7 +443,7 @@ export const AgentWorkbench: React.FC = () => {
     setIsRunning(true);
 
     try {
-      const response = await fetch("http://localhost:8000/agent/run", {
+      const response = await fetch(`${apiBase}/agent/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -513,7 +489,7 @@ export const AgentWorkbench: React.FC = () => {
 
     // 2. 调用后端 API 触发任务
     try {
-      const response = await fetch("http://localhost:8000/agent/run", {
+      const response = await fetch(`${apiBase}/agent/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -561,7 +537,7 @@ export const AgentWorkbench: React.FC = () => {
     setGoal("");
     setTokenInfo(null);
     setTraceId(null);
-    setVncUrl(null);
+    setNovncUrl(null);
     setActiveTab("runner");
   };
 
@@ -1011,9 +987,9 @@ export const AgentWorkbench: React.FC = () => {
           >
             {/* Browser Viewport */}
             <div className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner">
-              {localVncViewerUrl ? (
+              {normalizedNoVncUrl ? (
                 <iframe
-                  src={localVncViewerUrl}
+                  src={normalizedNoVncUrl}
                   title="VNC Browser View"
                   className="h-full w-full border-0"
                   allow="clipboard-read; clipboard-write; fullscreen"
@@ -1028,8 +1004,8 @@ export const AgentWorkbench: React.FC = () => {
                     Waiting for VNC Session
                   </h4>
                   <p className="mt-2 text-[11px] text-gray-400">
-                    Browser tools will populate AgentRun session info, then VNC
-                    will render here in real time.
+                    Browser tools will refresh sandbox noVNC URL from `/sandboxes`,
+                    then render the remote browser here.
                   </p>
                 </div>
               )}

@@ -14,12 +14,7 @@ from .protocol import (
     Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus
 )
 from .llm import Provider
-from .runtime_settings import RuntimeSettings, get_runtime_settings
 from .trace_event_logger import bind_event_context, emit_trace_event
-from .tool_result_externalizer import (
-    ToolResultExternalizerConfig,
-    ToolResultExternalizerMiddleware,
-)
 from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
@@ -55,27 +50,27 @@ def _summarize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, An
         )
     return summarized
 
+
+def _serialize_observation_content(payload: Any) -> str:
+    if payload is None:
+        return ""
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8", errors="replace")
+    if isinstance(payload, (dict, list)):
+        return json.dumps(payload, ensure_ascii=False)
+    return str(payload)
+
 class TaskExecutor:
     stream: bool = False
 
     def __init__(self, checkpoint: CheckpointStore, provider: Provider, tool_registry: ToolRegistry,
                  ws_manager: ConnectionManager, cache_manager: CacheManager,
-                 tool_result_config: Optional[ToolResultExternalizerConfig] = None,
-                 runtime_settings: RuntimeSettings | None = None):
+                 ):
         self.llm = provider
         self.tool_registry = tool_registry
         self.checkpoint = checkpoint
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
-        if runtime_settings is not None:
-            resolved_settings = runtime_settings
-        elif tool_result_config is not None:
-            resolved_settings = tool_result_config.to_runtime_settings()
-        else:
-            resolved_settings = get_runtime_settings()
-        self.tool_result_externalizer = ToolResultExternalizerMiddleware(
-            settings=resolved_settings
-        )
 
     async def run(self, trace: Trace):
         trace.started_at = datetime.utcnow()
@@ -331,30 +326,32 @@ class TaskExecutor:
         if action.confirm_status == "denied":
             # User denied this tool action.
             action.status = ActionStatus.DONE
-            denied_payload = self.tool_result_externalizer.build_error(
-                tool_name=tool_name or "unknown_tool",
-                error_text="The user refuses to perform the current tool call",
-            )
+            denied_payload = {
+                "ok": False,
+                "tool_name": tool_name or "unknown_tool",
+                "error": "The user refuses to perform the current tool call",
+            }
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.HITL_DENIED,
                 ok=True,
-                content=json.dumps(denied_payload, ensure_ascii=False),
+                content=_serialize_observation_content(denied_payload),
             )
         tool = self.tool_registry.get(tool_name)
         if not tool:
             action.status = ActionStatus.FAILED
-            not_found_payload = self.tool_result_externalizer.build_error(
-                tool_name=tool_name or "unknown_tool",
-                error_text=f"Tool '{tool_name}' not found",
-            )
+            not_found_payload = {
+                "ok": False,
+                "tool_name": tool_name or "unknown_tool",
+                "error": f"Tool '{tool_name}' not found",
+            }
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_ERROR,
                 ok=False,
-                content=json.dumps(not_found_payload, ensure_ascii=False),
+                content=_serialize_observation_content(not_found_payload),
             )
         started_at = time.perf_counter()
         tool_ok = False
@@ -386,35 +383,29 @@ class TaskExecutor:
                 tool_call_id=tool_call_id,
                 tool_name=tool_name or "unknown_tool",
             ):
-                observation_payload = self.tool_result_externalizer.externalize(
-                    tool_name=tool_name or "unknown_tool",
-                    raw_result=execute_result,
-                    trace_id=trace.trace_id,
-                    turn_id=turn.turn_id,
-                    step_id=step.step_id,
-                    tool_call_id=action.action_id,
-                )
+                observation_payload = execute_result
             tool_ok = True
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_RESULT,
                 ok=True,
-                content=json.dumps(observation_payload, ensure_ascii=False),
+                content=_serialize_observation_content(observation_payload),
             )
         except Exception as e:
             action.status = ActionStatus.FAILED
             tool_ok = False
-            error_payload = self.tool_result_externalizer.build_error(
-                tool_name=tool_name or "unknown_tool",
-                error_text=f"Tool '{tool_name}' executed error: {str(e)}",
-            )
+            error_payload = {
+                "ok": False,
+                "tool_name": tool_name or "unknown_tool",
+                "error": f"Tool '{tool_name}' executed error: {str(e)}",
+            }
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_ERROR,
                 ok=False,
-                content=json.dumps(error_payload, ensure_ascii=False),
+                content=_serialize_observation_content(error_payload),
             )
         finally:
             elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000))

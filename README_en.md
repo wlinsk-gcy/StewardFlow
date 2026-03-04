@@ -6,12 +6,12 @@ StewardFlow is a FastAPI-based ReAct + HITL (Human-in-the-Loop) agent system. It
 
 ## Demo
 
-The LLM used in this case is deepseek-v3.2
+The LLM used in this case is qwen3.5-plus
 
-> If you don't have a deepseek API key, you have two ways to experience the Agent project.
+> If you don't have a qwen API key, you have two ways to experience the Agent project.
 > 
 > 1. Go to `https:www.modelscope.cn` to get a free API key, which supports 20 free model calls per day
-> 2. Go to `https:bailian.console.aliyun.com` to apply for a free API Key, and new users can get a free trial credit of 1 million tokens for the deepseek-v3.2 model.
+> 2. Go to `https:bailian.console.aliyun.com` to apply for a free API Key, and new users can get a free trial credit of 1 million tokens for the qwen3.5-plus model.
 
 
 ### 1. Open Xiaohongshu, search for the homepage of the Qianwen model, and summarize
@@ -22,16 +22,15 @@ The LLM used in this case is deepseek-v3.2
 
 **You can watch the 'public/demo2.mp4' video**
 
-### 3. Use the `fs_list` semantic tool to inspect current workspace files
+### 3. Use the `exec` tool to run commands in docker-sandbox
 
 **You can watch the 'public/demo3.mp4' video**
 
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
-- **Tool system**: built-in tools such as `fs_list`, `fs_glob`, `fs_read`, `fs_write`, `fs_stat`, `text_search`, `proc_run`, etc.
-- **Unified tool result externalization**: every tool observation follows `kind=inline|ref`; large outputs are stored under `data/tool_results/`.
-- **AgentRun browser sandbox**: create browser sandbox by template name, with VNC desktop sharing and browser automation tools
-- **Web search & VNC browser view**: the UI can display real-time desktop sharing and retrieval results
+- **Tool system**: docker-sandbox tools only (`exec` / `exec_meta` / `browser_*`)
+- **Docker sandbox lifecycle**: auto-create on backend startup, auto-delete on backend shutdown
+- **VNC browser view**: UI renders sandbox noVNC URL directly
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
 - **Frontend-backend separation**: FastAPI backend + Vite/React frontend workspace
 
@@ -84,22 +83,18 @@ Default URL: http://localhost:5173
 ### `config.yaml`
 - `app.port`: backend listening port
 - `log.level`: log level (e.g., info)
-- `tool_result.root_dir`: storage root for externalized tool results (default: `data/tool_results`)
-- `tool_result.inline_limit` / `tool_result.preview_limit`: inline/preview thresholds (in chars)
-- `tool_result.always_externalize_tools`: tools that should always return `kind=ref`
-- `agentrun.template_name`: template name used to create browser-sandbox
-- `agentrun.account_id` / `agentrun.access_key_id` / `agentrun.access_key_secret` / `agentrun.region_id`: AgentRun auth/region settings (can be overridden by env vars)
-- `agentrun.vnc_api_key`: upstream auth key for VNC proxy. When set, backend forwards both `X-API-Key` and `X-API-KEY` headers
+- `sandbox.image`: sandbox image name (for example `gui-sandbox:dev`)
+- `sandbox.public_host`: host/IP used by frontend noVNC URL
+- `sandbox.healthcheck_host`: host/IP used by backend when calling sandbox API
+- `sandbox.docker_base_url`: Docker Engine endpoint (for example `tcp://192.168.130.147:2375`)
+- `sandbox.start_url`: initial URL opened by Chromium inside sandbox
+- `sandbox.display_width` / `sandbox.display_height`: virtual desktop resolution
 - `llm.model` / `llm.api_key` / `llm.base_url`: LLM provider settings
 
-## Ref Retrieval Workflow
-- If an observation is `kind=ref`, only summary/preview and `ref.path` are in context.
-- Recommended retrieval chain:
-  1. Run `text_search(path=ref.path, query=..., max_matches=..., context_lines=...)` first
-  2. Use `matches[0].line` as the line anchor
-  3. Run `fs_read(path=ref.path, start_line=line-2, max_lines=40, max_bytes=...)` for bounded snippets
-  4. Use `offset/length` only as an advanced fine-tuning fallback
-- `snapshot_query` style per-tool query helpers are no longer used.
+## Tool Result Contract
+- Tool results are returned directly from sandbox API; local `tool_result` externalization is removed.
+- For large `exec` output, sandbox API returns previews and artifact file paths (inside sandbox `/config/tool-artifacts`).
+- To inspect large outputs, call `exec` again with targeted commands (`rg/head/tail/sed`) against those artifact files.
 
 ## API Endpoints
 - `POST /agent/run`: start or continue a task
