@@ -180,11 +180,96 @@ def _stream_result_payload(
     return payload
 
 
+def _ok_envelope(
+    *,
+    data: Any,
+    artifacts: list[dict[str, Any]] | None = None,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": True,
+        "data": data,
+        "artifacts": artifacts or [],
+        "error": None,
+    }
+    if meta:
+        out["meta"] = meta
+    return out
+
+
+def _subprocess_result_to_envelope(
+    payload: dict[str, Any],
+    *,
+    engine_used: str | None = None,
+    fallback_from: str | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "success": bool(payload.get("success")),
+        "timed_out": bool(payload.get("timed_out")),
+        "exit_code": int(payload.get("exit_code", -1)),
+    }
+    if engine_used:
+        data["engine_used"] = engine_used
+    if fallback_from:
+        data["fallback_from"] = fallback_from
+
+    artifacts: list[dict[str, Any]] = []
+    for stream_name in ("stdout", "stderr"):
+        stream_payload = payload.get(stream_name)
+        if not isinstance(stream_payload, dict):
+            continue
+        artifact: dict[str, Any] = {
+            "name": stream_name,
+            "kind": "text",
+            "preview": str(stream_payload.get("preview", "")),
+        }
+        path = stream_payload.get("path")
+        if isinstance(path, str) and path.strip():
+            artifact["path"] = path
+        if stream_payload.get("truncated") is True:
+            artifact["truncated"] = True
+        if isinstance(stream_payload.get("by"), str):
+            artifact["by"] = stream_payload.get("by")
+        artifacts.append(artifact)
+
+    out = _ok_envelope(data=data, artifacts=artifacts)
+    if not data["success"]:
+        out["ok"] = False
+        out["error"] = {
+            "type": "subprocess_failed",
+            "exit_code": data["exit_code"],
+            "timed_out": data["timed_out"],
+        }
+    return out
+
+
+def _subprocess_should_fallback_to_grep(payload: dict[str, Any]) -> bool:
+    if bool(payload.get("timed_out")):
+        return False
+    if bool(payload.get("success")):
+        return False
+    exit_code = int(payload.get("exit_code", -1))
+    if exit_code in {2, 127}:
+        return True
+    stderr = payload.get("stderr") if isinstance(payload.get("stderr"), dict) else {}
+    stderr_preview = str((stderr or {}).get("preview", "")).lower()
+    fallback_markers = (
+        "regex parse error",
+        "unsupported",
+        "unrecognized flag",
+        "pcre",
+        "look-around",
+        "backreferences",
+    )
+    return any(marker in stderr_preview for marker in fallback_markers)
+
+
 def _maybe_externalize_payload(payload: Any, *, tool_name: str) -> Any:
     text = _payload_to_text(payload)
     preview, truncated, by = _preview_text(text)
     if not truncated:
         return payload
+
     response: dict[str, Any] = {
         "output": {
             "preview": preview,
@@ -1908,23 +1993,14 @@ class ReadRequest(BaseModel):
     persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
 
 
-class GrepRequest(BaseModel):
+class SearchRequest(BaseModel):
     pattern: str = Field(..., min_length=1)
     path: str = Field(default=".")
+    engine_hint: Literal["auto", "rg", "grep"] = "auto"
+    glob: str | None = None
+    pcre2: bool = False
     ignore_case: bool = False
     recursive: bool = True
-    line_number: bool = True
-    max_count: int | None = Field(default=None, ge=1)
-    cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
-    timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
-    persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
-
-
-class RgRequest(BaseModel):
-    pattern: str = Field(..., min_length=1)
-    path: str = Field(default=".")
-    glob: str | None = None
-    ignore_case: bool = False
     line_number: bool = True
     max_count: int | None = Field(default=None, ge=1)
     cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
@@ -2145,59 +2221,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/tools/bash")
-async def tools_bash(req: BashRequest) -> dict[str, Any]:
-    cwd_path = _ensure_cwd(req.cwd)
-    return await _run_subprocess_tool(
-        tool_name="tools_bash",
-        cwd_path=cwd_path,
-        timeout_ms=req.timeout_ms,
-        env=req.env,
-        persist_output=req.persist_output,
-        success_exit_codes={0},
-        shell_command=req.command,
-        shell_executable=req.shell_executable,
-    )
-
-
-@app.post("/tools/glob")
-async def tools_glob(req: GlobRequest) -> dict[str, Any]:
-    cwd_path = _ensure_cwd(req.cwd)
-    argv = ["rg", "--files"]
-    if req.include_hidden:
-        argv.append("-uu")
-    argv.extend(["-g", req.pattern, "--", req.path])
-    return await _run_subprocess_tool(
-        tool_name="tools_glob",
-        cwd_path=cwd_path,
-        timeout_ms=req.timeout_ms,
-        env=None,
-        persist_output=req.persist_output,
-        success_exit_codes={0, 1},
-        argv=argv,
-    )
-
-
-@app.post("/tools/read")
-async def tools_read(req: ReadRequest) -> dict[str, Any]:
-    cwd_path = _ensure_cwd(req.cwd)
-    start = max(1, int(req.start_line))
-    end = max(start, int(req.end_line)) if req.end_line is not None else (start + 255)
-    argv = ["sed", "-n", f"{start},{end}p", "--", req.path]
-    return await _run_subprocess_tool(
-        tool_name="tools_read",
-        cwd_path=cwd_path,
-        timeout_ms=req.timeout_ms,
-        env=None,
-        persist_output=req.persist_output,
-        success_exit_codes={0},
-        argv=argv,
-    )
-
-
-@app.post("/tools/grep")
-async def tools_grep(req: GrepRequest) -> dict[str, Any]:
-    cwd_path = _ensure_cwd(req.cwd)
+def _build_grep_argv(req: SearchRequest) -> list[str]:
     argv = ["grep"]
     if req.recursive:
         argv.append("-R")
@@ -2208,32 +2232,106 @@ async def tools_grep(req: GrepRequest) -> dict[str, Any]:
     if isinstance(req.max_count, int) and req.max_count > 0:
         argv.extend(["-m", str(int(req.max_count))])
     argv.extend(["--", req.pattern, req.path])
-    return await _run_subprocess_tool(
-        tool_name="tools_grep",
-        cwd_path=cwd_path,
-        timeout_ms=req.timeout_ms,
-        env=None,
-        persist_output=req.persist_output,
-        success_exit_codes={0, 1},
-        argv=argv,
-    )
+    return argv
 
 
-@app.post("/tools/rg")
-async def tools_rg(req: RgRequest) -> dict[str, Any]:
-    cwd_path = _ensure_cwd(req.cwd)
+def _build_rg_argv(req: SearchRequest) -> list[str]:
     argv = ["rg"]
     if req.ignore_case:
         argv.append("-i")
     if req.line_number:
         argv.append("-n")
+    if req.pcre2:
+        argv.append("-P")
     if isinstance(req.max_count, int) and req.max_count > 0:
         argv.extend(["-m", str(int(req.max_count))])
+    if not req.recursive:
+        argv.extend(["--max-depth", "1"])
     if isinstance(req.glob, str) and req.glob.strip():
         argv.extend(["-g", req.glob.strip()])
     argv.extend(["--", req.pattern, req.path])
-    return await _run_subprocess_tool(
-        tool_name="tools_rg",
+    return argv
+
+
+async def _run_search_with_routing(req: SearchRequest, *, forced_engine: str | None = None) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    chosen = (forced_engine or req.engine_hint or "auto").strip().lower()
+    if chosen not in {"auto", "rg", "grep"}:
+        raise HTTPException(status_code=400, detail=f"unsupported_engine_hint: {chosen}")
+
+    if chosen == "grep":
+        grep_result = await _run_subprocess_tool(
+            tool_name="tools_search_grep",
+            cwd_path=cwd_path,
+            timeout_ms=req.timeout_ms,
+            env=None,
+            persist_output=req.persist_output,
+            success_exit_codes={0, 1},
+            argv=_build_grep_argv(req),
+        )
+        return _subprocess_result_to_envelope(grep_result, engine_used="grep")
+
+    if chosen == "rg":
+        rg_result = await _run_subprocess_tool(
+            tool_name="tools_search_rg",
+            cwd_path=cwd_path,
+            timeout_ms=req.timeout_ms,
+            env=None,
+            persist_output=req.persist_output,
+            success_exit_codes={0, 1},
+            argv=_build_rg_argv(req),
+        )
+        return _subprocess_result_to_envelope(rg_result, engine_used="rg")
+
+    rg_result = await _run_subprocess_tool(
+        tool_name="tools_search_rg",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0, 1},
+        argv=_build_rg_argv(req),
+    )
+    if not _subprocess_should_fallback_to_grep(rg_result):
+        return _subprocess_result_to_envelope(rg_result, engine_used="rg")
+
+    grep_result = await _run_subprocess_tool(
+        tool_name="tools_search_grep",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0, 1},
+        argv=_build_grep_argv(req),
+    )
+    return _subprocess_result_to_envelope(grep_result, engine_used="grep", fallback_from="rg")
+
+
+@app.post("/tools/bash")
+async def tools_bash(req: BashRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    result = await _run_subprocess_tool(
+        tool_name="tools_bash",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=req.env,
+        persist_output=req.persist_output,
+        success_exit_codes={0},
+        shell_command=req.command,
+        shell_executable=req.shell_executable,
+    )
+    return _subprocess_result_to_envelope(result)
+
+
+@app.post("/tools/glob")
+async def tools_glob(req: GlobRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    argv = ["rg", "--files"]
+    if req.include_hidden:
+        argv.append("-uu")
+    argv.extend(["-g", req.pattern, "--", req.path])
+    result = await _run_subprocess_tool(
+        tool_name="tools_glob",
         cwd_path=cwd_path,
         timeout_ms=req.timeout_ms,
         env=None,
@@ -2241,6 +2339,40 @@ async def tools_rg(req: RgRequest) -> dict[str, Any]:
         success_exit_codes={0, 1},
         argv=argv,
     )
+    return _subprocess_result_to_envelope(result)
+
+
+@app.post("/tools/read")
+async def tools_read(req: ReadRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    start = max(1, int(req.start_line))
+    end = max(start, int(req.end_line)) if req.end_line is not None else (start + 255)
+    argv = ["sed", "-n", f"{start},{end}p", "--", req.path]
+    result = await _run_subprocess_tool(
+        tool_name="tools_read",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0},
+        argv=argv,
+    )
+    return _subprocess_result_to_envelope(result)
+
+
+@app.post("/tools/search")
+async def tools_search(req: SearchRequest) -> dict[str, Any]:
+    return await _run_search_with_routing(req)
+
+
+@app.post("/tools/grep")
+async def tools_grep(req: SearchRequest) -> dict[str, Any]:
+    return await _run_search_with_routing(req, forced_engine="grep")
+
+
+@app.post("/tools/rg")
+async def tools_rg(req: SearchRequest) -> dict[str, Any]:
+    return await _run_search_with_routing(req, forced_engine="rg")
 
 
 @app.get("/browser/state")

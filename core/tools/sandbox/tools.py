@@ -62,7 +62,18 @@ class _SandboxTool(Tool):
             payload = await asyncio.to_thread(fn, **kwargs)
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "data": None,
+                    "artifacts": [],
+                    "error": {
+                        "type": "sandbox_client_error",
+                        "message": str(exc),
+                    },
+                },
+                ensure_ascii=False,
+            )
 
 
 class _CommandTool(_SandboxTool):
@@ -242,18 +253,24 @@ class ReadTool(_SandboxTool):
         )
 
 
-class GrepTool(_SandboxTool):
+class SearchTool(_SandboxTool):
     def __init__(self, client: DockerSandboxClient) -> None:
         super().__init__(
             client=client,
-            name="grep",
-            description="Search text using grep (read-only).",
+            name="search",
+            description=(
+                "Search text in files with automatic engine routing. "
+                "Defaults to ripgrep and falls back to grep when needed."
+            ),
         )
 
     async def execute(
         self,
         pattern: str,
         path: str = ".",
+        engine_hint: str = "auto",
+        glob: str | None = None,
+        pcre2: bool = False,
         ignore_case: bool = False,
         recursive: bool = True,
         line_number: bool = True,
@@ -268,6 +285,9 @@ class GrepTool(_SandboxTool):
         payload = {
             "pattern": pattern,
             "path": path,
+            "engine_hint": str(engine_hint or "auto"),
+            "glob": glob,
+            "pcre2": bool(pcre2),
             "ignore_case": bool(ignore_case),
             "recursive": bool(recursive),
             "line_number": bool(line_number),
@@ -279,7 +299,7 @@ class GrepTool(_SandboxTool):
         return await self._invoke(
             self.client.api_post,
             sandbox_id=None,
-            path="/tools/grep",
+            path="/tools/search",
             payload=payload,
             timeout_sec=_tool_timeout_sec(timeout_ms),
         )
@@ -291,69 +311,11 @@ class GrepTool(_SandboxTool):
             properties={
                 "pattern": {"type": "string"},
                 "path": {"type": "string", "default": "."},
+                "engine_hint": {"type": "string", "enum": ["auto", "rg", "grep"], "default": "auto"},
+                "glob": {"type": "string"},
+                "pcre2": {"type": "boolean", "default": False},
                 "ignore_case": {"type": "boolean", "default": False},
                 "recursive": {"type": "boolean", "default": True},
-                "line_number": {"type": "boolean", "default": True},
-                "max_count": {"type": "integer", "minimum": 1},
-                "cwd": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 120000, "minimum": 1, "maximum": 3600000},
-                "persist_output": {"type": "boolean", "default": False},
-            },
-            required=["pattern"],
-        )
-
-
-class RgTool(_SandboxTool):
-    def __init__(self, client: DockerSandboxClient) -> None:
-        super().__init__(
-            client=client,
-            name="rg",
-            description="Search text using ripgrep (read-only, fast).",
-        )
-
-    async def execute(
-        self,
-        pattern: str,
-        path: str = ".",
-        glob: str | None = None,
-        ignore_case: bool = False,
-        line_number: bool = True,
-        max_count: int | None = None,
-        cwd: str | None = None,
-        timeout_ms: int = 120000,
-        persist_output: bool = False,
-        **kwargs,
-    ) -> str:
-        del kwargs
-        timeout_ms = max(1, min(int(timeout_ms), 3600000))
-        payload = {
-            "pattern": pattern,
-            "path": path,
-            "glob": glob,
-            "ignore_case": bool(ignore_case),
-            "line_number": bool(line_number),
-            "max_count": int(max_count) if isinstance(max_count, int) else None,
-            "cwd": cwd,
-            "timeout_ms": timeout_ms,
-            "persist_output": bool(persist_output),
-        }
-        return await self._invoke(
-            self.client.api_post,
-            sandbox_id=None,
-            path="/tools/rg",
-            payload=payload,
-            timeout_sec=_tool_timeout_sec(timeout_ms),
-        )
-
-    def schema(self) -> dict[str, Any]:
-        return _tool_schema(
-            name=self.name,
-            description=self.description,
-            properties={
-                "pattern": {"type": "string"},
-                "path": {"type": "string", "default": "."},
-                "glob": {"type": "string"},
-                "ignore_case": {"type": "boolean", "default": False},
                 "line_number": {"type": "boolean", "default": True},
                 "max_count": {"type": "integer", "minimum": 1},
                 "cwd": {"type": "string"},
@@ -455,8 +417,7 @@ def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) 
     registry.register(BashTool(client))
     registry.register(GlobTool(client))
     registry.register(ReadTool(client))
-    registry.register(GrepTool(client))
-    registry.register(RgTool(client))
+    registry.register(SearchTool(client))
 
     _register_browser_tool(
         registry,

@@ -28,7 +28,7 @@ The LLM used in this case is qwen3.5-plus
 
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
-- **Tool system**: docker-sandbox tools only (`bash` / `glob` / `read` / `grep` / `rg` / `browser_*`)
+- **Tool system**: docker-sandbox tools only (`bash` / `glob` / `read` / `search` / task-oriented `browser_*`)
 - **Docker sandbox lifecycle**: auto-create on backend startup, auto-delete on backend shutdown
 - **VNC browser view**: UI renders sandbox noVNC URL directly
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
@@ -94,8 +94,10 @@ Default URL: http://localhost:5173
 
 ## Tool Result Contract
 - Tool results are returned directly from sandbox API; local `tool_result` externalization is removed.
-- `bash/glob/read/grep/rg` return `stdout` / `stderr`; read `preview` first.
-- When output is truncated, sandbox API includes `path` (inside `/config/tool-artifacts/results`) for follow-up targeted queries via `bash` + `rg/head/tail/sed`.
+- Only command/query tools (`bash/glob/read/search`) use the envelope format: `{"ok":bool,"data":...,"artifacts":[...],"error":...}`.
+- Those command/query tools expose `stdout/stderr` inside `artifacts` (`preview` first; `path` when persisted/truncated).
+- When `artifacts[].truncated=true`, continue with focused follow-up queries on that `path` (for example `sed/head/tail/search`).
+- Other tools (especially browser tools) keep their native payload format; when externalized, they return `output.preview/path/truncated`.
 - By default, non-truncated output does not include `path`; set `persist_output=true` to force artifact persistence.
 
 ## API Endpoints

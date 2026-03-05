@@ -1054,6 +1054,50 @@ class CacheManager(abc.ABC):
                 obj = None
 
             if isinstance(obj, dict):
+                if {"ok", "data", "artifacts", "error"}.issubset(obj.keys()):
+                    out: Dict[str, Any] = {
+                        "tool_type": "tool_envelope",
+                        "ok": bool(obj.get("ok")),
+                    }
+
+                    data = obj.get("data")
+                    if isinstance(data, dict):
+                        if "exit_code" in data:
+                            out["exit_code"] = data.get("exit_code")
+                        if "engine_used" in data:
+                            out["engine_used"] = data.get("engine_used")
+                        if "fallback_from" in data:
+                            out["fallback_from"] = data.get("fallback_from")
+                        if data.get("snapshot_id"):
+                            out["snapshot_id"] = data.get("snapshot_id")
+                        if data.get("latest_path"):
+                            out["latest_path"] = data.get("latest_path")
+
+                    if obj.get("error") is not None:
+                        err_obj = obj.get("error")
+                        if isinstance(err_obj, dict):
+                            err = json.dumps(err_obj, ensure_ascii=False)
+                        else:
+                            err = str(err_obj)
+                        if len(err) > self.config.max_tool_result_chars:
+                            err = err[: self.config.max_tool_result_chars] + "…"
+                        out["error"] = err
+
+                    artifacts = obj.get("artifacts") or []
+                    if isinstance(artifacts, list):
+                        paths: List[str] = []
+                        for artifact in artifacts:
+                            if not isinstance(artifact, dict):
+                                continue
+                            path = artifact.get("path")
+                            if isinstance(path, str) and path.strip():
+                                paths.append(path.strip())
+                        if paths:
+                            out["artifact_paths"] = paths[:3]
+                            if "latest_path" not in out:
+                                out["latest_path"] = paths[-1]
+                    return out
+
                 t = obj.get("type")
                 if t == "snapshot_ref":
                     return {"tool_type": "snapshot_ref", "latest_path": obj.get("path")}

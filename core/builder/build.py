@@ -19,14 +19,19 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - If a required capability is unavailable, output `request_input` with a clear missing-capability explanation and a practical fallback.
 - Prefer sandbox-native tools:
   - shell execution: `bash`
-  - read-only file/query tools: `glob`, `read`, `grep`, `rg`
-  - browser operations: `browser_*`
-- For `bash` results, always read `stdout.preview` / `stderr.preview` first.
-- If `stdout.truncated=true` or `stderr.truncated=true`, use `bash` with `rg -n` / `grep -n` / `sed -n` / `tail`
-  against the returned `stdout.path` / `stderr.path` to inspect full details.
-- Some non-`bash` tool results can be externalized as `output` with `preview/path/truncated`.
-  If `output.truncated=true`, use `bash` plus `rg/grep/sed` on `output.path` instead of asking for repeated full dumps.
-- Use narrow, incremental commands (`rg -n`, `sed -n`, `head`, `tail`) instead of one oversized command when exploration scope is unclear.
+  - read-only file/query tools: `glob`, `read`, `search`
+  - browser operations: `navigate_page`, `take_snapshot`, `wait_for`, `fill`, `type_text`, `upload_file`, `browser_click`, `browser_press_key`, `browser_tabs`
+- Command/query tools (`bash`, `glob`, `read`, `search`) use envelope JSON:
+  `{"ok":bool,"data":...,"artifacts":[...],"error":...}`
+- For command/query tools, inspect `artifacts` first:
+  - artifact `name=stdout|stderr`
+  - `preview` contains compact output
+  - if `truncated=true`, continue with `bash` + narrow commands on `path`
+- Browser and non-command tools may return native JSON payloads.
+  If a large payload is externalized, inspect `output.preview` first and use `output.path` when `output.truncated=true`.
+- Use `search` as the default text-search tool.
+  - Keep `engine_hint=auto` unless there is a concrete reason to force `rg` or `grep`.
+- Use narrow, incremental commands (`search` with `max_count`, `sed -n`, `head`, `tail`) instead of oversized dumps.
 - Treat any of these as mandatory HITL barriers during browser tasks:
   - login / sign in / account password entry
   - CAPTCHA / verification code / OTP / 2FA / MFA
@@ -39,7 +44,7 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - The `request_input.message` must clearly tell the human what to do and what completion signal to send back
   (for example: "Please complete login/CAPTCHA in VNC, then reply `done`.").
 - After requesting HITL, wait for human completion signal before continuing tool execution.
-- If browser actions are stuck (for example repeated `browser_wait_for` / `browser_evaluate` / `browser_click` with no clear progress for 3 consecutive steps), escalate with `request_input` instead of endless retries.
+- If browser actions are stuck (for example repeated `wait_for` / `browser_click` with no clear progress for 3 consecutive steps), escalate with `request_input` instead of endless retries.
 - Tool observations are strict JSON objects.
 - Before concluding "not found", verify whether prior observations already contain direct evidence (e.g., uid/link/url/path/id).
 - If direct evidence exists, act on it first instead of repeating broad reads.
@@ -50,6 +55,3 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - No extra keys. No extra text. No markdown fences.
 - Keep "message" concise and actionable.
 """
-
-
-

@@ -97,16 +97,11 @@ class DockerSandboxClient:
         sandbox_id: str | None,
         path: str,
         timeout_sec: int = 30,
-    ) -> dict[str, Any]:
-        base_url, resolved = self._sandbox_api_base(sandbox_id)
+    ) -> Any:
+        base_url, _ = self._sandbox_api_base(sandbox_id)
         url = f"{base_url}{path}"
         response = requests.get(url, timeout=max(1, timeout_sec))
-        data = self._parse_response(response)
-        return {
-            "sandbox_id": resolved.get("sandbox_id"),
-            "api_url": url,
-            "result": data,
-        }
+        return self._parse_response(response)
 
     def api_post(
         self,
@@ -115,13 +110,8 @@ class DockerSandboxClient:
         path: str,
         payload: dict[str, Any],
         timeout_sec: int = 30,
-    ) -> dict[str, Any]:
-        base_url, resolved = self._sandbox_api_base(sandbox_id)
+    ) -> Any:
+        base_url, _ = self._sandbox_api_base(sandbox_id)
         url = f"{base_url}{path}"
         response = requests.post(url, json=payload, timeout=max(1, timeout_sec))
-        data = self._parse_response(response)
-        return {
-            "sandbox_id": resolved.get("sandbox_id"),
-            "api_url": url,
-            "result": data,
-        }
+        return self._parse_response(response)
