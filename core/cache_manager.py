@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 from openai import OpenAI
 from openai.types.shared_params.response_format_json_schema import ResponseFormatJSONSchema, JSONSchema
+from core.context_event_audit import append_context_event
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,8 @@ class RuntimeContext:
 
     # summarization audit
     summary_versions: List[Dict[str, Any]] = field(default_factory=list)
+    # pruning cooldown marker
+    last_prune_turn_index: int = 0
 
     updated_at: float = field(default_factory=lambda: time.time())
 
@@ -253,6 +256,7 @@ class RuntimeContext:
             seen_step_ids=d.get("seen_step_ids", []),
             seen_turn_ids=d.get("seen_turn_ids", []),
             summary_versions=d.get("summary_versions", []),
+            last_prune_turn_index=int(d.get("last_prune_turn_index", 0)),
             updated_at=float(d.get("updated_at", time.time())),
         )
 
@@ -280,6 +284,22 @@ class CacheManagerConfig:
     max_compaction_rounds: int = 6
 
     max_summary_tokens: int = 2000
+
+    # context defense pipeline (v2)
+    history_limit_turns: int = 10
+    history_limit_trigger_ratio: float = 0.70
+    pruning_soft_trigger_ratio: float = 0.72
+    pruning_hard_trigger_ratio: float = 0.86
+    compaction_trigger_ratio: float = 0.92
+    compaction_target_ratio: float = 0.75
+    pruning_cooldown_turns: int = 2
+    prune_protect_recent_tool_results: int = 3
+
+    # soft/hard pruning details
+    soft_trim_min_chars: int = 4000
+    soft_trim_head_chars: int = 1500
+    soft_trim_tail_chars: int = 1500
+    hard_clear_min_total_chars: int = 50_000
 
     # Turn Result Card behavior
     # 约定 Result Card 作为普通 content 插入 messages，靠前缀识别并在压缩时保留
@@ -336,7 +356,8 @@ class CacheManager(abc.ABC):
             response_schema_version: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Incrementally builds messages and triggers deterministic local compaction when needed.
+        Rebuilds model context view from trace and applies deterministic context defenses:
+        history_limit -> pruning -> compaction.
 
         toolset_version/response_schema_version:
         - If provided, used as cache key (fastest).
@@ -346,11 +367,8 @@ class CacheManager(abc.ABC):
         trace_id = getattr(trace, "trace_id")
         ctx = await self._get_or_create_ctx(trace_id)
 
-        # Append turns/steps incrementally
-        for turn in getattr(trace, "turns", []):
-            self._append_turn_user_input_if_needed(ctx, turn)
-            for step in getattr(turn, "steps", []):
-                self._append_step_if_new_or_empty(ctx, step)
+        # Rebuild runtime view from trace each round to keep pipeline deterministic.
+        self._rebuild_messages_from_trace(ctx, trace)
 
         # cache schema token estimates (cheap; only on change)
         self._ensure_schema_tokens_cached(
@@ -361,8 +379,7 @@ class CacheManager(abc.ABC):
             response_schema_version=response_schema_version,
         )
 
-        # Maybe compact (possibly multiple rounds to reach target_after_tokens)
-        # await self._maybe_compact(ctx) # TODO 暂时不压缩上下文
+        await self._apply_context_defense(ctx, trace=trace)
 
         ctx.updated_at = time.time()
         await self._save_ctx(ctx)
@@ -376,6 +393,47 @@ class CacheManager(abc.ABC):
         if loaded is None:
             return None
         return self._coerce_ctx(loaded)
+
+    async def context_report(self, trace_id: str) -> Optional[Dict[str, Any]]:
+        loaded = await self._load_ctx(trace_id)
+        if loaded is None:
+            return None
+        ctx = self._coerce_ctx(loaded)
+        estimated_prompt_tokens = self._estimate_prompt_tokens_from_ctx(ctx)
+        estimated_prompt_tokens_raw = self._estimate_prompt_tokens_raw_from_ctx(ctx)
+        tail_tool_highlight: Dict[str, Any] | None = None
+        for msg in reversed(ctx.messages):
+            if msg.get("role") != "tool":
+                continue
+            tail_tool_highlight = self._extract_tool_result_highlights(str(msg.get("content", "")))
+            if tail_tool_highlight:
+                break
+
+        report = {
+            "trace_id": ctx.trace_id,
+            "updated_at": ctx.updated_at,
+            "calibration_multiplier": ctx.calibration_multiplier,
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "estimated_prompt_tokens_raw": estimated_prompt_tokens_raw,
+            "buckets": {
+                "messages_raw_tokens": ctx.msg_tokens_raw_sum,
+                "tool_schema_raw_tokens": ctx.tool_schema_tokens_raw,
+                "response_schema_raw_tokens": ctx.response_schema_tokens_raw,
+            },
+            "counts": {
+                "messages": len(ctx.messages),
+                "steps": len(ctx.step_order),
+                "seen_turns": len(ctx.seen_turn_ids),
+                "seen_steps": len(ctx.seen_step_ids),
+                "summary_versions": len(ctx.summary_versions),
+            },
+            "last_applied_step_id": ctx.last_applied_step_id,
+            "step_order_tail": ctx.step_order[-10:],
+            "summary_versions_tail": ctx.summary_versions[-5:],
+        }
+        if tail_tool_highlight:
+            report["tail_tool_highlight"] = tail_tool_highlight
+        return report
 
     async def update_calibration(
             self,
@@ -465,6 +523,260 @@ class CacheManager(abc.ABC):
                 ctx.msg_tokens_raw_sum = int(sum(ctx.msg_tokens_raw))
             return ctx
         raise TypeError(f"Unsupported ctx type: {type(loaded)}")
+
+    def _reset_runtime_view(self, ctx: RuntimeContext) -> None:
+        system_prompt = self._build_system_prompt_fn()
+        sys_msg = {"role": "system", "content": system_prompt}
+        sys_tok = self.estimator.estimate_message_tokens_raw(sys_msg)
+
+        ctx.messages = [sys_msg]
+        ctx.msg_tokens_raw = [sys_tok]
+        ctx.msg_tokens_raw_sum = int(sys_tok)
+        ctx.step_order = []
+        ctx.step_span_map = {}
+        ctx.step_tokens_raw = {}
+        ctx.last_applied_step_id = None
+        ctx.seen_turn_ids = []
+        ctx.seen_step_ids = []
+
+    def _turns_for_context_view(self, trace: Any) -> List[Any]:
+        turns = list(getattr(trace, "turns", []) or [])
+        limit = max(1, int(self.config.history_limit_turns))
+        if len(turns) <= limit:
+            return turns
+        return turns[-limit:]
+
+    def _rebuild_messages_from_trace(self, ctx: RuntimeContext, trace: Any) -> None:
+        self._reset_runtime_view(ctx)
+        turns = self._turns_for_context_view(trace)
+        for turn in turns:
+            self._append_turn_user_input_if_needed(ctx, turn)
+            for step in getattr(turn, "steps", []) or []:
+                self._append_step_if_new_or_empty(ctx, step)
+
+    def _context_metrics(self, ctx: RuntimeContext) -> Dict[str, Any]:
+        est = self._estimate_prompt_tokens_from_ctx(ctx)
+        threshold = max(1, int(self.config.threshold_tokens))
+        return {
+            "estimated_prompt_tokens": est,
+            "threshold_tokens": threshold,
+            "u": round(est / threshold, 4),
+        }
+
+    def _replace_message_content(self, ctx: RuntimeContext, idx: int, new_content: str) -> None:
+        old_msg = ctx.messages[idx]
+        new_msg = dict(old_msg)
+        new_msg["content"] = new_content
+        old_tok = int(ctx.msg_tokens_raw[idx])
+        new_tok = int(self.estimator.estimate_message_tokens_raw(new_msg))
+        ctx.messages[idx] = new_msg
+        ctx.msg_tokens_raw[idx] = new_tok
+        ctx.msg_tokens_raw_sum += (new_tok - old_tok)
+
+    def _soft_trim_text(self, text: str) -> str:
+        if len(text) <= max(0, self.config.soft_trim_head_chars + self.config.soft_trim_tail_chars):
+            return text
+        head = text[: self.config.soft_trim_head_chars]
+        tail = text[-self.config.soft_trim_tail_chars:]
+        omitted = max(0, len(text) - len(head) - len(tail))
+        marker = f"\n[... OMITTED MIDDLE: {omitted} chars ...]\n"
+        return head + marker + tail
+
+    def _build_hard_placeholder_content(self, old_content: str) -> str:
+        highlight = self._extract_tool_result_highlights(old_content) or {}
+        summary = (
+            str(highlight.get("summary") or "").strip()
+            or str(highlight.get("preview") or "").strip()
+            or "tool result replaced by placeholder"
+        )
+        if len(summary) > 240:
+            summary = summary[:240] + "..."
+
+        refs: Dict[str, Any] = {}
+        if highlight.get("latest_path"):
+            refs["latest_path"] = highlight.get("latest_path")
+        artifact_paths = highlight.get("artifact_paths")
+        if isinstance(artifact_paths, list) and artifact_paths:
+            refs["artifact_paths"] = artifact_paths[:3]
+
+        facts: Dict[str, Any] = {
+            "tool_type": highlight.get("tool_type"),
+            "exit_code": highlight.get("exit_code"),
+            "timed_out": highlight.get("timed_out"),
+            "engine_used": highlight.get("engine_used"),
+            "fallback_from": highlight.get("fallback_from"),
+            "trim_mode": "hard",
+            "truncated": True,
+            "raw_chars": len(old_content),
+            "kept_head_chars": 0,
+            "kept_tail_chars": 0,
+        }
+        placeholder = {
+            "type": "tool_result_placeholder_v1",
+            "summary": summary,
+            "facts": {k: v for k, v in facts.items() if v is not None},
+            "refs": refs,
+        }
+        return json.dumps(placeholder, ensure_ascii=False, separators=(",", ":"))
+
+    def _prunable_tool_indexes(self, ctx: RuntimeContext) -> List[int]:
+        tool_indexes = [i for i, m in enumerate(ctx.messages) if m.get("role") == "tool" and i > 0]
+        if not tool_indexes:
+            return []
+        protect_n = max(0, int(self.config.prune_protect_recent_tool_results))
+        protected = set(tool_indexes[-protect_n:]) if protect_n > 0 else set()
+        return [idx for idx in tool_indexes if idx not in protected]
+
+    def _apply_tool_result_pruning(self, ctx: RuntimeContext, *, trace: Any) -> None:
+        threshold = max(1, int(self.config.threshold_tokens))
+        soft_trigger = int(threshold * float(self.config.pruning_soft_trigger_ratio))
+        hard_trigger = int(threshold * float(self.config.pruning_hard_trigger_ratio))
+        stop_target = int(threshold * float(self.config.compaction_target_ratio))
+
+        before = self._context_metrics(ctx)
+        if before["estimated_prompt_tokens"] < soft_trigger:
+            return
+
+        turn_count = len(getattr(trace, "turns", []) or [])
+        cooldown = max(0, int(self.config.pruning_cooldown_turns))
+        if ctx.last_prune_turn_index > 0 and (turn_count - ctx.last_prune_turn_index) <= cooldown:
+            return
+
+        candidates = self._prunable_tool_indexes(ctx)
+        if not candidates:
+            return
+
+        changed_soft = 0
+        released_soft_chars = 0
+        for idx in candidates:
+            current = self._context_metrics(ctx)
+            if current["estimated_prompt_tokens"] <= stop_target:
+                break
+            text = str(ctx.messages[idx].get("content", ""))
+            if len(text) < int(self.config.soft_trim_min_chars):
+                continue
+            trimmed = self._soft_trim_text(text)
+            if trimmed == text:
+                continue
+            self._replace_message_content(ctx, idx, trimmed)
+            changed_soft += 1
+            released_soft_chars += max(0, len(text) - len(trimmed))
+
+        if changed_soft > 0:
+            after_soft = self._context_metrics(ctx)
+            append_context_event(
+                trace_id=getattr(trace, "trace_id"),
+                turn_id=getattr(trace, "current_turn_id", None),
+                step_id=getattr(trace, "current_step_id", None),
+                event_type="CONTEXT_PRUNE_SOFT",
+                reason_code="soft_trigger",
+                metrics_before=before,
+                metrics_after=after_soft,
+                changes={
+                    "trimmed_items": changed_soft,
+                    "released_chars": released_soft_chars,
+                    "protected_recent_tool_results": int(self.config.prune_protect_recent_tool_results),
+                },
+            )
+            ctx.last_prune_turn_index = turn_count
+
+        mid = self._context_metrics(ctx)
+        if mid["estimated_prompt_tokens"] < hard_trigger:
+            return
+
+        total_candidate_chars = 0
+        for idx in candidates:
+            total_candidate_chars += len(str(ctx.messages[idx].get("content", "")))
+        if total_candidate_chars < int(self.config.hard_clear_min_total_chars):
+            return
+
+        changed_hard = 0
+        released_hard_chars = 0
+        for idx in candidates:
+            current = self._context_metrics(ctx)
+            if current["estimated_prompt_tokens"] <= stop_target:
+                break
+            old = str(ctx.messages[idx].get("content", ""))
+            placeholder = self._build_hard_placeholder_content(old)
+            if placeholder == old:
+                continue
+            self._replace_message_content(ctx, idx, placeholder)
+            changed_hard += 1
+            released_hard_chars += max(0, len(old) - len(placeholder))
+
+        if changed_hard > 0:
+            after_hard = self._context_metrics(ctx)
+            append_context_event(
+                trace_id=getattr(trace, "trace_id"),
+                turn_id=getattr(trace, "current_turn_id", None),
+                step_id=getattr(trace, "current_step_id", None),
+                event_type="CONTEXT_PRUNE_HARD",
+                reason_code="hard_trigger",
+                metrics_before=mid,
+                metrics_after=after_hard,
+                changes={
+                    "cleared_items": changed_hard,
+                    "released_chars": released_hard_chars,
+                },
+            )
+            ctx.last_prune_turn_index = turn_count
+
+    async def _apply_context_defense(self, ctx: RuntimeContext, *, trace: Any) -> None:
+        turns_total = len(getattr(trace, "turns", []) or [])
+        turns_kept = len(self._turns_for_context_view(trace))
+        if turns_total > turns_kept:
+            append_context_event(
+                trace_id=getattr(trace, "trace_id"),
+                turn_id=getattr(trace, "current_turn_id", None),
+                step_id=getattr(trace, "current_step_id", None),
+                event_type="CONTEXT_HISTORY_LIMIT",
+                reason_code="history_limit",
+                metrics_before=None,
+                metrics_after=self._context_metrics(ctx),
+                changes={"dropped_turns": turns_total - turns_kept, "kept_turns": turns_kept},
+            )
+
+        self._apply_tool_result_pruning(ctx, trace=trace)
+
+        before_compact = self._context_metrics(ctx)
+        compaction_trigger = int(max(1, self.config.threshold_tokens) * float(self.config.compaction_trigger_ratio))
+        if before_compact["estimated_prompt_tokens"] < compaction_trigger:
+            return
+
+        append_context_event(
+            trace_id=getattr(trace, "trace_id"),
+            turn_id=getattr(trace, "current_turn_id", None),
+            step_id=getattr(trace, "current_step_id", None),
+            event_type="CONTEXT_COMPACT_START",
+            reason_code="compaction_trigger",
+            metrics_before=before_compact,
+            metrics_after=before_compact,
+            changes=None,
+        )
+        try:
+            await self._maybe_compact(ctx)
+            after_compact = self._context_metrics(ctx)
+            append_context_event(
+                trace_id=getattr(trace, "trace_id"),
+                turn_id=getattr(trace, "current_turn_id", None),
+                step_id=getattr(trace, "current_step_id", None),
+                event_type="CONTEXT_COMPACT_DONE",
+                reason_code="compaction_done",
+                metrics_before=before_compact,
+                metrics_after=after_compact,
+                changes=None,
+            )
+        except Exception as exc:
+            append_context_event(
+                trace_id=getattr(trace, "trace_id"),
+                turn_id=getattr(trace, "current_turn_id", None),
+                step_id=getattr(trace, "current_step_id", None),
+                event_type="CONTEXT_COMPACT_FAILED",
+                reason_code=type(exc).__name__,
+                metrics_before=before_compact,
+                metrics_after=self._context_metrics(ctx),
+                changes={"error": str(exc)},
+            )
 
     # ---------- O(1) estimation ----------
     def _estimate_prompt_tokens_raw_from_ctx(self, ctx: RuntimeContext) -> int:
@@ -1054,6 +1366,41 @@ class CacheManager(abc.ABC):
                 obj = None
 
             if isinstance(obj, dict):
+                if (
+                    obj.get("type") == "observation_card_v1"
+                    or {"outcome", "summary", "facts", "refs"}.issubset(obj.keys())
+                ):
+                    out: Dict[str, Any] = {
+                        "tool_type": "observation_card_v1",
+                        "outcome": obj.get("outcome"),
+                        "summary": obj.get("summary"),
+                    }
+                    if obj.get("tool_name"):
+                        out["tool_name"] = obj.get("tool_name")
+                    facts = obj.get("facts") if isinstance(obj.get("facts"), dict) else {}
+                    if "exit_code" in facts:
+                        out["exit_code"] = facts.get("exit_code")
+                    if "timed_out" in facts:
+                        out["timed_out"] = bool(facts.get("timed_out"))
+                    if "engine_used" in facts:
+                        out["engine_used"] = facts.get("engine_used")
+                    if "fallback_from" in facts:
+                        out["fallback_from"] = facts.get("fallback_from")
+
+                    refs = obj.get("refs") if isinstance(obj.get("refs"), dict) else {}
+                    artifacts = refs.get("artifacts") if isinstance(refs.get("artifacts"), list) else []
+                    paths: List[str] = []
+                    for artifact in artifacts:
+                        if not isinstance(artifact, dict):
+                            continue
+                        path = artifact.get("path")
+                        if isinstance(path, str) and path.strip():
+                            paths.append(path.strip())
+                    if paths:
+                        out["artifact_paths"] = paths[:3]
+                        out["latest_path"] = paths[-1]
+                    return out
+
                 if {"ok", "data", "artifacts", "error"}.issubset(obj.keys()):
                     out: Dict[str, Any] = {
                         "tool_type": "tool_envelope",

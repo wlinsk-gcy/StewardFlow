@@ -34,11 +34,19 @@ from api.sandbox_routes import router as sandbox_router
 from ws.connection_manager import ConnectionManager
 from core.cache_manager import InMemoryCacheManager
 from core.builder.build import build_system_prompt
+from core.trace_event_logger import configure_trace_event_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
+
+runtime_cfg = config.get("runtime") or {}
+configure_trace_event_logger(
+    mode=runtime_cfg.get("trace_event_log_mode"),
+    preview_chars=runtime_cfg.get("trace_event_log_preview_chars"),
+    rate_limit_sec=runtime_cfg.get("trace_event_log_rate_limit_sec"),
+)
 
 
 class RequestIdFilter(logging.Filter):

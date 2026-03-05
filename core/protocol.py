@@ -35,6 +35,7 @@ class NodeType(str, Enum):
     THINK = "think"
     DECIDE = "decide"
     EXECUTE = "execute"
+    GUARD = "guard"
     HITL = "hitl" # request or confirm ?
     OBSERVE = "observe"
     END = "end"
@@ -103,7 +104,7 @@ class Trace:
     trace_id: str = field(default_factory=lambda: get_sonyflake("trace_"))
 
     status: AgentStatus = AgentStatus.RUNNING  # IDLE / RUNNING / WAITING / PAUSED / DONE / FAILED
-    node: Optional[NodeType] = None # THINK / DECIDE / EXECUTE / HITL / OBSERVE / END
+    node: Optional[NodeType] = None # THINK / DECIDE / EXECUTE / OBSERVE / GUARD / HITL / END
 
     # 指针（恢复时只要靠它定位到“正在进行的 turn/step/action”）
     current_turn_id: Optional[str] = None

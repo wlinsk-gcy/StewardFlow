@@ -204,7 +204,6 @@ def _subprocess_result_to_envelope(
     fallback_from: str | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "success": bool(payload.get("success")),
         "timed_out": bool(payload.get("timed_out")),
         "exit_code": int(payload.get("exit_code", -1)),
     }
@@ -233,7 +232,7 @@ def _subprocess_result_to_envelope(
         artifacts.append(artifact)
 
     out = _ok_envelope(data=data, artifacts=artifacts)
-    if not data["success"]:
+    if not bool(payload.get("success")):
         out["ok"] = False
         out["error"] = {
             "type": "subprocess_failed",

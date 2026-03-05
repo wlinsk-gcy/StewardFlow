@@ -4,6 +4,11 @@ app:
 log:
   level: info
 
+runtime:
+  trace_event_log_mode: human
+  trace_event_log_preview_chars: 80
+  trace_event_log_rate_limit_sec: 1
+
 llm:
   model: qwen3.5-plus
   api_key: "replace-with-your-key"

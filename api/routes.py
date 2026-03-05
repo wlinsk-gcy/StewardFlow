@@ -3,10 +3,13 @@ FastAPI route definitions for agent endpoints.
 """
 
 import asyncio
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.protocol import AgentStatus, NodeType, RunAgentRequest, RunAgentResponse
 from core.registry_summary import build_registry_summary
@@ -20,6 +23,11 @@ def get_task_service() -> TaskService:
     from main import app
 
     return app.state.task_service
+
+
+def get_cache_manager() -> Any:
+    service = get_task_service()
+    return service.cache_manager
 
 
 def get_checkpoint() -> CheckpointStore:
@@ -93,3 +101,58 @@ async def registry_summary(
     except Exception as exc:
         logger.exception("Failed to build registry summary: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to load registry summary") from exc
+
+
+@router.get("/context")
+async def context_report(
+    trace_id: str = Query(..., min_length=1),
+    cache_manager: Any = Depends(get_cache_manager),
+) -> dict[str, Any]:
+    report = await cache_manager.context_report(trace_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Context not found")
+    return report
+
+
+@router.get("/context/events")
+async def context_events(
+    trace_id: str = Query(..., min_length=1),
+    limit: int = Query(default=200, ge=1, le=5000),
+) -> dict[str, Any]:
+    root = Path(os.getenv("STEWARDFLOW_AUDIT_ROOT", "data/audit")).resolve()
+    events_path = (root / trace_id / "events.jsonl").resolve()
+    try:
+        events_path.relative_to(root)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid trace_id")
+
+    if not events_path.exists():
+        return {
+            "trace_id": trace_id,
+            "count": 0,
+            "items": [],
+            "path": str(events_path),
+        }
+
+    items: list[dict[str, Any]] = []
+    try:
+        with events_path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    obj = {"raw": raw}
+                items.append(obj)
+    except Exception as exc:
+        logger.exception("Failed to read audit events for trace=%s: %s", trace_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to read context events") from exc
+
+    return {
+        "trace_id": trace_id,
+        "count": len(items),
+        "items": items[-limit:],
+        "path": str(events_path),
+    }
