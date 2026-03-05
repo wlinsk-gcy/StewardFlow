@@ -84,6 +84,7 @@ Default URL: http://localhost:5173
 - `app.port`: backend listening port
 - `log.level`: log level (e.g., info)
 - `sandbox.image`: sandbox image name (for example `gui-sandbox:dev`)
+- `sandbox.tool_profile`: browser tool exposure profile. `task` (default) exposes only 9 task-oriented browser tools: `navigate_page/take_snapshot/wait_for/browser_click/fill/type_text/browser_press_key/upload_file/browser_tabs`; `debug` additionally exposes fine-grained tab and debugging tools (`list_pages/new_page/select_page/close_page/browser_handle_dialog/browser_select_option/browser_take_screenshot/browser_close/browser_drag/browser_evaluate/browser_hover`).
 - `sandbox.public_host`: host/IP used by frontend noVNC URL
 - `sandbox.healthcheck_host`: host/IP used by backend when calling sandbox API
 - `sandbox.docker_base_url`: Docker Engine endpoint (for example `tcp://192.168.130.147:2375`)

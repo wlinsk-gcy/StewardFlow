@@ -110,6 +110,7 @@ cp config.yaml.example config.yaml
 
 至少确认以下字段：
 - `sandbox.image: gui-sandbox:dev`
+- `sandbox.tool_profile: task`（默认，仅暴露 9 个任务向浏览器工具：`navigate_page/take_snapshot/wait_for/browser_click/fill/type_text/browser_press_key/upload_file/browser_tabs`；设为 `debug` 可额外暴露细粒度页签与调试工具）
 - `sandbox.public_host: <docker-vm-ip>`（前端访问 noVNC 用）
 - `sandbox.healthcheck_host: <docker-vm-ip>`（后端调用沙箱 API 用）
 - `sandbox.docker_base_url: tcp://<docker-vm-ip>:2375`
@@ -165,6 +166,7 @@ npm run dev
 - `app.port`：后端监听端口
 - `log.level`：日志级别（如 `info`）
 - `sandbox.image`：沙箱镜像名（例如 `gui-sandbox:dev`）
+- `sandbox.tool_profile`：浏览器工具暴露配置。`task`（默认）仅暴露 9 个任务向浏览器工具；`debug` 额外暴露 `list_pages/new_page/select_page/close_page/browser_handle_dialog/browser_select_option/browser_take_screenshot/browser_close/browser_drag/browser_evaluate/browser_hover`
 - `sandbox.public_host`：用于前端 noVNC 访问的宿主机地址
 - `sandbox.healthcheck_host`：后端访问沙箱 API 的地址
 - `sandbox.docker_base_url`：Docker Engine 地址（例如 `tcp://192.168.130.147:2375`）

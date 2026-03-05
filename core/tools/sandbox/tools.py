@@ -436,6 +436,13 @@ def _register_browser_tool(
     )
 
 
+def _normalize_tool_profile(raw: Any) -> str:
+    profile = str(raw or "task").strip().lower()
+    if profile in {"task", "debug"}:
+        return profile
+    return "task"
+
+
 def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) -> SandboxToolRuntime:
     client = DockerSandboxClient(
         default_image=str(sandbox_cfg.get("image", "gui-sandbox:dev")),
@@ -443,6 +450,7 @@ def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) 
         public_host=sandbox_cfg.get("public_host"),
         healthcheck_host=str(sandbox_cfg.get("healthcheck_host", "127.0.0.1")),
     )
+    tool_profile = _normalize_tool_profile((sandbox_cfg or {}).get("tool_profile"))
 
     registry.register(BashTool(client))
     registry.register(GlobTool(client))
@@ -494,21 +502,13 @@ def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) 
     _register_browser_tool(
         registry,
         client,
-        name="list_pages",
-        description="List open pages.",
-        path="/browser/list_pages",
-        properties={},
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="new_page",
-        description="Create a new page and navigate to the provided URL.",
-        path="/browser/new_page",
+        name="browser_tabs",
+        description="Manage browser tabs (list/new/activate/close).",
+        path="/browser/tabs",
         properties={
+            "action": {"type": "string", "enum": ["list", "new", "activate", "close"], "default": "list"},
+            "index": {"type": "integer", "minimum": 0},
             "url": {"type": "string"},
-            "background": {"type": "boolean", "default": False},
             "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
             "wait_until": {
                 "type": "string",
@@ -516,30 +516,7 @@ def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) 
                 "enum": ["load", "domcontentloaded", "networkidle", "commit"],
             },
         },
-        required=["url"],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="select_page",
-        description="Select one page as active by pageId.",
-        path="/browser/select_page",
-        properties={
-            "pageId": {"type": "integer", "minimum": 0},
-            "bringToFront": {"type": "boolean", "default": False},
-        },
-        required=["pageId"],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="close_page",
-        description="Close one page by pageId.",
-        path="/browser/close_page",
-        properties={
-            "pageId": {"type": "integer", "minimum": 0},
-        },
-        required=["pageId"],
+        required=[],
     )
     _register_browser_tool(
         registry,
@@ -601,68 +578,6 @@ def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) 
     _register_browser_tool(
         registry,
         client,
-        name="browser_close",
-        description="Disconnect current CDP browser session (does not kill GUI Chrome process).",
-        path="/browser/close",
-        properties={},
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_drag",
-        description="Drag from one element to another.",
-        path="/browser/drag",
-        properties={
-            "from_uid": {"type": "string"},
-            "from_selector": {"type": "string"},
-            "to_uid": {"type": "string"},
-            "to_selector": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_evaluate",
-        description="Evaluate JavaScript expression in current page context.",
-        path="/browser/evaluate",
-        properties={
-            "expression": {"type": "string"},
-            "arg": _json_any_schema(),
-        },
-        required=["expression"],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_handle_dialog",
-        description="Handle next browser dialog by accepting or dismissing it.",
-        path="/browser/handle_dialog",
-        properties={
-            "action": {"type": "string", "enum": ["accept", "dismiss"], "default": "accept"},
-            "prompt_text": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 10000, "minimum": 1, "maximum": 300000},
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_hover",
-        description="Hover over an element.",
-        path="/browser/hover",
-        properties={
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
         name="browser_press_key",
         description="Press keyboard key globally or on a target element.",
         path="/browser/press_key",
@@ -674,35 +589,149 @@ def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) 
         },
         required=["key"],
     )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_select_option",
-        description="Select options in a select element.",
-        path="/browser/select_option",
-        properties={
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "values": {"type": "array", "items": {"type": "string"}},
-            "labels": {"type": "array", "items": {"type": "string"}},
-            "indexes": {"type": "array", "items": {"type": "integer"}},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_take_screenshot",
-        description="Take a screenshot of page or target element.",
-        path="/browser/take_screenshot",
-        properties={
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "full_page": {"type": "boolean", "default": True},
-            "format": {"type": "string", "enum": ["png", "jpeg", "webp"], "default": "png"},
-            "quality": {"type": "integer", "minimum": 0, "maximum": 100},
-        },
-        required=[],
-    )
+
+    if tool_profile == "debug":
+        _register_browser_tool(
+            registry,
+            client,
+            name="list_pages",
+            description="List open pages.",
+            path="/browser/list_pages",
+            properties={},
+            required=[],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="new_page",
+            description="Create a new page and navigate to the provided URL.",
+            path="/browser/new_page",
+            properties={
+                "url": {"type": "string"},
+                "background": {"type": "boolean", "default": False},
+                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
+                "wait_until": {
+                    "type": "string",
+                    "default": "domcontentloaded",
+                    "enum": ["load", "domcontentloaded", "networkidle", "commit"],
+                },
+            },
+            required=["url"],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="select_page",
+            description="Select one page as active by pageId.",
+            path="/browser/select_page",
+            properties={
+                "pageId": {"type": "integer", "minimum": 0},
+                "bringToFront": {"type": "boolean", "default": False},
+            },
+            required=["pageId"],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="close_page",
+            description="Close one page by pageId.",
+            path="/browser/close_page",
+            properties={
+                "pageId": {"type": "integer", "minimum": 0},
+            },
+            required=["pageId"],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_handle_dialog",
+            description="Handle next browser dialog by accepting or dismissing it.",
+            path="/browser/handle_dialog",
+            properties={
+                "action": {"type": "string", "enum": ["accept", "dismiss"], "default": "accept"},
+                "prompt_text": {"type": "string"},
+                "timeout_ms": {"type": "integer", "default": 10000, "minimum": 1, "maximum": 300000},
+            },
+            required=[],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_select_option",
+            description="Select options in a select element.",
+            path="/browser/select_option",
+            properties={
+                "uid": {"type": "string"},
+                "selector": {"type": "string"},
+                "values": {"type": "array", "items": {"type": "string"}},
+                "labels": {"type": "array", "items": {"type": "string"}},
+                "indexes": {"type": "array", "items": {"type": "integer"}},
+                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
+            },
+            required=[],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_take_screenshot",
+            description="Take a screenshot of page or target element.",
+            path="/browser/take_screenshot",
+            properties={
+                "uid": {"type": "string"},
+                "selector": {"type": "string"},
+                "full_page": {"type": "boolean", "default": True},
+                "format": {"type": "string", "enum": ["png", "jpeg", "webp"], "default": "png"},
+                "quality": {"type": "integer", "minimum": 0, "maximum": 100},
+            },
+            required=[],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_close",
+            description="Disconnect current CDP browser session (does not kill GUI Chrome process).",
+            path="/browser/close",
+            properties={},
+            required=[],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_drag",
+            description="Drag from one element to another.",
+            path="/browser/drag",
+            properties={
+                "from_uid": {"type": "string"},
+                "from_selector": {"type": "string"},
+                "to_uid": {"type": "string"},
+                "to_selector": {"type": "string"},
+                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
+            },
+            required=[],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_evaluate",
+            description="Evaluate JavaScript expression in current page context.",
+            path="/browser/evaluate",
+            properties={
+                "expression": {"type": "string"},
+                "arg": _json_any_schema(),
+            },
+            required=["expression"],
+        )
+        _register_browser_tool(
+            registry,
+            client,
+            name="browser_hover",
+            description="Hover over an element.",
+            path="/browser/hover",
+            properties={
+                "uid": {"type": "string"},
+                "selector": {"type": "string"},
+                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
+            },
+            required=[],
+        )
     return SandboxToolRuntime(client)
