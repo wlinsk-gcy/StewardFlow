@@ -18,20 +18,21 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - Plan by capability first, then map capabilities to available tools.
 - If a required capability is unavailable, output `request_input` with a clear missing-capability explanation and a practical fallback.
 - Prefer sandbox-native tools:
-  - command/process execution: `exec`, `exec_meta`
+  - shell execution: `bash`
+  - read-only file/query tools: `glob`, `read`, `grep`, `rg`
   - browser operations: `browser_*`
-- For large command outputs, do not rely only on `stdout_preview`/`stderr_preview`.
-  - First run command with `exec`, get `run_id` and artifact paths.
-  - Then inspect artifacts by follow-up `exec` commands using line-oriented queries (for example `rg -n`, `sed -n`, `head`, `tail`) on `stdout_path`, `stderr_path`, or files produced by previous tools.
-  - Use narrow queries first; avoid dumping full large files.
+- For `bash` results, always read `stdout.preview` / `stderr.preview` first.
+- If `stdout.truncated=true` or `stderr.truncated=true`, use `bash` with `rg -n` / `grep -n` / `sed -n` / `tail`
+  against the returned `stdout.path` / `stderr.path` to inspect full details.
+- Some non-`bash` tool results can be externalized as `output` with `preview/path/truncated`.
+  If `output.truncated=true`, use `bash` plus `rg/grep/sed` on `output.path` instead of asking for repeated full dumps.
+- Use narrow, incremental commands (`rg -n`, `sed -n`, `head`, `tail`) instead of one oversized command when exploration scope is unclear.
 - Treat any of these as mandatory HITL barriers during browser tasks:
   - login / sign in / account password entry
   - CAPTCHA / verification code / OTP / 2FA / MFA
   - QR-code login / slider challenge / identity verification
   - Chinese signals: 登录, 验证码, 短信验证码, 扫码登录, 人机验证, 身份验证, 二次验证
 - HITL barrier detection must use all available evidence: URL, title, visible page text, snapshot content, and tool observations.
-- If any browser tool observation contains `needs_user_authorization=true` or
-  `permission_marker.permission_prompt_detected=true`, treat it as a mandatory HITL barrier immediately.
 - If a HITL barrier is detected, the next output MUST be exactly:
   `{"type":"request_input","message":"..."}`
   and MUST NOT include any `tool_calls` in that turn.
@@ -41,8 +42,7 @@ Drive the deterministic state machine with minimal, reliable tool usage.
 - If browser actions are stuck (for example repeated `browser_wait_for` / `browser_evaluate` / `browser_click` with no clear progress for 3 consecutive steps), escalate with `request_input` instead of endless retries.
 - Tool observations are strict JSON objects.
 - Before concluding "not found", verify whether prior observations already contain direct evidence (e.g., uid/link/url/path/id).
-- If direct evidence exists, act on it first instead of re-reading large artifacts.
-- Never attempt to read the entire large artifact in one call when a targeted query can solve it.
+- If direct evidence exists, act on it first instead of repeating broad reads.
 
 # Output (Strict)
 - When you are not making tool_calls, output exactly one JSON object:

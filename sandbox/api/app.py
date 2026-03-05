@@ -4,12 +4,13 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import signal
+import time
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from playwright.async_api import (
@@ -24,24 +25,176 @@ from pydantic import BaseModel, Field
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("SANDBOX_EXEC_TIMEOUT_MS", "120000"))
 MAX_TIMEOUT_MS = int(os.getenv("SANDBOX_EXEC_MAX_TIMEOUT_MS", "3600000"))
-DEFAULT_PREVIEW_BYTES = int(os.getenv("SANDBOX_EXEC_PREVIEW_BYTES", "4096"))
-DEFAULT_CAPTURE_LIMIT_BYTES = int(
-    os.getenv("SANDBOX_EXEC_CAPTURE_LIMIT_BYTES", str(50 * 1024 * 1024))
-)
-
-ARTIFACT_ROOT = Path(os.getenv("SANDBOX_ARTIFACT_ROOT", "/config/tool-artifacts")).resolve()
-EXEC_ARTIFACT_ROOT = (ARTIFACT_ROOT / "exec").resolve()
-BROWSER_ARTIFACT_ROOT = (ARTIFACT_ROOT / "browser").resolve()
 UPLOAD_ROOT = Path(os.getenv("SANDBOX_UPLOAD_ROOT", "/config/uploads")).resolve()
+RESULT_ARTIFACT_ROOT = Path(
+    os.getenv("SANDBOX_RESULT_ARTIFACT_ROOT", "/config/tool-artifacts/results")
+).resolve()
+RESULT_PREVIEW_MAX_LINES = max(1, int(os.getenv("SANDBOX_RESULT_PREVIEW_MAX_LINES", "256")))
+RESULT_PREVIEW_MAX_BYTES = max(128, int(os.getenv("SANDBOX_RESULT_PREVIEW_MAX_BYTES", "10240")))
+RESULT_PREVIEW_HEAD_LINES = max(1, int(os.getenv("SANDBOX_RESULT_PREVIEW_HEAD_LINES", "128")))
+RESULT_PREVIEW_TAIL_LINES = max(1, int(os.getenv("SANDBOX_RESULT_PREVIEW_TAIL_LINES", "128")))
+AUTO_GRANT_PERMISSIONS_ENV = "SANDBOX_BROWSER_AUTO_GRANT_PERMISSIONS"
+AUTO_GRANT_PERMISSIONS_LIST_ENV = "SANDBOX_BROWSER_AUTO_GRANT_PERMISSION_LIST"
+DEFAULT_AUTO_GRANT_PERMISSIONS = [
+    "geolocation",
+    "notifications",
+    "camera",
+    "microphone",
+    "clipboard-read",
+    "clipboard-write",
+]
+SUPPORTED_BROWSER_PERMISSIONS = {
+    "geolocation",
+    "midi",
+    "midi-sysex",
+    "notifications",
+    "camera",
+    "microphone",
+    "background-sync",
+    "ambient-light-sensor",
+    "accelerometer",
+    "gyroscope",
+    "magnetometer",
+    "accessibility-events",
+    "clipboard-read",
+    "clipboard-write",
+    "payment-handler",
+    "persistent-storage",
+    "idle-detection",
+}
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _safe_tool_name(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    normalized = normalized.strip("._-")
+    return normalized or "tool"
 
 
-def _new_id(prefix: str) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    return f"{prefix}-{ts}-{uuid4().hex[:8]}"
+def _artifact_path(tool_name: str, suffix: str) -> Path:
+    folder = (RESULT_ARTIFACT_ROOT / _safe_tool_name(tool_name)).resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    filename = f"{time.time_ns()}_{os.getpid()}.{suffix}"
+    return (folder / filename).resolve()
+
+
+def _write_text_artifact(tool_name: str, text: str, *, suffix: str = "txt") -> str:
+    out_path = _artifact_path(tool_name, suffix=suffix)
+    out_path.write_text(text, encoding="utf-8")
+    return str(out_path)
+
+
+def _write_bytes_artifact(tool_name: str, data: bytes, *, suffix: str) -> str:
+    out_path = _artifact_path(tool_name, suffix=suffix)
+    out_path.write_bytes(data)
+    return str(out_path)
+
+
+def _preview_text(text: str) -> tuple[str, bool, str | None]:
+    encoded = text.encode("utf-8", errors="replace")
+    byte_count = len(encoded)
+    lines = text.splitlines()
+    line_count = len(lines)
+
+    hit_line = line_count > RESULT_PREVIEW_MAX_LINES
+    hit_byte = byte_count > RESULT_PREVIEW_MAX_BYTES
+    if not hit_line and not hit_byte:
+        return text, False, None
+
+    line_hit_at = (RESULT_PREVIEW_MAX_LINES + 1) if hit_line else None
+    byte_hit_at: int | None = None
+    if hit_byte:
+        if line_count == 0:
+            byte_hit_at = 1
+        else:
+            running_bytes = 0
+            for idx, line in enumerate(lines, start=1):
+                running_bytes += len(line.encode("utf-8", errors="replace"))
+                if idx < line_count:
+                    running_bytes += 1  # account for newline separators
+                if running_bytes > RESULT_PREVIEW_MAX_BYTES:
+                    byte_hit_at = idx
+                    break
+            if byte_hit_at is None:
+                byte_hit_at = line_count + 1
+
+    prefer_line_mode = bool(
+        hit_line
+        and (
+            not hit_byte
+            or (line_hit_at is not None and byte_hit_at is not None and line_hit_at < byte_hit_at)
+        )
+    )
+
+    if prefer_line_mode:
+        head_n = min(RESULT_PREVIEW_HEAD_LINES, line_count)
+        max_tail = max(0, line_count - head_n)
+        tail_n = min(RESULT_PREVIEW_TAIL_LINES, max_tail)
+        head_lines = lines[:head_n]
+        tail_lines = lines[-tail_n:] if tail_n > 0 else []
+        omitted_lines = max(0, line_count - head_n - tail_n)
+        kept_text = "\n".join(head_lines + tail_lines)
+        omitted_bytes = max(0, byte_count - len(kept_text.encode("utf-8", errors="replace")))
+        marker = f"[... OMITTED MIDDLE: {omitted_lines} lines, {omitted_bytes} bytes ...]"
+        merged = head_lines + [marker] + tail_lines
+        return "\n".join(merged), True, "line"
+
+    # Byte-only overflow (line count is within limit): keep byte head/tail.
+    half = max(1, RESULT_PREVIEW_MAX_BYTES // 2)
+    head_text = encoded[:half].decode("utf-8", errors="ignore")
+    tail_text = encoded[-half:].decode("utf-8", errors="ignore")
+    omitted_bytes = max(0, byte_count - len(encoded[:half]) - len(encoded[-half:]))
+    marker = f"[... OMITTED MIDDLE: 0 lines, {omitted_bytes} bytes ...]"
+    if tail_text:
+        preview = "\n".join([head_text, marker, tail_text])
+    else:
+        preview = "\n".join([head_text, marker])
+    return preview, True, "byte"
+
+
+def _payload_to_text(payload: Any) -> str:
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8", errors="replace")
+    if isinstance(payload, list) and all(isinstance(item, str) for item in payload):
+        return "\n".join(payload)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _stream_result_payload(
+    tool_name: str,
+    stream_name: str,
+    content: str,
+    *,
+    persist_output: bool = False,
+) -> dict[str, Any]:
+    preview, truncated, by = _preview_text(content)
+    payload: dict[str, Any] = {"preview": preview}
+    if truncated or persist_output:
+        payload["path"] = _write_text_artifact(f"{tool_name}_{stream_name}", content, suffix="txt")
+    if truncated:
+        payload["truncated"] = True
+        payload["by"] = by
+    return payload
+
+
+def _maybe_externalize_payload(payload: Any, *, tool_name: str) -> Any:
+    text = _payload_to_text(payload)
+    preview, truncated, by = _preview_text(text)
+    if not truncated:
+        return payload
+    response: dict[str, Any] = {
+        "output": {
+            "preview": preview,
+            "path": _write_text_artifact(tool_name, text, suffix="txt"),
+            "truncated": True,
+        }
+    }
+    if by:
+        response["output"]["by"] = by
+    return response
 
 
 def _resolve_any_path(raw_path: str | None, base_dir: Path) -> Path:
@@ -62,21 +215,390 @@ def _resolve_cwd(raw_cwd: str | None) -> Path:
     return candidate.resolve()
 
 
-def _artifact_file_path(base_dir: Path, requested: str | None, suffix: str, stem_prefix: str) -> Path:
-    if requested is None or not requested.strip():
-        base_dir.mkdir(parents=True, exist_ok=True)
-        return (base_dir / f"{_new_id(stem_prefix)}.{suffix}").resolve()
+def _ensure_cwd(raw_cwd: str | None) -> Path:
+    cwd_path = _resolve_cwd(raw_cwd)
+    if not cwd_path.exists() or not cwd_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"invalid cwd: {cwd_path}")
+    return cwd_path
 
-    candidate = _resolve_any_path(requested, base_dir)
-    if requested.endswith("/") or candidate.suffix == "":
-        candidate.mkdir(parents=True, exist_ok=True)
-        candidate = candidate / f"{_new_id(stem_prefix)}.{suffix}"
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    return candidate.resolve()
 
+async def _run_subprocess_tool(
+    *,
+    tool_name: str,
+    cwd_path: Path,
+    timeout_ms: int,
+    env: dict[str, str] | None,
+    persist_output: bool,
+    success_exit_codes: set[int],
+    shell_command: str | None = None,
+    argv: list[str] | None = None,
+    shell_executable: str | None = None,
+) -> dict[str, Any]:
+    if bool(shell_command) == bool(argv):
+        raise HTTPException(status_code=400, detail="invalid_subprocess_request")
+
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+
+    spawn_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        spawn_kwargs["preexec_fn"] = os.setsid
+
+    try:
+        if shell_command is not None:
+            proc = await asyncio.create_subprocess_shell(
+                shell_command,
+                cwd=str(cwd_path),
+                env=merged_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                executable=shell_executable,
+                **spawn_kwargs,
+            )
+        else:
+            assert argv is not None
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd_path),
+                env=merged_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"spawn_failed: {exc}") from exc
+
+    timed_out = False
+    stdout_bytes = b""
+    stderr_bytes = b""
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=max(1, int(timeout_ms)) / 1000.0,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        await _kill_process_tree(proc)
+        stdout_bytes, stderr_bytes = await proc.communicate()
+
+    exit_code = -1 if proc.returncode is None else int(proc.returncode)
+    return {
+        "success": (not timed_out and exit_code in success_exit_codes),
+        "timed_out": timed_out,
+        "exit_code": exit_code,
+        "stdout": _stream_result_payload(
+            tool_name,
+            "stdout",
+            stdout_bytes.decode("utf-8", errors="replace"),
+            persist_output=persist_output,
+        ),
+        "stderr": _stream_result_payload(
+            tool_name,
+            "stderr",
+            stderr_bytes.decode("utf-8", errors="replace"),
+            persist_output=persist_output,
+        ),
+    }
 
 def _escape_css_attr(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _compact_whitespace(value: str, *, limit: int = 240) -> str:
+    compact = " ".join((value or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)] + "..."
+
+
+def _env_flag_enabled(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _normalize_permission_list(raw: str | None) -> list[str]:
+    source = raw if raw is not None else ",".join(DEFAULT_AUTO_GRANT_PERMISSIONS)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in str(source).split(","):
+        value = item.strip().lower()
+        if not value or value in seen:
+            continue
+        if value not in SUPPORTED_BROWSER_PERMISSIONS:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    if normalized:
+        return normalized
+    return list(DEFAULT_AUTO_GRANT_PERMISSIONS)
+
+
+def _origin_from_url(raw_url: str) -> str | None:
+    parsed = urlsplit(str(raw_url or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _flatten_a11y_tree(root: Any, *, max_nodes: int) -> tuple[list[str], int, bool]:
+    lines: list[str] = []
+    visited = 0
+    truncated = False
+    hard_limit = max(1, int(max_nodes))
+
+    def _walk(node: Any, depth: int) -> None:
+        nonlocal visited, truncated
+        if truncated or not isinstance(node, dict):
+            return
+
+        visited += 1
+        role = _compact_whitespace(str(node.get("role") or ""))
+        name = _compact_whitespace(str(node.get("name") or ""))
+        value = _compact_whitespace(str(node.get("value") or ""))
+        description = _compact_whitespace(str(node.get("description") or ""))
+        disabled = bool(node.get("disabled"))
+        focused = bool(node.get("focused"))
+        checked = node.get("checked")
+        selected = node.get("selected")
+
+        parts = [f"role={role or '-'}"]
+        if name:
+            parts.append(f"name={name}")
+        if value:
+            parts.append(f"value={value}")
+        if description:
+            parts.append(f"description={description}")
+        if disabled:
+            parts.append("disabled=true")
+        if focused:
+            parts.append("focused=true")
+        if isinstance(checked, bool):
+            parts.append(f"checked={str(checked).lower()}")
+        if isinstance(selected, bool):
+            parts.append(f"selected={str(selected).lower()}")
+
+        lines.append(f"{'  ' * max(0, depth)}- " + " | ".join(parts))
+        if len(lines) >= hard_limit:
+            truncated = True
+            return
+
+        children = node.get("children")
+        if isinstance(children, list):
+            for child in children:
+                _walk(child, depth + 1)
+                if truncated:
+                    break
+
+    _walk(root, 0)
+    return lines, visited, truncated
+
+
+def _cdp_ax_field(node: dict[str, Any], field: str) -> str:
+    raw = node.get(field)
+    value: Any
+    if isinstance(raw, dict):
+        value = raw.get("value")
+    else:
+        value = raw
+    if value is None:
+        return ""
+    return _compact_whitespace(str(value))
+
+
+def _cdp_ax_properties(node: dict[str, Any]) -> dict[str, str]:
+    props = node.get("properties")
+    if not isinstance(props, list):
+        return {}
+    out: dict[str, str] = {}
+    for item in props:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("name") or "").strip()
+        if not key:
+            continue
+        value_raw = item.get("value")
+        value: Any = value_raw
+        if isinstance(value_raw, dict):
+            value = value_raw.get("value")
+        if value is None:
+            continue
+        out[key] = _compact_whitespace(str(value))
+    return out
+
+
+def _sanitize_a11y_url(url: str) -> str:
+    if not url:
+        return ""
+    compact = _compact_whitespace(url, limit=320)
+    if compact.startswith("data:image"):
+        return "data:image(<redacted>)"
+    return compact
+
+
+def _format_cdp_a11y_line(
+    *,
+    uid: str,
+    role: str,
+    name: str,
+    url: str,
+    value: str,
+    description: str,
+    ignored: bool,
+) -> str:
+    role_token = "ignored" if ignored else (role or "unknown")
+    parts = [f"uid={uid}", role_token]
+    if name:
+        parts.append(json.dumps(name, ensure_ascii=False))
+    if url:
+        parts.append(f"url={json.dumps(url, ensure_ascii=False)}")
+    if value and value != name:
+        parts.append(f"value={json.dumps(value, ensure_ascii=False)}")
+    if description:
+        parts.append(f"description={json.dumps(description, ensure_ascii=False)}")
+    return " ".join(parts)
+
+
+def _build_cdp_a11y_lines(
+    nodes: list[dict[str, Any]],
+    *,
+    interesting_only: bool,
+    max_nodes: int,
+) -> tuple[list[str], list[dict[str, Any]], int, bool]:
+    hard_limit = max(1, int(max_nodes))
+    by_id: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = node.get("nodeId")
+        if node_id is None:
+            continue
+        key = str(node_id)
+        if key not in by_id:
+            by_id[key] = node
+
+    if not by_id:
+        return [], [], 0, False
+
+    root_ids: list[str] = []
+    for node_id, node in by_id.items():
+        parent_id = node.get("parentId")
+        parent_key = str(parent_id) if parent_id is not None else ""
+        if not parent_key or parent_key not in by_id:
+            root_ids.append(node_id)
+    if "1" in root_ids:
+        root_ids = ["1"] + [item for item in root_ids if item != "1"]
+
+    lines: list[str] = []
+    items: list[dict[str, Any]] = []
+    visited = 0
+    truncated = False
+    uid_counter = 0
+    seen: set[str] = set()
+
+    def _should_emit(*, role: str, ignored: bool, name: str, value: str, description: str, url: str) -> bool:
+        if not interesting_only:
+            return True
+        role_lc = role.lower()
+        if role_lc == "rootwebarea":
+            return True
+        if ignored:
+            return False
+        if role_lc in {"none", "generic"} and not any([name, value, description, url]):
+            return False
+        return True
+
+    def _walk(node_id: str, depth: int, parent_uid: str | None) -> None:
+        nonlocal visited, truncated, uid_counter
+        if truncated or node_id in seen:
+            return
+        node = by_id.get(node_id)
+        if node is None:
+            return
+        seen.add(node_id)
+        visited += 1
+
+        role = _cdp_ax_field(node, "role")
+        name = _cdp_ax_field(node, "name")
+        value = _cdp_ax_field(node, "value")
+        description = _cdp_ax_field(node, "description")
+        ignored = bool(node.get("ignored"))
+        props = _cdp_ax_properties(node)
+        url = _sanitize_a11y_url(props.get("url", ""))
+
+        emit = _should_emit(
+            role=role,
+            ignored=ignored,
+            name=name,
+            value=value,
+            description=description,
+            url=url,
+        )
+
+        next_depth = depth
+        current_parent_uid = parent_uid
+        if emit:
+            if len(items) >= hard_limit:
+                truncated = True
+                return
+            uid = f"1_{uid_counter}"
+            uid_counter += 1
+            line = _format_cdp_a11y_line(
+                uid=uid,
+                role=role,
+                name=name,
+                url=url,
+                value=value,
+                description=description,
+                ignored=ignored,
+            )
+            lines.append(f"{'  ' * max(0, depth)}{line}")
+            items.append(
+                {
+                    "uid": uid,
+                    "nodeId": node_id,
+                    "parentUid": parent_uid,
+                    "depth": depth,
+                    "role": role,
+                    "name": name,
+                    "value": value,
+                    "description": description,
+                    "url": url,
+                    "ignored": ignored,
+                }
+            )
+            current_parent_uid = uid
+            next_depth = depth + 1
+
+        child_ids_raw = node.get("childIds")
+        child_ids: list[str] = []
+        if isinstance(child_ids_raw, list):
+            for child in child_ids_raw:
+                child_key = str(child)
+                if child_key in by_id:
+                    child_ids.append(child_key)
+
+        for child_id in child_ids:
+            _walk(child_id, next_depth, current_parent_uid)
+            if truncated:
+                return
+
+    for root_id in root_ids:
+        _walk(root_id, 0, None)
+        if truncated:
+            return lines, items, visited, True
+
+    # Traverse disconnected nodes if any remain.
+    for node_id in by_id.keys():
+        if node_id in seen:
+            continue
+        _walk(node_id, 0, None)
+        if truncated:
+            return lines, items, visited, True
+
+    return lines, items, visited, False
 
 
 async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
@@ -94,59 +616,6 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _capture_stream(
-    stream: asyncio.StreamReader | None,
-    output_file: Path,
-    *,
-    preview_bytes: int,
-    capture_limit_bytes: int,
-) -> dict[str, Any]:
-    preview = bytearray()
-    total_bytes = 0
-    stored_bytes = 0
-    truncated = False
-
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with output_file.open("wb") as handle:
-        if stream is None:
-            return {
-                "path": str(output_file),
-                "total_bytes": 0,
-                "stored_bytes": 0,
-                "truncated": False,
-                "preview": "",
-            }
-
-        while True:
-            chunk = await stream.read(65536)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-
-            if len(preview) < preview_bytes:
-                remain = preview_bytes - len(preview)
-                preview.extend(chunk[:remain])
-
-            if stored_bytes < capture_limit_bytes:
-                remain = capture_limit_bytes - stored_bytes
-                part = chunk[:remain]
-                if part:
-                    handle.write(part)
-                    stored_bytes += len(part)
-                if len(part) < len(chunk):
-                    truncated = True
-            else:
-                truncated = True
-
-    return {
-        "path": str(output_file),
-        "total_bytes": total_bytes,
-        "stored_bytes": stored_bytes,
-        "truncated": truncated,
-        "preview": preview.decode("utf-8", errors="replace"),
-    }
-
-
 class BrowserManager:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -157,6 +626,12 @@ class BrowserManager:
         self._dialog_queue: asyncio.Queue[Any] = asyncio.Queue()
         self._dialog_listener_page: Page | None = None
         self._permission_probe_context_id: int | None = None
+        self._auto_grant_permissions = _env_flag_enabled(AUTO_GRANT_PERMISSIONS_ENV, default=True)
+        self._auto_grant_permission_list = _normalize_permission_list(
+            os.getenv(AUTO_GRANT_PERMISSIONS_LIST_ENV)
+        )
+        self._permission_grant_context_id: int | None = None
+        self._permission_granted_origins: set[str] = set()
 
         cdp_port = os.getenv("CHROME_REMOTE_DEBUGGING_PORT", "9222").strip() or "9222"
         self._cdp_url = os.getenv("SANDBOX_CHROME_CDP_URL", f"http://127.0.0.1:{cdp_port}")
@@ -243,6 +718,34 @@ class BrowserManager:
                     pass
         try:
             await page.evaluate(self._permission_probe_init_script())
+        except Exception:
+            pass
+
+    async def _grant_auto_permissions_locked(self, page: Page | None = None) -> None:
+        if not self._auto_grant_permissions or self._context is None:
+            return
+        permissions = list(self._auto_grant_permission_list)
+        if not permissions:
+            return
+
+        ctx_id = id(self._context)
+        if self._permission_grant_context_id != ctx_id:
+            self._permission_grant_context_id = None
+            self._permission_granted_origins = set()
+            try:
+                await self._context.grant_permissions(permissions)
+                self._permission_grant_context_id = ctx_id
+            except Exception:
+                return
+
+        if page is None:
+            return
+        origin = _origin_from_url(page.url)
+        if not origin or origin in self._permission_granted_origins:
+            return
+        try:
+            await self._context.grant_permissions(permissions, origin=origin)
+            self._permission_granted_origins.add(origin)
         except Exception:
             pass
 
@@ -399,6 +902,7 @@ class BrowserManager:
         if not contexts:
             self._context = await self._browser.new_context(ignore_https_errors=True)
             self._page = await self._context.new_page()
+            await self._grant_auto_permissions_locked(self._page)
             self._install_dialog_listener_locked(self._page)
             await self._install_permission_probe_locked(self._page)
             return
@@ -416,6 +920,7 @@ class BrowserManager:
             self._page = pages[0]
         else:
             self._page = await primary.new_page()
+        await self._grant_auto_permissions_locked(self._page)
         self._install_dialog_listener_locked(self._page)
         await self._install_permission_probe_locked(self._page)
 
@@ -440,6 +945,9 @@ class BrowserManager:
         self._page = None
         self._browser = None
         self._dialog_listener_page = None
+        self._permission_probe_context_id = None
+        self._permission_grant_context_id = None
+        self._permission_granted_origins = set()
         while not self._dialog_queue.empty():
             try:
                 self._dialog_queue.get_nowait()
@@ -481,12 +989,40 @@ class BrowserManager:
             )
 
         return {
-            "single_browser_process": True,
-            "single_context_enforced": True,
-            "context_count": len(self._browser.contexts) if self._browser is not None else 0,
-            "tab_count": len(items),
             "active_index": active_index,
             "tabs": items,
+        }
+
+    @staticmethod
+    def _cdp_pages_payload(tabs_payload: dict[str, Any]) -> dict[str, Any]:
+        tabs = tabs_payload.get("tabs") if isinstance(tabs_payload, dict) else []
+        pages: list[dict[str, Any]] = []
+        if isinstance(tabs, list):
+            for item in tabs:
+                if not isinstance(item, dict):
+                    continue
+                page_id = item.get("index")
+                try:
+                    page_id = int(page_id)
+                except Exception:
+                    continue
+                pages.append(
+                    {
+                        "pageId": page_id,
+                        "url": item.get("url") or "",
+                        "title": item.get("title") or "",
+                        "isActive": bool(item.get("is_active")),
+                    }
+                )
+        active_page_id = tabs_payload.get("active_index") if isinstance(tabs_payload, dict) else None
+        try:
+            active_page_id = int(active_page_id)
+        except Exception:
+            active_page_id = None
+        return {
+            "pageCount": len(pages),
+            "activePageId": active_page_id,
+            "pages": pages,
         }
 
     async def _ensure_snapshot_uids(self, page: Page, *, max_elements: int) -> dict[str, Any]:
@@ -553,47 +1089,200 @@ class BrowserManager:
             max(1, min(int(max_elements), 2000)),
         )
 
+    async def _a11y_snapshot_payload(
+        self,
+        page: Page,
+        *,
+        interesting_only: bool,
+        max_nodes: int,
+    ) -> list[str]:
+        # Prefer CDP AX tree so text output stays aligned with cdp-mcp style.
+        if self._context is None:
+            raise HTTPException(status_code=500, detail="browser_context_unavailable")
+
+        try:
+            cdp = await self._context.new_cdp_session(page)
+            try:
+                raw = await cdp.send("Accessibility.getFullAXTree")
+            finally:
+                with suppress(Exception):
+                    await cdp.detach()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"a11y_snapshot_unavailable: {exc}") from exc
+
+        nodes_raw = raw.get("nodes") if isinstance(raw, dict) else []
+        nodes: list[dict[str, Any]] = (
+            [node for node in nodes_raw if isinstance(node, dict)] if isinstance(nodes_raw, list) else []
+        )
+        lines, _, _, _ = _build_cdp_a11y_lines(
+            nodes,
+            interesting_only=bool(interesting_only),
+            max_nodes=max_nodes,
+        )
+        return lines
+
     async def state(self) -> dict[str, Any]:
         async with self._lock:
             await self._start_locked()
-            page = self._require_page_locked()
-            tabs = await self._tabs_payload_locked()
-            permission_marker = await self._permission_marker_locked(page)
-            return {
-                "started": True,
-                "headless": False,
-                "url": page.url,
-                "title": await self._safe_page_title(page),
-                "cdp_url": self._cdp_url,
-                "permission_marker": permission_marker,
-                "needs_user_authorization": bool(permission_marker.get("permission_prompt_detected")),
-                **tabs,
-            }
+            return await self._tabs_payload_locked()
 
     async def navigate(self, *, url: str, timeout_ms: int, wait_until: str) -> dict[str, Any]:
-        async with self._lock:
-            await self._start_locked()
-            page = self._require_page_locked()
-            resolved_wait = self._normalize_wait_until(wait_until)
-            await page.goto(url, timeout=timeout_ms, wait_until=resolved_wait)
-            return {
-                "url": page.url,
-                "title": await self._safe_page_title(page),
-                "wait_until": resolved_wait,
-            }
+        return await self.navigate_page(
+            action="url",
+            url=url,
+            timeout_ms=timeout_ms,
+            wait_until=wait_until,
+        )
 
     async def navigate_back(self, *, timeout_ms: int, wait_until: str) -> dict[str, Any]:
+        return await self.navigate_page(
+            action="back",
+            url=None,
+            timeout_ms=timeout_ms,
+            wait_until=wait_until,
+        )
+
+    async def navigate_page(
+        self,
+        *,
+        action: Literal["url", "back", "forward", "reload"],
+        url: str | None,
+        timeout_ms: int,
+        wait_until: str,
+    ) -> dict[str, Any]:
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
             resolved_wait = self._normalize_wait_until(wait_until)
-            response = await page.go_back(timeout=timeout_ms, wait_until=resolved_wait)
+
+            if action == "url":
+                target_url = str(url or "").strip()
+                if not target_url:
+                    raise HTTPException(status_code=400, detail="navigate_page_url_required")
+                await page.goto(target_url, timeout=timeout_ms, wait_until=resolved_wait)
+                await self._grant_auto_permissions_locked(page)
+                return {
+                    "action": "url",
+                    "url": page.url,
+                }
+
+            if action == "back":
+                response = await page.go_back(timeout=timeout_ms, wait_until=resolved_wait)
+                await self._grant_auto_permissions_locked(page)
+                return {
+                    "action": "back",
+                    "navigated": response is not None,
+                    "url": page.url,
+                }
+
+            if action == "forward":
+                response = await page.go_forward(timeout=timeout_ms, wait_until=resolved_wait)
+                await self._grant_auto_permissions_locked(page)
+                return {
+                    "action": "forward",
+                    "navigated": response is not None,
+                    "url": page.url,
+                }
+
+            response = await page.reload(timeout=timeout_ms, wait_until=resolved_wait)
+            await self._grant_auto_permissions_locked(page)
             return {
-                "navigated": response is not None,
+                "action": "reload",
+                "reloaded": response is not None,
                 "url": page.url,
-                "title": await self._safe_page_title(page),
-                "wait_until": resolved_wait,
             }
+
+    async def list_pages(self) -> dict[str, Any]:
+        async with self._lock:
+            await self._start_locked()
+            tabs_payload = await self._tabs_payload_locked()
+            return self._cdp_pages_payload(tabs_payload)
+
+    async def new_page(
+        self,
+        *,
+        url: str,
+        timeout_ms: int,
+        wait_until: str,
+        background: bool,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            await self._start_locked()
+            if self._context is None:
+                raise HTTPException(status_code=500, detail="browser_context_unavailable")
+
+            target_url = str(url or "").strip()
+            if not target_url:
+                raise HTTPException(status_code=400, detail="new_page_url_required")
+
+            previous_active = self._page
+            resolved_wait = self._normalize_wait_until(wait_until)
+            page = await self._context.new_page()
+            self._install_dialog_listener_locked(page)
+            await page.goto(target_url, timeout=timeout_ms, wait_until=resolved_wait)
+            await self._grant_auto_permissions_locked(page)
+
+            if not background:
+                self._page = page
+                await page.bring_to_front()
+            elif previous_active is not None:
+                self._page = previous_active
+
+            pages_now = list(self._context.pages)
+            created_page_id = pages_now.index(page) if page in pages_now else None
+            tabs_payload = await self._tabs_payload_locked()
+            return {
+                "pageId": created_page_id,
+                **self._cdp_pages_payload(tabs_payload),
+            }
+
+    async def select_page(self, *, page_id: int, bring_to_front: bool) -> dict[str, Any]:
+        async with self._lock:
+            await self._start_locked()
+            if self._context is None:
+                raise HTTPException(status_code=500, detail="browser_context_unavailable")
+
+            pages = list(self._context.pages)
+            if page_id < 0 or page_id >= len(pages):
+                raise HTTPException(status_code=404, detail=f"page_id_out_of_range: {page_id}")
+            page = pages[page_id]
+            self._page = page
+            self._install_dialog_listener_locked(page)
+            await self._grant_auto_permissions_locked(page)
+            if bring_to_front:
+                await page.bring_to_front()
+
+            tabs_payload = await self._tabs_payload_locked()
+            return self._cdp_pages_payload(tabs_payload)
+
+    async def close_page(self, *, page_id: int) -> dict[str, Any]:
+        async with self._lock:
+            await self._start_locked()
+            if self._context is None:
+                raise HTTPException(status_code=500, detail="browser_context_unavailable")
+
+            pages = list(self._context.pages)
+            if len(pages) <= 1:
+                raise HTTPException(status_code=400, detail="cannot_close_last_page")
+            if page_id < 0 or page_id >= len(pages):
+                raise HTTPException(status_code=404, detail=f"page_id_out_of_range: {page_id}")
+
+            target = pages[page_id]
+            active_page = self._page
+            await target.close()
+            remaining = list(self._context.pages)
+            if not remaining:
+                self._page = await self._context.new_page()
+            elif active_page is target or active_page not in remaining:
+                fallback = min(page_id, len(remaining) - 1)
+                self._page = remaining[fallback]
+                await self._page.bring_to_front()
+            else:
+                self._page = active_page
+            self._install_dialog_listener_locked(self._page)
+
+            tabs_payload = await self._tabs_payload_locked()
+            return self._cdp_pages_payload(tabs_payload)
 
     async def click(
         self,
@@ -613,10 +1302,7 @@ class BrowserManager:
 
             def _ok_response(**extra: Any) -> dict[str, Any]:
                 payload = {
-                    "clicked": target,
-                    "button": button,
-                    "click_count": clicks,
-                    "url": page.url,
+                    "target": target,
                     "dialog_pending": self._dialog_queue.qsize() > pending_before,
                 }
                 payload.update(extra)
@@ -665,7 +1351,7 @@ class BrowserManager:
             page = self._require_page_locked()
             locator, target = self._resolve_locator(page, uid=uid, selector=selector)
             await locator.hover(timeout=timeout_ms)
-            return {"hovered": target, "url": page.url}
+            return {"target": target}
 
     async def drag(
         self,
@@ -682,14 +1368,13 @@ class BrowserManager:
             source, source_target = self._resolve_locator(page, uid=from_uid, selector=from_selector)
             target, target_target = self._resolve_locator(page, uid=to_uid, selector=to_selector)
             await source.drag_to(target, timeout=timeout_ms)
-            return {"dragged_from": source_target, "dragged_to": target_target, "url": page.url}
+            return {"from": source_target, "to": target_target}
 
-    async def evaluate(self, *, expression: str, arg: Any) -> dict[str, Any]:
+    async def evaluate(self, *, expression: str, arg: Any) -> Any:
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
-            result = await page.evaluate(expression, arg)
-            return {"result": result}
+            return await page.evaluate(expression, arg)
 
     async def type_text(
         self,
@@ -712,17 +1397,41 @@ class BrowserManager:
                 return {
                     "typed": len(text),
                     "target": target,
-                    "clear_before": clear_before,
-                    "url": page.url,
                 }
 
             await page.keyboard.type(text, delay=max(0, delay_ms))
             return {
                 "typed": len(text),
                 "target": "active_element",
-                "clear_before": clear_before,
-                "url": page.url,
             }
+
+    async def type_text_alias(
+        self,
+        *,
+        text: str,
+        submit_key: str | None,
+        delay_ms: int,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            await self._start_locked()
+            page = self._require_page_locked()
+            await page.keyboard.type(text, delay=max(0, int(delay_ms)))
+            submitted = None
+            if isinstance(submit_key, str) and submit_key.strip():
+                submitted = submit_key.strip()
+                await page.keyboard.press(submitted)
+            return {
+                "typed": len(text),
+                "submitKey": submitted,
+            }
+
+    async def fill(self, *, uid: str | None, selector: str | None, value: str, timeout_ms: int) -> dict[str, Any]:
+        async with self._lock:
+            await self._start_locked()
+            page = self._require_page_locked()
+            locator, target = self._resolve_locator(page, uid=uid, selector=selector)
+            await locator.fill(value, timeout=timeout_ms)
+            return {"target": target}
 
     async def fill_form(
         self,
@@ -747,8 +1456,6 @@ class BrowserManager:
             return {
                 "filled_count": len(applied),
                 "submit": submit,
-                "applied": applied,
-                "url": page.url,
             }
 
     async def press_key(
@@ -765,9 +1472,9 @@ class BrowserManager:
             if (uid and uid.strip()) or (selector and selector.strip()):
                 locator, target = self._resolve_locator(page, uid=uid, selector=selector)
                 await locator.press(key, timeout=timeout_ms)
-                return {"pressed": key, "target": target, "url": page.url}
+                return {"pressed": key, "target": target}
             await page.keyboard.press(key)
-            return {"pressed": key, "target": "active_element", "url": page.url}
+            return {"pressed": key, "target": "active_element"}
 
     async def select_option(
         self,
@@ -791,7 +1498,7 @@ class BrowserManager:
                 index=indexes or None,
                 timeout=timeout_ms,
             )
-            return {"target": target, "selected": selected, "url": page.url}
+            return {"target": target, "selected": selected}
 
     async def wait_for(
         self,
@@ -809,7 +1516,7 @@ class BrowserManager:
             if (uid and uid.strip()) or (selector and selector.strip()):
                 locator, target = self._resolve_locator(page, uid=uid, selector=selector)
                 await locator.wait_for(state=state, timeout=timeout_ms)
-                return {"waited_for": "locator", "target": target, "state": state, "url": page.url}
+                return {"matched": target, "state": state}
 
             candidates = [item for item in texts if isinstance(item, str) and item.strip()]
             if candidates:
@@ -832,31 +1539,52 @@ class BrowserManager:
                     """,
                     candidates,
                 )
-                return {"waited_for": "text", "matched": matched, "url": page.url}
+                return {"matched": matched}
 
-            await page.wait_for_timeout(timeout_ms)
-            return {"waited_for": "timeout", "timeout_ms": timeout_ms, "url": page.url}
+            raise HTTPException(status_code=400, detail="wait_for_requires_text_or_target")
 
-    async def snapshot(self, *, max_elements: int, output_path: str | None) -> dict[str, Any]:
+    async def take_snapshot(
+        self,
+        *,
+        verbose: bool,
+        file_path: str | None,
+        preview_lines: int,
+    ) -> list[str]:
+        del file_path, preview_lines
+        return await self.snapshot(
+            mode="a11y",
+            max_elements=200,
+            max_nodes=3000 if verbose else 800,
+            interesting_only=not bool(verbose),
+            preview_lines=0,
+            output_path=None,
+        )
+
+    async def snapshot(
+        self,
+        *,
+        mode: Literal["a11y", "dom"],
+        max_elements: int,
+        max_nodes: int,
+        interesting_only: bool,
+        preview_lines: int,
+        output_path: str | None,
+    ) -> Any:
+        del preview_lines, output_path
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
-            payload = await self._ensure_snapshot_uids(page, max_elements=max_elements)
-            target = _artifact_file_path(
-                BROWSER_ARTIFACT_ROOT,
-                output_path,
-                suffix="json",
-                stem_prefix="snapshot",
+            normalized_mode = "dom" if mode == "dom" else "a11y"
+
+            if normalized_mode == "dom":
+                payload = await self._ensure_snapshot_uids(page, max_elements=max_elements)
+                return payload.get("elements") or []
+
+            return await self._a11y_snapshot_payload(
+                page,
+                interesting_only=interesting_only,
+                max_nodes=max_nodes,
             )
-            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            return {
-                "path": str(target),
-                "url": payload.get("url"),
-                "title": payload.get("title"),
-                "viewport": payload.get("viewport"),
-                "element_count": payload.get("element_count"),
-                "elements": payload.get("elements"),
-            }
 
     async def take_screenshot(
         self,
@@ -868,37 +1596,34 @@ class BrowserManager:
         image_format: Literal["png", "jpeg", "webp"],
         quality: int | None,
     ) -> dict[str, Any]:
+        del output_path
+        suffix_map = {"png": "png", "jpeg": "jpg", "webp": "webp"}
+        mime_map = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
-            suffix = "jpg" if image_format == "jpeg" else image_format
-            target = _artifact_file_path(
-                BROWSER_ARTIFACT_ROOT,
-                output_path,
-                suffix=suffix,
-                stem_prefix="screenshot",
-            )
             kwargs: dict[str, Any] = {
-                "path": str(target),
                 "type": image_format,
             }
             if quality is not None and image_format in {"jpeg", "webp"}:
                 kwargs["quality"] = max(0, min(int(quality), 100))
 
-            target_desc = "page"
             if (uid and uid.strip()) or (selector and selector.strip()):
-                locator, target_desc = self._resolve_locator(page, uid=uid, selector=selector)
-                await locator.screenshot(**kwargs)
+                locator, _ = self._resolve_locator(page, uid=uid, selector=selector)
+                image_bytes = await locator.screenshot(**kwargs)
             else:
                 kwargs["full_page"] = bool(full_page)
-                await page.screenshot(**kwargs)
+                image_bytes = await page.screenshot(**kwargs)
 
+            path = _write_bytes_artifact(
+                "browser_take_screenshot",
+                image_bytes,
+                suffix=suffix_map.get(image_format, "bin"),
+            )
             return {
-                "path": str(target),
-                "target": target_desc,
-                "format": image_format,
-                "full_page": bool(full_page),
-                "url": page.url,
+                "path": path,
+                "mime": mime_map.get(image_format, "application/octet-stream"),
+                "bytes": len(image_bytes),
             }
 
     async def tabs(
@@ -976,9 +1701,7 @@ class BrowserManager:
             elif action != "list":
                 raise HTTPException(status_code=400, detail=f"unsupported_tabs_action: {action}")
 
-            result = await self._tabs_payload_locked()
-            result["action"] = action
-            return result
+            return await self._tabs_payload_locked()
 
     async def mouse_click_xy(
         self,
@@ -999,21 +1722,21 @@ class BrowserManager:
                 click_count=max(1, int(click_count)),
                 delay=max(0, int(delay_ms)),
             )
-            return {"clicked": {"x": float(x), "y": float(y)}, "button": button, "url": page.url}
+            return {"clicked": {"x": float(x), "y": float(y)}}
 
     async def mouse_down(self, *, button: Literal["left", "right", "middle"]) -> dict[str, Any]:
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
             await page.mouse.down(button=button)
-            return {"mouse_down": True, "button": button, "url": page.url}
+            return {"mouse_down": True}
 
     async def mouse_move_xy(self, *, x: float, y: float, steps: int) -> dict[str, Any]:
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
             await page.mouse.move(x=float(x), y=float(y), steps=max(1, int(steps)))
-            return {"moved_to": {"x": float(x), "y": float(y)}, "steps": max(1, int(steps)), "url": page.url}
+            return {"moved_to": {"x": float(x), "y": float(y)}}
 
     async def mouse_drag_xy(
         self,
@@ -1037,9 +1760,6 @@ class BrowserManager:
                     "start": {"x": float(start_x), "y": float(start_y)},
                     "end": {"x": float(end_x), "y": float(end_y)},
                 },
-                "steps": max(1, int(steps)),
-                "button": button,
-                "url": page.url,
             }
 
     async def mouse_up(self, *, button: Literal["left", "right", "middle"]) -> dict[str, Any]:
@@ -1047,14 +1767,14 @@ class BrowserManager:
             await self._start_locked()
             page = self._require_page_locked()
             await page.mouse.up(button=button)
-            return {"mouse_up": True, "button": button, "url": page.url}
+            return {"mouse_up": True}
 
     async def mouse_wheel(self, *, delta_x: float, delta_y: float) -> dict[str, Any]:
         async with self._lock:
             await self._start_locked()
             page = self._require_page_locked()
             await page.mouse.wheel(delta_x=float(delta_x), delta_y=float(delta_y))
-            return {"wheel": {"delta_x": float(delta_x), "delta_y": float(delta_y)}, "url": page.url}
+            return {"wheel": {"delta_x": float(delta_x), "delta_y": float(delta_y)}}
 
     async def file_upload(
         self,
@@ -1080,7 +1800,22 @@ class BrowserManager:
             page = self._require_page_locked()
             locator, target = self._resolve_locator(page, uid=uid, selector=selector)
             await locator.set_input_files(normalized, timeout=timeout_ms)
-            return {"target": target, "files": normalized, "count": len(normalized), "url": page.url}
+            return {"target": target, "files": normalized}
+
+    async def upload_file(
+        self,
+        *,
+        uid: str | None,
+        selector: str | None,
+        file_path: str,
+        timeout_ms: int,
+    ) -> dict[str, Any]:
+        return await self.file_upload(
+            uid=uid,
+            selector=selector,
+            files=[file_path],
+            timeout_ms=timeout_ms,
+        )
 
     async def handle_dialog(
         self,
@@ -1125,11 +1860,7 @@ class BrowserManager:
         async with self._lock:
             was_connected = self._browser is not None
             await self._disconnect_locked()
-            return {
-                "closed": was_connected,
-                "detached_only": True,
-                "note": "Only the CDP session is disconnected. GUI Chrome process keeps running.",
-            }
+            return {"closed": was_connected}
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -1141,9 +1872,8 @@ browser_manager = BrowserManager()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    EXEC_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
-    BROWSER_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    RESULT_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     yield
     await browser_manager.shutdown()
 
@@ -1151,14 +1881,55 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="StewardFlow Sandbox API", version="0.3.0", lifespan=lifespan)
 
 
-class ExecRequest(BaseModel):
+class BashRequest(BaseModel):
     command: str = Field(..., min_length=1, description="Shell command string.")
     cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
     timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
     env: dict[str, str] | None = Field(default=None, description="Extra environment variables.")
-    preview_bytes: int = Field(default=DEFAULT_PREVIEW_BYTES, ge=128, le=65536)
-    capture_limit_bytes: int = Field(default=DEFAULT_CAPTURE_LIMIT_BYTES, ge=1024, le=512 * 1024 * 1024)
     shell_executable: str | None = Field(default=None, description="Optional shell executable path.")
+    persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
+
+
+class GlobRequest(BaseModel):
+    pattern: str = Field(..., min_length=1)
+    path: str = Field(default=".")
+    include_hidden: bool = False
+    cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
+    timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
+    persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
+
+
+class ReadRequest(BaseModel):
+    path: str = Field(..., min_length=1)
+    start_line: int = Field(default=1, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
+    timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
+    persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
+
+
+class GrepRequest(BaseModel):
+    pattern: str = Field(..., min_length=1)
+    path: str = Field(default=".")
+    ignore_case: bool = False
+    recursive: bool = True
+    line_number: bool = True
+    max_count: int | None = Field(default=None, ge=1)
+    cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
+    timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
+    persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
+
+
+class RgRequest(BaseModel):
+    pattern: str = Field(..., min_length=1)
+    path: str = Field(default=".")
+    glob: str | None = None
+    ignore_case: bool = False
+    line_number: bool = True
+    max_count: int | None = Field(default=None, ge=1)
+    cwd: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
+    timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
+    persist_output: bool = Field(default=False, description="Persist stdout/stderr to artifact path even if not truncated.")
 
 
 class BrowserNavigateRequest(BaseModel):
@@ -1170,6 +1941,33 @@ class BrowserNavigateRequest(BaseModel):
 class BrowserNavigateBackRequest(BaseModel):
     timeout_ms: int = Field(default=30000, ge=1, le=300000)
     wait_until: str = Field(default="domcontentloaded")
+
+
+class BrowserNavigatePageRequest(BaseModel):
+    type: Literal["url", "back", "forward", "reload"] = "url"
+    url: str | None = None
+    timeout_ms: int = Field(default=30000, ge=1, le=300000)
+    wait_until: str = Field(default="domcontentloaded")
+
+
+class BrowserListPagesRequest(BaseModel):
+    pass
+
+
+class BrowserNewPageRequest(BaseModel):
+    url: str
+    timeout_ms: int = Field(default=30000, ge=1, le=300000)
+    wait_until: str = Field(default="domcontentloaded")
+    background: bool = False
+
+
+class BrowserSelectPageRequest(BaseModel):
+    pageId: int = Field(ge=0)
+    bringToFront: bool = False
+
+
+class BrowserClosePageRequest(BaseModel):
+    pageId: int = Field(ge=0)
 
 
 class BrowserClickRequest(BaseModel):
@@ -1241,14 +2039,21 @@ class BrowserSelectOptionRequest(BaseModel):
 
 
 class BrowserSnapshotRequest(BaseModel):
+    mode: Literal["a11y", "dom"] = "a11y"
+    interesting_only: bool = True
+    max_nodes: int = Field(default=800, ge=1, le=10000)
+    preview_lines: int = Field(default=40, ge=0, le=200)
     max_elements: int = Field(default=200, ge=1, le=2000)
-    output_path: str | None = None
+
+
+class BrowserTakeSnapshotRequest(BaseModel):
+    verbose: bool = False
+    preview_lines: int = Field(default=40, ge=0, le=200)
 
 
 class BrowserTakeScreenshotRequest(BaseModel):
     uid: str | None = None
     selector: str | None = None
-    output_path: str | None = None
     full_page: bool = True
     format: Literal["png", "jpeg", "webp"] = "png"
     quality: int | None = Field(default=None, ge=0, le=100)
@@ -1260,6 +2065,26 @@ class BrowserTypeRequest(BaseModel):
     selector: str | None = None
     clear_before: bool = False
     delay_ms: int = Field(default=0, ge=0, le=2000)
+    timeout_ms: int = Field(default=30000, ge=1, le=300000)
+
+
+class BrowserTypeTextRequest(BaseModel):
+    text: str
+    submitKey: str | None = None
+    delay_ms: int = Field(default=0, ge=0, le=2000)
+
+
+class BrowserFillRequest(BaseModel):
+    uid: str | None = None
+    selector: str | None = None
+    value: str
+    timeout_ms: int = Field(default=30000, ge=1, le=300000)
+
+
+class BrowserUploadFileRequest(BaseModel):
+    uid: str | None = None
+    selector: str | None = None
+    filePath: str
     timeout_ms: int = Field(default=30000, ge=1, le=300000)
 
 
@@ -1320,135 +2145,112 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/tools/exec")
-async def tools_exec(req: ExecRequest) -> dict[str, Any]:
-    run_id = _new_id("exec")
-    run_dir = (EXEC_ARTIFACT_ROOT / run_id).resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    stdout_file = run_dir / "stdout.txt"
-    stderr_file = run_dir / "stderr.txt"
-    meta_file = run_dir / "meta.json"
-
-    cwd_path = _resolve_cwd(req.cwd)
-    if not cwd_path.exists() or not cwd_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"invalid cwd: {cwd_path}")
-
-    env = os.environ.copy()
-    if req.env:
-        env.update(req.env)
-
-    spawn_kwargs: dict[str, Any] = {}
-    if os.name != "nt":
-        spawn_kwargs["preexec_fn"] = os.setsid
-
-    started_at = _utc_now_iso()
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            req.command,
-            cwd=str(cwd_path),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            executable=req.shell_executable,
-            **spawn_kwargs,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"spawn_failed: {exc}") from exc
-
-    stdout_task = asyncio.create_task(
-        _capture_stream(
-            proc.stdout,
-            stdout_file,
-            preview_bytes=req.preview_bytes,
-            capture_limit_bytes=req.capture_limit_bytes,
-        )
-    )
-    stderr_task = asyncio.create_task(
-        _capture_stream(
-            proc.stderr,
-            stderr_file,
-            preview_bytes=req.preview_bytes,
-            capture_limit_bytes=req.capture_limit_bytes,
-        )
+@app.post("/tools/bash")
+async def tools_bash(req: BashRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    return await _run_subprocess_tool(
+        tool_name="tools_bash",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=req.env,
+        persist_output=req.persist_output,
+        success_exit_codes={0},
+        shell_command=req.command,
+        shell_executable=req.shell_executable,
     )
 
-    timed_out = False
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=req.timeout_ms / 1000.0)
-    except asyncio.TimeoutError:
-        timed_out = True
-        await _kill_process_tree(proc)
-        await proc.wait()
 
-    stdout_info, stderr_info = await asyncio.gather(stdout_task, stderr_task)
-    exit_code = -1 if proc.returncode is None else int(proc.returncode)
-    finished_at = _utc_now_iso()
-
-    meta = {
-        "run_id": run_id,
-        "command": req.command,
-        "cwd": str(cwd_path),
-        "timeout_ms": req.timeout_ms,
-        "timed_out": timed_out,
-        "exit_code": exit_code,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "stdout": {k: v for k, v in stdout_info.items() if k != "preview"},
-        "stderr": {k: v for k, v in stderr_info.items() if k != "preview"},
-    }
-    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "ok": (not timed_out and exit_code == 0),
-        "run_id": run_id,
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "cwd": str(cwd_path),
-        "artifacts": {
-            "run_dir": str(run_dir),
-            "meta_json": str(meta_file),
-            "stdout_path": str(stdout_file),
-            "stderr_path": str(stderr_file),
-        },
-        "stdout_preview": stdout_info["preview"],
-        "stderr_preview": stderr_info["preview"],
-        "stdout_truncated": stdout_info["truncated"],
-        "stderr_truncated": stderr_info["truncated"],
-        "query_hints": [
-            f"rg -n \"pattern\" {stdout_file}",
-            f"sed -n '1,120p' {stdout_file}",
-            f"tail -n 80 {stderr_file}",
-        ],
-    }
+@app.post("/tools/glob")
+async def tools_glob(req: GlobRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    argv = ["rg", "--files"]
+    if req.include_hidden:
+        argv.append("-uu")
+    argv.extend(["-g", req.pattern, "--", req.path])
+    return await _run_subprocess_tool(
+        tool_name="tools_glob",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0, 1},
+        argv=argv,
+    )
 
 
-@app.get("/tools/exec/{run_id}")
-def tools_exec_meta(run_id: str) -> dict[str, Any]:
-    safe_id = run_id.strip()
-    if not safe_id or "/" in safe_id or "\\" in safe_id:
-        raise HTTPException(status_code=400, detail="invalid_run_id")
-    meta_file = (EXEC_ARTIFACT_ROOT / safe_id / "meta.json").resolve()
-    if not meta_file.exists():
-        raise HTTPException(status_code=404, detail="run_id_not_found")
-    return json.loads(meta_file.read_text(encoding="utf-8"))
+@app.post("/tools/read")
+async def tools_read(req: ReadRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    start = max(1, int(req.start_line))
+    end = max(start, int(req.end_line)) if req.end_line is not None else (start + 255)
+    argv = ["sed", "-n", f"{start},{end}p", "--", req.path]
+    return await _run_subprocess_tool(
+        tool_name="tools_read",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0},
+        argv=argv,
+    )
 
 
-async def _attach_permission_marker(payload: dict[str, Any]) -> dict[str, Any]:
-    marker = await browser_manager.permission_marker()
-    enriched = dict(payload)
-    enriched["permission_marker"] = marker
-    enriched["needs_user_authorization"] = bool(marker.get("permission_prompt_detected"))
-    return enriched
+@app.post("/tools/grep")
+async def tools_grep(req: GrepRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    argv = ["grep"]
+    if req.recursive:
+        argv.append("-R")
+    if req.ignore_case:
+        argv.append("-i")
+    if req.line_number:
+        argv.append("-n")
+    if isinstance(req.max_count, int) and req.max_count > 0:
+        argv.extend(["-m", str(int(req.max_count))])
+    argv.extend(["--", req.pattern, req.path])
+    return await _run_subprocess_tool(
+        tool_name="tools_grep",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0, 1},
+        argv=argv,
+    )
+
+
+@app.post("/tools/rg")
+async def tools_rg(req: RgRequest) -> dict[str, Any]:
+    cwd_path = _ensure_cwd(req.cwd)
+    argv = ["rg"]
+    if req.ignore_case:
+        argv.append("-i")
+    if req.line_number:
+        argv.append("-n")
+    if isinstance(req.max_count, int) and req.max_count > 0:
+        argv.extend(["-m", str(int(req.max_count))])
+    if isinstance(req.glob, str) and req.glob.strip():
+        argv.extend(["-g", req.glob.strip()])
+    argv.extend(["--", req.pattern, req.path])
+    return await _run_subprocess_tool(
+        tool_name="tools_rg",
+        cwd_path=cwd_path,
+        timeout_ms=req.timeout_ms,
+        env=None,
+        persist_output=req.persist_output,
+        success_exit_codes={0, 1},
+        argv=argv,
+    )
 
 
 @app.get("/browser/state")
-async def browser_state() -> dict[str, Any]:
-    return await browser_manager.state()
+async def browser_state() -> Any:
+    payload = await browser_manager.state()
+    return _maybe_externalize_payload(payload, tool_name="browser_state")
 
 
 @app.post("/browser/click")
-async def browser_click(req: BrowserClickRequest) -> dict[str, Any]:
+async def browser_click(req: BrowserClickRequest) -> Any:
     payload = await browser_manager.click(
         uid=req.uid,
         selector=req.selector,
@@ -1456,16 +2258,17 @@ async def browser_click(req: BrowserClickRequest) -> dict[str, Any]:
         click_count=req.click_count,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_click")
 
 
 @app.post("/browser/close")
-async def browser_close() -> dict[str, Any]:
-    return await browser_manager.close()
+async def browser_close() -> Any:
+    payload = await browser_manager.close()
+    return _maybe_externalize_payload(payload, tool_name="browser_close")
 
 
 @app.post("/browser/drag")
-async def browser_drag(req: BrowserDragRequest) -> dict[str, Any]:
+async def browser_drag(req: BrowserDragRequest) -> Any:
     payload = await browser_manager.drag(
         from_uid=req.from_uid,
         from_selector=req.from_selector,
@@ -1473,84 +2276,128 @@ async def browser_drag(req: BrowserDragRequest) -> dict[str, Any]:
         to_selector=req.to_selector,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_drag")
 
 
 @app.post("/browser/evaluate")
-async def browser_evaluate(req: BrowserEvaluateRequest) -> dict[str, Any]:
+async def browser_evaluate(req: BrowserEvaluateRequest) -> Any:
     payload = await browser_manager.evaluate(expression=req.expression, arg=req.arg)
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_evaluate")
 
 
 @app.post("/browser/file_upload")
-async def browser_file_upload(req: BrowserFileUploadRequest) -> dict[str, Any]:
+async def browser_file_upload(req: BrowserFileUploadRequest) -> Any:
     payload = await browser_manager.file_upload(
         uid=req.uid,
         selector=req.selector,
         files=req.files,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_file_upload")
 
 
 @app.post("/browser/fill_form")
-async def browser_fill_form(req: BrowserFillFormRequest) -> dict[str, Any]:
+async def browser_fill_form(req: BrowserFillFormRequest) -> Any:
     payload = await browser_manager.fill_form(
         fields=[item.model_dump() for item in req.fields],
         timeout_ms=req.timeout_ms,
         submit=req.submit,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_fill_form")
 
 
 @app.post("/browser/handle_dialog")
-async def browser_handle_dialog(req: BrowserHandleDialogRequest) -> dict[str, Any]:
+async def browser_handle_dialog(req: BrowserHandleDialogRequest) -> Any:
     payload = await browser_manager.handle_dialog(
         action=req.action,
         prompt_text=req.prompt_text,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_handle_dialog")
 
 
 @app.post("/browser/hover")
-async def browser_hover(req: BrowserHoverRequest) -> dict[str, Any]:
+async def browser_hover(req: BrowserHoverRequest) -> Any:
     payload = await browser_manager.hover(uid=req.uid, selector=req.selector, timeout_ms=req.timeout_ms)
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_hover")
 
 
 @app.post("/browser/navigate")
-async def browser_navigate(req: BrowserNavigateRequest) -> dict[str, Any]:
+async def browser_navigate(req: BrowserNavigateRequest) -> Any:
     payload = await browser_manager.navigate(
         url=req.url,
         timeout_ms=req.timeout_ms,
         wait_until=req.wait_until,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_navigate")
+
+
+@app.post("/browser/navigate_page")
+async def browser_navigate_page(req: BrowserNavigatePageRequest) -> Any:
+    payload = await browser_manager.navigate_page(
+        action=req.type,
+        url=req.url,
+        timeout_ms=req.timeout_ms,
+        wait_until=req.wait_until,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_navigate_page")
+
+
+@app.post("/browser/list_pages")
+async def browser_list_pages(req: BrowserListPagesRequest) -> Any:
+    del req
+    payload = await browser_manager.list_pages()
+    return _maybe_externalize_payload(payload, tool_name="browser_list_pages")
+
+
+@app.post("/browser/new_page")
+async def browser_new_page(req: BrowserNewPageRequest) -> Any:
+    payload = await browser_manager.new_page(
+        url=req.url,
+        timeout_ms=req.timeout_ms,
+        wait_until=req.wait_until,
+        background=req.background,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_new_page")
+
+
+@app.post("/browser/select_page")
+async def browser_select_page(req: BrowserSelectPageRequest) -> Any:
+    payload = await browser_manager.select_page(
+        page_id=req.pageId,
+        bring_to_front=req.bringToFront,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_select_page")
+
+
+@app.post("/browser/close_page")
+async def browser_close_page(req: BrowserClosePageRequest) -> Any:
+    payload = await browser_manager.close_page(page_id=req.pageId)
+    return _maybe_externalize_payload(payload, tool_name="browser_close_page")
 
 
 @app.post("/browser/navigate_back")
-async def browser_navigate_back(req: BrowserNavigateBackRequest) -> dict[str, Any]:
+async def browser_navigate_back(req: BrowserNavigateBackRequest) -> Any:
     payload = await browser_manager.navigate_back(
         timeout_ms=req.timeout_ms,
         wait_until=req.wait_until,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_navigate_back")
 
 
 @app.post("/browser/press_key")
-async def browser_press_key(req: BrowserPressKeyRequest) -> dict[str, Any]:
+async def browser_press_key(req: BrowserPressKeyRequest) -> Any:
     payload = await browser_manager.press_key(
         key=req.key,
         uid=req.uid,
         selector=req.selector,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_press_key")
 
 
 @app.post("/browser/select_option")
-async def browser_select_option(req: BrowserSelectOptionRequest) -> dict[str, Any]:
+async def browser_select_option(req: BrowserSelectOptionRequest) -> Any:
     payload = await browser_manager.select_option(
         uid=req.uid,
         selector=req.selector,
@@ -1559,30 +2406,57 @@ async def browser_select_option(req: BrowserSelectOptionRequest) -> dict[str, An
         indexes=req.indexes,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_select_option")
 
 
 @app.post("/browser/snapshot")
-async def browser_snapshot(req: BrowserSnapshotRequest) -> dict[str, Any]:
-    payload = await browser_manager.snapshot(max_elements=req.max_elements, output_path=req.output_path)
-    return await _attach_permission_marker(payload)
+async def browser_snapshot(req: BrowserSnapshotRequest) -> Any:
+    payload = await browser_manager.snapshot(
+        mode=req.mode,
+        max_elements=req.max_elements,
+        max_nodes=req.max_nodes,
+        interesting_only=req.interesting_only,
+        preview_lines=req.preview_lines,
+        output_path=None,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_snapshot")
+
+
+@app.post("/browser/take_snapshot")
+async def browser_take_snapshot(req: BrowserTakeSnapshotRequest) -> Any:
+    payload = await browser_manager.take_snapshot(
+        verbose=req.verbose,
+        file_path=None,
+        preview_lines=req.preview_lines,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_take_snapshot")
 
 
 @app.post("/browser/take_screenshot")
-async def browser_take_screenshot(req: BrowserTakeScreenshotRequest) -> dict[str, Any]:
+async def browser_take_screenshot(req: BrowserTakeScreenshotRequest) -> Any:
     payload = await browser_manager.take_screenshot(
         uid=req.uid,
         selector=req.selector,
-        output_path=req.output_path,
+        output_path=None,
         full_page=req.full_page,
         image_format=req.format,
         quality=req.quality,
     )
-    return await _attach_permission_marker(payload)
+    return payload
+
+
+@app.post("/browser/type_text")
+async def browser_type_text(req: BrowserTypeTextRequest) -> Any:
+    payload = await browser_manager.type_text_alias(
+        text=req.text,
+        submit_key=req.submitKey,
+        delay_ms=req.delay_ms,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_type_text")
 
 
 @app.post("/browser/type")
-async def browser_type(req: BrowserTypeRequest) -> dict[str, Any]:
+async def browser_type(req: BrowserTypeRequest) -> Any:
     payload = await browser_manager.type_text(
         text=req.text,
         uid=req.uid,
@@ -1591,11 +2465,22 @@ async def browser_type(req: BrowserTypeRequest) -> dict[str, Any]:
         delay_ms=req.delay_ms,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_type")
+
+
+@app.post("/browser/fill")
+async def browser_fill(req: BrowserFillRequest) -> Any:
+    payload = await browser_manager.fill(
+        uid=req.uid,
+        selector=req.selector,
+        value=req.value,
+        timeout_ms=req.timeout_ms,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_fill")
 
 
 @app.post("/browser/wait_for")
-async def browser_wait_for(req: BrowserWaitForRequest) -> dict[str, Any]:
+async def browser_wait_for(req: BrowserWaitForRequest) -> Any:
     payload = await browser_manager.wait_for(
         texts=req.text,
         uid=req.uid,
@@ -1603,11 +2488,22 @@ async def browser_wait_for(req: BrowserWaitForRequest) -> dict[str, Any]:
         state=req.state,
         timeout_ms=req.timeout_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_wait_for")
+
+
+@app.post("/browser/upload_file")
+async def browser_upload_file(req: BrowserUploadFileRequest) -> Any:
+    payload = await browser_manager.upload_file(
+        uid=req.uid,
+        selector=req.selector,
+        file_path=req.filePath,
+        timeout_ms=req.timeout_ms,
+    )
+    return _maybe_externalize_payload(payload, tool_name="browser_upload_file")
 
 
 @app.post("/browser/tabs")
-async def browser_tabs(req: BrowserTabsRequest) -> dict[str, Any]:
+async def browser_tabs(req: BrowserTabsRequest) -> Any:
     payload = await browser_manager.tabs(
         action=req.action,
         index=req.index,
@@ -1615,11 +2511,11 @@ async def browser_tabs(req: BrowserTabsRequest) -> dict[str, Any]:
         timeout_ms=req.timeout_ms,
         wait_until=req.wait_until,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_tabs")
 
 
 @app.post("/browser/mouse_click_xy")
-async def browser_mouse_click_xy(req: BrowserMouseClickXYRequest) -> dict[str, Any]:
+async def browser_mouse_click_xy(req: BrowserMouseClickXYRequest) -> Any:
     payload = await browser_manager.mouse_click_xy(
         x=req.x,
         y=req.y,
@@ -1627,17 +2523,17 @@ async def browser_mouse_click_xy(req: BrowserMouseClickXYRequest) -> dict[str, A
         click_count=req.click_count,
         delay_ms=req.delay_ms,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_mouse_click_xy")
 
 
 @app.post("/browser/mouse_down")
-async def browser_mouse_down(req: BrowserMouseDownRequest) -> dict[str, Any]:
+async def browser_mouse_down(req: BrowserMouseDownRequest) -> Any:
     payload = await browser_manager.mouse_down(button=req.button)
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_mouse_down")
 
 
 @app.post("/browser/mouse_drag_xy")
-async def browser_mouse_drag_xy(req: BrowserMouseDragXYRequest) -> dict[str, Any]:
+async def browser_mouse_drag_xy(req: BrowserMouseDragXYRequest) -> Any:
     payload = await browser_manager.mouse_drag_xy(
         start_x=req.start_x,
         start_y=req.start_y,
@@ -1646,25 +2542,25 @@ async def browser_mouse_drag_xy(req: BrowserMouseDragXYRequest) -> dict[str, Any
         steps=req.steps,
         button=req.button,
     )
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_mouse_drag_xy")
 
 
 @app.post("/browser/mouse_move_xy")
-async def browser_mouse_move_xy(req: BrowserMouseMoveXYRequest) -> dict[str, Any]:
+async def browser_mouse_move_xy(req: BrowserMouseMoveXYRequest) -> Any:
     payload = await browser_manager.mouse_move_xy(x=req.x, y=req.y, steps=req.steps)
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_mouse_move_xy")
 
 
 @app.post("/browser/mouse_up")
-async def browser_mouse_up(req: BrowserMouseUpRequest) -> dict[str, Any]:
+async def browser_mouse_up(req: BrowserMouseUpRequest) -> Any:
     payload = await browser_manager.mouse_up(button=req.button)
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_mouse_up")
 
 
 @app.post("/browser/mouse_wheel")
-async def browser_mouse_wheel(req: BrowserMouseWheelRequest) -> dict[str, Any]:
+async def browser_mouse_wheel(req: BrowserMouseWheelRequest) -> Any:
     payload = await browser_manager.mouse_wheel(delta_x=req.delta_x, delta_y=req.delta_y)
-    return await _attach_permission_marker(payload)
+    return _maybe_externalize_payload(payload, tool_name="browser_mouse_wheel")
 
 
 @app.post("/files/upload")
@@ -1673,7 +2569,7 @@ async def files_upload(
     target_path: str | None = Form(default=None),
     destination_dir: str = Form(default="/config/uploads"),
     overwrite: bool = Form(default=True),
-) -> dict[str, Any]:
+) -> Any:
     if target_path and target_path.strip():
         out_path = _resolve_any_path(target_path, UPLOAD_ROOT)
     else:
@@ -1698,13 +2594,11 @@ async def files_upload(
             size += len(chunk)
     await file.close()
 
-    return {
-        "ok": True,
-        "filename": file.filename,
-        "content_type": file.content_type,
+    payload = {
         "path": str(out_path),
         "size_bytes": size,
         "sha256": digest.hexdigest(),
     }
+    return _maybe_externalize_payload(payload, tool_name="files_upload")
 
 

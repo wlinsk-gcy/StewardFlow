@@ -28,7 +28,7 @@ The LLM used in this case is qwen3.5-plus
 
 ## Key Features
 - **ReAct + HITL orchestration**: supports steps that require user confirmation or additional input
-- **Tool system**: docker-sandbox tools only (`exec` / `exec_meta` / `browser_*`)
+- **Tool system**: docker-sandbox tools only (`bash` / `glob` / `read` / `grep` / `rg` / `browser_*`)
 - **Docker sandbox lifecycle**: auto-create on backend startup, auto-delete on backend shutdown
 - **VNC browser view**: UI renders sandbox noVNC URL directly
 - **Real-time WebSocket streaming**: shows execution logs such as Thought/Action/Observation/Final
@@ -93,8 +93,9 @@ Default URL: http://localhost:5173
 
 ## Tool Result Contract
 - Tool results are returned directly from sandbox API; local `tool_result` externalization is removed.
-- For large `exec` output, sandbox API returns previews and artifact file paths (inside sandbox `/config/tool-artifacts`).
-- To inspect large outputs, call `exec` again with targeted commands (`rg/head/tail/sed`) against those artifact files.
+- `bash/glob/read/grep/rg` return `stdout` / `stderr`; read `preview` first.
+- When output is truncated, sandbox API includes `path` (inside `/config/tool-artifacts/results`) for follow-up targeted queries via `bash` + `rg/head/tail/sed`.
+- By default, non-truncated output does not include `path`; set `persist_output=true` to force artifact persistence.
 
 ## API Endpoints
 - `POST /agent/run`: start or continue a task

@@ -41,6 +41,7 @@ RUN apt-get update \
        ripgrep \
        ca-certificates \
        curl \
+       git \
        fonts-dejavu-core \
        fonts-liberation \
        fonts-noto-cjk \
