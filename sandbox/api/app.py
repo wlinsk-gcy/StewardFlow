@@ -12,6 +12,8 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import browser_runtime
+from .browser_state import get_browser_state
 from .tool_runtime import (
     ToolExecutionError,
     ToolInputError,
@@ -33,35 +35,6 @@ RESULT_ARTIFACT_ROOT = Path(
     os.getenv("SANDBOX_RESULT_ARTIFACT_ROOT", "/config/tool-artifacts/results")
 ).resolve()
 
-AUTO_GRANT_PERMISSIONS_ENV = "SANDBOX_BROWSER_AUTO_GRANT_PERMISSIONS"
-AUTO_GRANT_PERMISSIONS_LIST_ENV = "SANDBOX_BROWSER_AUTO_GRANT_PERMISSION_LIST"
-DEFAULT_AUTO_GRANT_PERMISSIONS = [
-    "geolocation",
-    "notifications",
-    "camera",
-    "microphone",
-    "clipboard-read",
-    "clipboard-write",
-]
-SUPPORTED_BROWSER_PERMISSIONS = {
-    "geolocation",
-    "midi",
-    "midi-sysex",
-    "notifications",
-    "camera",
-    "microphone",
-    "background-sync",
-    "ambient-light-sensor",
-    "accelerometer",
-    "gyroscope",
-    "magnetometer",
-    "accessibility-events",
-    "clipboard-read",
-    "clipboard-write",
-    "payment-handler",
-    "persistent-storage",
-    "idle-detection",
-}
 
 
 def _safe_tool_name(value: str) -> str:
@@ -80,6 +53,12 @@ def _artifact_path(tool_name: str, suffix: str) -> Path:
 def _write_text_artifact(tool_name: str, text: str, *, suffix: str = "txt") -> str:
     out_path = _artifact_path(tool_name, suffix=suffix)
     out_path.write_text(text, encoding="utf-8")
+    return str(out_path)
+
+
+def _write_binary_artifact(tool_name: str, data: bytes, *, suffix: str) -> str:
+    out_path = _artifact_path(tool_name, suffix=suffix)
+    out_path.write_bytes(data)
     return str(out_path)
 
 
@@ -102,7 +81,10 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
 async def lifespan(_app: FastAPI):
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     RESULT_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
-    yield
+    try:
+        yield
+    finally:
+        await get_browser_state().shutdown()
 
 
 app = FastAPI(title="StewardFlow Sandbox API", version="0.3.0", lifespan=lifespan)
@@ -148,6 +130,69 @@ class WriteRequest(StrictRequestModel):
     filePath: str = Field(..., min_length=1)
 
 
+class NavigatePageRequest(StrictRequestModel):
+    type: str = Field(default="url")
+    url: str | None = Field(default=None)
+    timeout: int = Field(default=30000, ge=1, le=MAX_TIMEOUT_MS)
+    waitUntil: str = Field(default="domcontentloaded")
+
+
+class TakeSnapshotRequest(StrictRequestModel):
+    verbose: bool = Field(default=False)
+    filePath: str | None = Field(default=None)
+
+
+class ClickRequest(StrictRequestModel):
+    uid: str = Field(..., min_length=1)
+    dblClick: bool = Field(default=False)
+    includeSnapshot: bool = Field(default=False)
+
+
+class FillRequest(StrictRequestModel):
+    uid: str = Field(..., min_length=1)
+    value: str
+    includeSnapshot: bool = Field(default=False)
+
+
+class WaitForRequest(StrictRequestModel):
+    text: list[str] = Field(..., min_length=1)
+    timeout: int = Field(default=30000, ge=1, le=MAX_TIMEOUT_MS)
+
+
+class TakeScreenshotRequest(StrictRequestModel):
+    uid: str | None = Field(default=None)
+    filePath: str | None = Field(default=None)
+    format: str = Field(default="png")
+    fullPage: bool = Field(default=True)
+    quality: int | None = Field(default=None, ge=0, le=100)
+
+
+class PressKeyRequest(StrictRequestModel):
+    key: str = Field(..., min_length=1)
+    includeSnapshot: bool = Field(default=False)
+
+
+class HandleDialogRequest(StrictRequestModel):
+    action: str = Field(default="accept")
+    promptText: str | None = Field(default=None)
+
+
+class HoverRequest(StrictRequestModel):
+    uid: str = Field(..., min_length=1)
+    includeSnapshot: bool = Field(default=False)
+
+
+class UploadFileRequest(StrictRequestModel):
+    uid: str = Field(..., min_length=1)
+    filePath: str = Field(..., min_length=1)
+    includeSnapshot: bool = Field(default=False)
+
+
+class SelectPageRequest(StrictRequestModel):
+    pageId: int = Field(..., ge=0)
+    bringToFront: bool = Field(default=False)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -159,6 +204,10 @@ def _tool_base_dir() -> Path:
 
 def _artifact_writer(tool_name: str, text: str) -> str:
     return _write_text_artifact(tool_name, text, suffix="txt")
+
+
+def _binary_artifact_writer(tool_name: str, data: bytes, suffix: str) -> str:
+    return _write_binary_artifact(tool_name, data, suffix=suffix)
 
 
 def _tool_error_payload(exc: Exception, *, metadata: dict[str, object] | None = None) -> dict[str, Any]:
@@ -290,6 +339,160 @@ async def tools_write(req: WriteRequest) -> dict[str, Any]:
             req.filePath,
             content=req.content,
             base_dir=_tool_base_dir(),
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/navigate_page")
+async def tools_navigate_page(req: NavigatePageRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.navigate_page(
+            state=get_browser_state(),
+            navigation_type=req.type,
+            url=req.url,
+            timeout_ms=req.timeout,
+            wait_until=req.waitUntil,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/take_snapshot")
+async def tools_take_snapshot(req: TakeSnapshotRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.take_snapshot(
+            state=get_browser_state(),
+            verbose=req.verbose,
+            file_path=req.filePath,
+            base_dir=_tool_base_dir(),
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/click")
+async def tools_click(req: ClickRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.click(
+            state=get_browser_state(),
+            uid=req.uid,
+            include_snapshot=req.includeSnapshot,
+            dbl_click=req.dblClick,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/fill")
+async def tools_fill(req: FillRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.fill(
+            state=get_browser_state(),
+            uid=req.uid,
+            value=req.value,
+            include_snapshot=req.includeSnapshot,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/wait_for")
+async def tools_wait_for(req: WaitForRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.wait_for(
+            state=get_browser_state(),
+            text=req.text,
+            timeout_ms=req.timeout,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/take_screenshot")
+async def tools_take_screenshot(req: TakeScreenshotRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.take_screenshot(
+            state=get_browser_state(),
+            uid=req.uid,
+            file_path=req.filePath,
+            image_format=req.format,
+            full_page=req.fullPage,
+            quality=req.quality,
+            base_dir=_tool_base_dir(),
+            binary_artifact_writer=_binary_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/press_key")
+async def tools_press_key(req: PressKeyRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.press_key(
+            state=get_browser_state(),
+            key=req.key,
+            include_snapshot=req.includeSnapshot,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/handle_dialog")
+async def tools_handle_dialog(req: HandleDialogRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.handle_dialog(
+            state=get_browser_state(),
+            action=req.action,
+            prompt_text=req.promptText,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/hover")
+async def tools_hover(req: HoverRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.hover(
+            state=get_browser_state(),
+            uid=req.uid,
+            include_snapshot=req.includeSnapshot,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/upload_file")
+async def tools_upload_file(req: UploadFileRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.upload_file(
+            state=get_browser_state(),
+            uid=req.uid,
+            file_path=req.filePath,
+            include_snapshot=req.includeSnapshot,
+            base_dir=_tool_base_dir(),
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/select_page")
+async def tools_select_page(req: SelectPageRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.select_page(
+            state=get_browser_state(),
+            page_id=req.pageId,
+            bring_to_front=req.bringToFront,
             artifact_writer=_artifact_writer,
         )
     except Exception as exc:

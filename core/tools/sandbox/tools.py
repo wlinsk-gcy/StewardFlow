@@ -1,698 +1,544 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
+import copy
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from core.tools.tool import Tool, ToolRegistry
 
 from .client import DockerSandboxClient
 
+DEFAULT_SANDBOX_IMAGE = "gui-sandbox:dev"
+DEFAULT_HEALTHCHECK_HOST = "127.0.0.1"
+DEFAULT_HTTP_TIMEOUT_SEC = 180
 
-def _tool_schema(
+_WAIT_UNTIL_VALUES = ["load", "domcontentloaded", "networkidle", "commit"]
+_SCREENSHOT_FORMAT_VALUES = ["png", "jpeg", "jpg", "webp"]
+
+
+def _schema(
     *,
-    name: str,
-    description: str,
     properties: dict[str, Any],
     required: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required or [],
-                "additionalProperties": False,
-            },
-            "strict": True,
-        },
+        "type": "object",
+        "additionalProperties": False,
+        "properties": copy.deepcopy(properties),
+        "required": list(required or []),
     }
 
 
-def _json_any_schema() -> dict[str, Any]:
-    return {
-        "anyOf": [
-            {"type": "string"},
-            {"type": "number"},
-            {"type": "integer"},
-            {"type": "boolean"},
-            {"type": "object"},
-            {"type": "array"},
-            {"type": "null"},
-        ]
-    }
+@dataclass(frozen=True)
+class SandboxToolSpec:
+    name: str
+    path: str
+    description: str
+    parameters: dict[str, Any]
+    requires_confirmation: bool = False
 
 
-def _tool_timeout_sec(timeout_ms: int) -> int:
-    return max(5, min(int(timeout_ms / 1000) + 5, 600))
+class SandboxToolRuntime:
+    def __init__(self, sandbox_cfg: dict[str, Any] | None = None) -> None:
+        cfg = dict(sandbox_cfg or {})
+        self.sandbox_id = str(cfg.get("sandbox_id") or "").strip() or None
+        self.default_http_timeout_sec = max(15, int(cfg.get("tool_http_timeout_sec", DEFAULT_HTTP_TIMEOUT_SEC)))
+        self.client = DockerSandboxClient(
+            default_image=str(cfg.get("image") or DEFAULT_SANDBOX_IMAGE),
+            docker_base_url=cfg.get("docker_base_url"),
+            public_host=cfg.get("public_host"),
+            healthcheck_host=str(cfg.get("healthcheck_host") or DEFAULT_HEALTHCHECK_HOST),
+            sandbox_id=self.sandbox_id,
+        )
 
+    def set_sandbox_id(self, sandbox_id: str | None) -> None:
+        self.sandbox_id = str(sandbox_id or "").strip() or None
+        self.client.set_sandbox_id(self.sandbox_id)
 
-class _SandboxTool(Tool):
-    def __init__(self, *, client: DockerSandboxClient, name: str, description: str) -> None:
-        super().__init__()
-        self.client = client
-        self.name = name
-        self.description = description
+    def _http_timeout_for(self, payload: dict[str, Any]) -> int:
+        timeout_sec = self.default_http_timeout_sec
+        raw_timeout = payload.get("timeout")
+        if isinstance(raw_timeout, (int, float)) and raw_timeout > 0:
+            timeout_sec = max(timeout_sec, int(raw_timeout / 1000) + 15)
+        return timeout_sec
 
-    async def _invoke(self, fn, **kwargs) -> str:
-        try:
-            payload = await asyncio.to_thread(fn, **kwargs)
-            return json.dumps(payload, ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps(
-                {
-                    "ok": False,
-                    "data": None,
-                    "artifacts": [],
-                    "error": {
-                        "type": "sandbox_client_error",
-                        "message": str(exc),
-                    },
-                },
-                ensure_ascii=False,
-            )
-
-
-class _CommandTool(_SandboxTool):
-    async def _run_command(
-        self,
-        *,
-        command: str,
-        cwd: str | None,
-        timeout_ms: int,
-        env: dict[str, str] | None = None,
-        shell_executable: str | None = None,
-        persist_output: bool = False,
-    ) -> str:
-        payload = {
-            "command": command,
-            "cwd": cwd,
-            "timeout_ms": max(1, min(int(timeout_ms), 3600000)),
-            "env": env,
-            "shell_executable": shell_executable,
-            "persist_output": bool(persist_output),
-        }
-        return await self._invoke(
+    async def invoke(self, *, path: str, payload: dict[str, Any]) -> Any:
+        timeout_sec = self._http_timeout_for(payload)
+        return await asyncio.to_thread(
             self.client.api_post,
-            sandbox_id=None,
-            path="/tools/bash",
-            payload=payload,
-            timeout_sec=_tool_timeout_sec(timeout_ms),
-        )
-
-
-class BashTool(_CommandTool):
-    def __init__(self, client: DockerSandboxClient) -> None:
-        super().__init__(
-            client=client,
-            name="bash",
-            description="Execute a shell command inside the managed docker sandbox via /tools/bash.",
-        )
-        self.requires_confirmation = True
-
-    async def execute(
-        self,
-        command: str,
-        cwd: str | None = None,
-        timeout_ms: int = 120000,
-        env: dict[str, str] | None = None,
-        shell_executable: str | None = None,
-        persist_output: bool = False,
-        **kwargs,
-    ) -> str:
-        del kwargs
-        return await self._run_command(
-            command=command,
-            cwd=cwd,
-            timeout_ms=timeout_ms,
-            env=env,
-            shell_executable=shell_executable,
-            persist_output=persist_output,
-        )
-
-    def schema(self) -> dict[str, Any]:
-        return _tool_schema(
-            name=self.name,
-            description=self.description,
-            properties={
-                "command": {"type": "string", "description": "Shell command to run inside sandbox."},
-                "cwd": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 120000, "minimum": 1, "maximum": 3600000},
-                "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                "shell_executable": {"type": "string"},
-                "persist_output": {"type": "boolean", "default": False},
-            },
-            required=["command"],
-        )
-
-
-class GlobTool(_SandboxTool):
-    def __init__(self, client: DockerSandboxClient) -> None:
-        super().__init__(
-            client=client,
-            name="glob",
-            description="List files matching a glob pattern using ripgrep file listing.",
-        )
-
-    async def execute(
-        self,
-        pattern: str,
-        path: str = ".",
-        include_hidden: bool = False,
-        cwd: str | None = None,
-        timeout_ms: int = 120000,
-        persist_output: bool = False,
-        **kwargs,
-    ) -> str:
-        del kwargs
-        timeout_ms = max(1, min(int(timeout_ms), 3600000))
-        payload = {
-            "pattern": pattern,
-            "path": path,
-            "include_hidden": bool(include_hidden),
-            "cwd": cwd,
-            "timeout_ms": timeout_ms,
-            "persist_output": bool(persist_output),
-        }
-        return await self._invoke(
-            self.client.api_post,
-            sandbox_id=None,
-            path="/tools/glob",
-            payload=payload,
-            timeout_sec=_tool_timeout_sec(timeout_ms),
-        )
-
-    def schema(self) -> dict[str, Any]:
-        return _tool_schema(
-            name=self.name,
-            description=self.description,
-            properties={
-                "pattern": {"type": "string", "description": "Glob pattern like '*.py'."},
-                "path": {"type": "string", "default": "."},
-                "include_hidden": {"type": "boolean", "default": False},
-                "cwd": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 120000, "minimum": 1, "maximum": 3600000},
-                "persist_output": {"type": "boolean", "default": False},
-            },
-            required=["pattern"],
-        )
-
-
-class ReadTool(_SandboxTool):
-    def __init__(self, client: DockerSandboxClient) -> None:
-        super().__init__(
-            client=client,
-            name="read",
-            description="Read file content by line range (read-only).",
-        )
-
-    async def execute(
-        self,
-        path: str,
-        start_line: int = 1,
-        end_line: int | None = None,
-        cwd: str | None = None,
-        timeout_ms: int = 120000,
-        persist_output: bool = False,
-        **kwargs,
-    ) -> str:
-        del kwargs
-        timeout_ms = max(1, min(int(timeout_ms), 3600000))
-        payload = {
-            "path": path,
-            "start_line": max(1, int(start_line)),
-            "end_line": int(end_line) if end_line is not None else None,
-            "cwd": cwd,
-            "timeout_ms": timeout_ms,
-            "persist_output": bool(persist_output),
-        }
-        return await self._invoke(
-            self.client.api_post,
-            sandbox_id=None,
-            path="/tools/read",
-            payload=payload,
-            timeout_sec=_tool_timeout_sec(timeout_ms),
-        )
-
-    def schema(self) -> dict[str, Any]:
-        return _tool_schema(
-            name=self.name,
-            description=self.description,
-            properties={
-                "path": {"type": "string"},
-                "start_line": {"type": "integer", "default": 1, "minimum": 1},
-                "end_line": {"type": "integer", "minimum": 1},
-                "cwd": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 120000, "minimum": 1, "maximum": 3600000},
-                "persist_output": {"type": "boolean", "default": False},
-            },
-            required=["path"],
-        )
-
-
-class SearchTool(_SandboxTool):
-    def __init__(self, client: DockerSandboxClient) -> None:
-        super().__init__(
-            client=client,
-            name="search",
-            description=(
-                "Search text in files with automatic engine routing. "
-                "Defaults to ripgrep and falls back to grep when needed."
-            ),
-        )
-
-    async def execute(
-        self,
-        pattern: str,
-        path: str = ".",
-        engine_hint: str = "auto",
-        glob: str | None = None,
-        pcre2: bool = False,
-        ignore_case: bool = False,
-        recursive: bool = True,
-        line_number: bool = True,
-        max_count: int | None = None,
-        cwd: str | None = None,
-        timeout_ms: int = 120000,
-        persist_output: bool = False,
-        **kwargs,
-    ) -> str:
-        del kwargs
-        timeout_ms = max(1, min(int(timeout_ms), 3600000))
-        payload = {
-            "pattern": pattern,
-            "path": path,
-            "engine_hint": str(engine_hint or "auto"),
-            "glob": glob,
-            "pcre2": bool(pcre2),
-            "ignore_case": bool(ignore_case),
-            "recursive": bool(recursive),
-            "line_number": bool(line_number),
-            "max_count": int(max_count) if isinstance(max_count, int) else None,
-            "cwd": cwd,
-            "timeout_ms": timeout_ms,
-            "persist_output": bool(persist_output),
-        }
-        return await self._invoke(
-            self.client.api_post,
-            sandbox_id=None,
-            path="/tools/search",
-            payload=payload,
-            timeout_sec=_tool_timeout_sec(timeout_ms),
-        )
-
-    def schema(self) -> dict[str, Any]:
-        return _tool_schema(
-            name=self.name,
-            description=self.description,
-            properties={
-                "pattern": {"type": "string"},
-                "path": {"type": "string", "default": "."},
-                "engine_hint": {"type": "string", "enum": ["auto", "rg", "grep"], "default": "auto"},
-                "glob": {"type": "string"},
-                "pcre2": {"type": "boolean", "default": False},
-                "ignore_case": {"type": "boolean", "default": False},
-                "recursive": {"type": "boolean", "default": True},
-                "line_number": {"type": "boolean", "default": True},
-                "max_count": {"type": "integer", "minimum": 1},
-                "cwd": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 120000, "minimum": 1, "maximum": 3600000},
-                "persist_output": {"type": "boolean", "default": False},
-            },
-            required=["pattern"],
-        )
-
-
-class BrowserPostTool(_SandboxTool):
-    def __init__(
-        self,
-        *,
-        client: DockerSandboxClient,
-        name: str,
-        description: str,
-        path: str,
-        properties: dict[str, Any],
-        required: list[str],
-    ) -> None:
-        super().__init__(client=client, name=name, description=description)
-        self._path = path
-        self._properties = properties
-        self._required = required
-
-    async def execute(self, **kwargs) -> str:
-        payload = dict(kwargs)
-        timeout_sec = 60
-        timeout_ms = payload.get("timeout_ms")
-        if isinstance(timeout_ms, int):
-            timeout_sec = max(5, min(int(timeout_ms / 1000) + 5, 300))
-        return await self._invoke(
-            self.client.api_post,
-            sandbox_id=None,
-            path=self._path,
+            sandbox_id=self.sandbox_id,
+            path=path,
             payload=payload,
             timeout_sec=timeout_sec,
         )
 
-    def schema(self) -> dict[str, Any]:
-        return _tool_schema(
-            name=self.name,
-            description=self.description,
-            properties=self._properties,
-            required=list(self._required),
-        )
-
-
-class SandboxToolRuntime:
-    def __init__(self, client: DockerSandboxClient) -> None:
-        self._client = client
-
-    def set_sandbox_id(self, sandbox_id: str | None) -> None:
-        self._client.set_sandbox_id(sandbox_id)
-
     async def shutdown(self) -> None:
-        await asyncio.to_thread(self._client.close)
+        await asyncio.to_thread(self.client.close)
 
 
-def _register_browser_tool(
-    registry: ToolRegistry,
-    client: DockerSandboxClient,
-    *,
-    name: str,
-    description: str,
-    path: str,
-    properties: dict[str, Any],
-    required: list[str],
-) -> None:
-    registry.register(
-        BrowserPostTool(
-            client=client,
-            name=name,
-            description=description,
-            path=path,
-            properties=properties,
-            required=required,
-        )
-    )
+class SandboxHttpTool(Tool):
+    def __init__(self, runtime: SandboxToolRuntime, spec: SandboxToolSpec) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._spec = spec
+        self.name = spec.name
+        self.description = spec.description
+        self.requires_confirmation = bool(spec.requires_confirmation)
 
-
-def _normalize_tool_profile(raw: Any) -> str:
-    profile = str(raw or "task").strip().lower()
-    if profile in {"task", "debug"}:
-        return profile
-    return "task"
-
-
-def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any]) -> SandboxToolRuntime:
-    client = DockerSandboxClient(
-        default_image=str(sandbox_cfg.get("image", "gui-sandbox:dev")),
-        docker_base_url=sandbox_cfg.get("docker_base_url"),
-        public_host=sandbox_cfg.get("public_host"),
-        healthcheck_host=str(sandbox_cfg.get("healthcheck_host", "127.0.0.1")),
-    )
-    tool_profile = _normalize_tool_profile((sandbox_cfg or {}).get("tool_profile"))
-
-    registry.register(BashTool(client))
-    registry.register(GlobTool(client))
-    registry.register(ReadTool(client))
-    registry.register(SearchTool(client))
-
-    _register_browser_tool(
-        registry,
-        client,
-        name="navigate_page",
-        description="Navigate page by URL/back/forward/reload.",
-        path="/browser/navigate_page",
-        properties={
-            "type": {"type": "string", "enum": ["url", "back", "forward", "reload"], "default": "url"},
-            "url": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-            "wait_until": {
-                "type": "string",
-                "default": "domcontentloaded",
-                "enum": ["load", "domcontentloaded", "networkidle", "commit"],
+    def schema(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": copy.deepcopy(self._spec.parameters),
+                "strict": True,
             },
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="take_snapshot",
-        description="Capture accessibility snapshot and return a11y lines only.",
-        path="/browser/take_snapshot",
-        properties={
-            "verbose": {"type": "boolean", "default": False},
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="wait_for",
-        description="Wait for any target text to appear (text is required).",
-        path="/browser/wait_for",
-        properties={
-            "text": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=["text"],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_tabs",
-        description="Manage browser tabs (list/new/activate/close).",
-        path="/browser/tabs",
-        properties={
-            "action": {"type": "string", "enum": ["list", "new", "activate", "close"], "default": "list"},
-            "index": {"type": "integer", "minimum": 0},
-            "url": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-            "wait_until": {
-                "type": "string",
-                "default": "domcontentloaded",
-                "enum": ["load", "domcontentloaded", "networkidle", "commit"],
-            },
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="fill",
-        description="Fill one input/textarea/select target with value.",
-        path="/browser/fill",
-        properties={
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "value": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=["value"],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="type_text",
-        description="Type text into currently focused element; optionally press submitKey.",
-        path="/browser/type_text",
-        properties={
-            "text": {"type": "string"},
-            "submitKey": {"type": "string"},
-            "delay_ms": {"type": "integer", "default": 0, "minimum": 0, "maximum": 2000},
-        },
-        required=["text"],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="upload_file",
-        description="Upload one file to a file-input target.",
-        path="/browser/upload_file",
-        properties={
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "filePath": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=["filePath"],
-    )
+        }
 
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_click",
-        description="Click an element in the sandbox browser.",
-        path="/browser/click",
-        properties={
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
-            "click_count": {"type": "integer", "default": 1, "minimum": 1, "maximum": 10},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=[],
-    )
-    _register_browser_tool(
-        registry,
-        client,
-        name="browser_press_key",
-        description="Press keyboard key globally or on a target element.",
-        path="/browser/press_key",
-        properties={
-            "key": {"type": "string"},
-            "uid": {"type": "string"},
-            "selector": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-        },
-        required=["key"],
-    )
+    async def execute(self, **kwargs) -> str:
+        result = await self._runtime.invoke(path=self._spec.path, payload=dict(kwargs))
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False)
 
-    if tool_profile == "debug":
-        _register_browser_tool(
-            registry,
-            client,
-            name="list_pages",
-            description="List open pages.",
-            path="/browser/list_pages",
-            properties={},
-            required=[],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="new_page",
-            description="Create a new page and navigate to the provided URL.",
-            path="/browser/new_page",
+
+TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
+    SandboxToolSpec(
+        name="bash",
+        path="/tools/bash",
+        description=(
+            "Execute a shell command inside the sandbox and return merged stdout/stderr. "
+            "Use this for command execution, not for structured file reads or edits when dedicated tools fit better."
+        ),
+        parameters=_schema(
             properties={
-                "url": {"type": "string"},
-                "background": {"type": "boolean", "default": False},
-                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-                "wait_until": {
+                "command": {
                     "type": "string",
-                    "default": "domcontentloaded",
-                    "enum": ["load", "domcontentloaded", "networkidle", "commit"],
+                    "description": "Shell command to execute.",
+                    "minLength": 1,
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Maximum execution time in milliseconds.",
+                    "minimum": 1,
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory, absolute or relative to the sandbox root.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional short note describing the command intent.",
                 },
             },
-            required=["url"],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="select_page",
-            description="Select one page as active by pageId.",
-            path="/browser/select_page",
+            required=["command"],
+        ),
+        requires_confirmation=True,
+    ),
+    SandboxToolSpec(
+        name="glob",
+        path="/tools/glob",
+        description=(
+            "Find files by glob pattern under a sandbox path. "
+            "This is a fast path-discovery tool and returns matching paths only."
+        ),
+        parameters=_schema(
             properties={
-                "pageId": {"type": "integer", "minimum": 0},
-                "bringToFront": {"type": "boolean", "default": False},
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match, such as `**/*.py` or `*.md`.",
+                    "minLength": 1,
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Base path to search from. Defaults to the sandbox working directory.",
+                },
+            },
+            required=["pattern"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="read",
+        path="/tools/read",
+        description=(
+            "Read a file or list a directory from the sandbox. "
+            "Supports offset/limit pagination and returns line-numbered text for files."
+        ),
+        parameters=_schema(
+            properties={
+                "filePath": {
+                    "type": "string",
+                    "description": "Target file or directory path.",
+                    "minLength": 1,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line or entry offset.",
+                    "minimum": 1,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines or directory entries to return.",
+                    "minimum": 1,
+                },
+            },
+            required=["filePath"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="grep",
+        path="/tools/grep",
+        description=(
+            "Search file contents with a regular expression under a sandbox path. "
+            "Returns grouped matches with file paths and line snippets."
+        ),
+        parameters=_schema(
+            properties={
+                "pattern": {
+                    "type": "string",
+                    "description": "Regular expression to search for.",
+                    "minLength": 1,
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search. Defaults to the sandbox working directory.",
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional glob filter to restrict searched files.",
+                },
+            },
+            required=["pattern"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="edit",
+        path="/tools/edit",
+        description=(
+            "Edit a file by replacing `oldString` with `newString`. "
+            "Use `replaceAll` only when the match is intentionally repeated."
+        ),
+        parameters=_schema(
+            properties={
+                "filePath": {
+                    "type": "string",
+                    "description": "Target file path.",
+                    "minLength": 1,
+                },
+                "oldString": {
+                    "type": "string",
+                    "description": "Exact text to replace.",
+                },
+                "newString": {
+                    "type": "string",
+                    "description": "Replacement text.",
+                },
+                "replaceAll": {
+                    "type": "boolean",
+                    "description": "Replace every match instead of requiring a unique match.",
+                },
+            },
+            required=["filePath", "oldString", "newString"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="write",
+        path="/tools/write",
+        description=(
+            "Create or overwrite a file with the provided content. "
+            "Parent directories are created automatically when needed."
+        ),
+        parameters=_schema(
+            properties={
+                "content": {
+                    "type": "string",
+                    "description": "Full file content to write.",
+                },
+                "filePath": {
+                    "type": "string",
+                    "description": "Target file path.",
+                    "minLength": 1,
+                },
+            },
+            required=["content", "filePath"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="navigate_page",
+        path="/tools/navigate_page",
+        description=(
+            "Navigate the active page to a URL, or move the page back, forward, or reload it."
+        ),
+        parameters=_schema(
+            properties={
+                "type": {
+                    "type": "string",
+                    "description": "Navigation mode.",
+                    "enum": ["url", "back", "forward", "reload"],
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Destination URL. Required when `type` is `url`.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Navigation timeout in milliseconds.",
+                    "minimum": 1,
+                },
+                "waitUntil": {
+                    "type": "string",
+                    "description": "Page lifecycle event to wait for before returning.",
+                    "enum": _WAIT_UNTIL_VALUES,
+                },
+            },
+            required=["type"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="take_snapshot",
+        path="/tools/take_snapshot",
+        description=(
+            "Capture a text snapshot of the current page that is optimized for subsequent interactions. "
+            "Use the returned element `uid` values with tools like `click`, `fill`, `hover`, and `upload_file`."
+        ),
+        parameters=_schema(
+            properties={
+                "verbose": {
+                    "type": "boolean",
+                    "description": "Include a more verbose snapshot when true.",
+                },
+                "filePath": {
+                    "type": "string",
+                    "description": "Optional path to persist the snapshot text inside the sandbox.",
+                },
+            }
+        ),
+    ),
+    SandboxToolSpec(
+        name="click",
+        path="/tools/click",
+        description=(
+            "Click an element from the latest page snapshot by `uid`."
+        ),
+        parameters=_schema(
+            properties={
+                "uid": {
+                    "type": "string",
+                    "description": "Element uid from the latest `take_snapshot` result.",
+                    "minLength": 1,
+                },
+                "dblClick": {
+                    "type": "boolean",
+                    "description": "Perform a double click instead of a single click.",
+                },
+                "includeSnapshot": {
+                    "type": "boolean",
+                    "description": "Append a fresh page snapshot to the result.",
+                },
+            },
+            required=["uid"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="fill",
+        path="/tools/fill",
+        description=(
+            "Fill an input, textarea, or select element from the latest page snapshot by `uid`."
+        ),
+        parameters=_schema(
+            properties={
+                "uid": {
+                    "type": "string",
+                    "description": "Element uid from the latest `take_snapshot` result.",
+                    "minLength": 1,
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Text or option value to apply.",
+                },
+                "includeSnapshot": {
+                    "type": "boolean",
+                    "description": "Append a fresh page snapshot to the result.",
+                },
+            },
+            required=["uid", "value"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="wait_for",
+        path="/tools/wait_for",
+        description=(
+            "Wait until any expected text appears on the active page."
+        ),
+        parameters=_schema(
+            properties={
+                "text": {
+                    "type": "array",
+                    "description": "One or more text fragments to wait for.",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Maximum wait time in milliseconds.",
+                    "minimum": 1,
+                },
+            },
+            required=["text"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="take_screenshot",
+        path="/tools/take_screenshot",
+        description=(
+            "Capture a screenshot of the active page or of a snapshot-referenced element."
+        ),
+        parameters=_schema(
+            properties={
+                "uid": {
+                    "type": "string",
+                    "description": "Optional element uid from the latest `take_snapshot` result.",
+                },
+                "filePath": {
+                    "type": "string",
+                    "description": "Optional sandbox path where the screenshot should be written.",
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Image format for the screenshot.",
+                    "enum": _SCREENSHOT_FORMAT_VALUES,
+                },
+                "fullPage": {
+                    "type": "boolean",
+                    "description": "Capture the full page instead of the viewport when supported.",
+                },
+                "quality": {
+                    "type": "integer",
+                    "description": "Image quality for lossy formats such as jpeg or webp.",
+                    "minimum": 0,
+                    "maximum": 100,
+                },
+            }
+        ),
+    ),
+    SandboxToolSpec(
+        name="press_key",
+        path="/tools/press_key",
+        description=(
+            "Press a keyboard key on the active page or focused element."
+        ),
+        parameters=_schema(
+            properties={
+                "key": {
+                    "type": "string",
+                    "description": "Keyboard key name, such as `Enter`, `Tab`, or `Control+A`.",
+                    "minLength": 1,
+                },
+                "includeSnapshot": {
+                    "type": "boolean",
+                    "description": "Append a fresh page snapshot to the result.",
+                },
+            },
+            required=["key"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="handle_dialog",
+        path="/tools/handle_dialog",
+        description=(
+            "Accept or dismiss the currently open JavaScript dialog."
+        ),
+        parameters=_schema(
+            properties={
+                "action": {
+                    "type": "string",
+                    "description": "Dialog action to perform.",
+                    "enum": ["accept", "dismiss"],
+                },
+                "promptText": {
+                    "type": "string",
+                    "description": "Prompt text to submit when accepting a prompt dialog.",
+                },
+            },
+            required=["action"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="hover",
+        path="/tools/hover",
+        description=(
+            "Hover over an element from the latest page snapshot by `uid`."
+        ),
+        parameters=_schema(
+            properties={
+                "uid": {
+                    "type": "string",
+                    "description": "Element uid from the latest `take_snapshot` result.",
+                    "minLength": 1,
+                },
+                "includeSnapshot": {
+                    "type": "boolean",
+                    "description": "Append a fresh page snapshot to the result.",
+                },
+            },
+            required=["uid"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="upload_file",
+        path="/tools/upload_file",
+        description=(
+            "Upload a sandbox file to a file input from the latest page snapshot by `uid`."
+        ),
+        parameters=_schema(
+            properties={
+                "uid": {
+                    "type": "string",
+                    "description": "Element uid from the latest `take_snapshot` result.",
+                    "minLength": 1,
+                },
+                "filePath": {
+                    "type": "string",
+                    "description": "Sandbox file path to upload.",
+                    "minLength": 1,
+                },
+                "includeSnapshot": {
+                    "type": "boolean",
+                    "description": "Append a fresh page snapshot to the result.",
+                },
+            },
+            required=["uid", "filePath"],
+        ),
+    ),
+    SandboxToolSpec(
+        name="select_page",
+        path="/tools/select_page",
+        description=(
+            "Switch the active browser page by `pageId`."
+        ),
+        parameters=_schema(
+            properties={
+                "pageId": {
+                    "type": "integer",
+                    "description": "Stable page identifier returned in browser tool metadata.",
+                    "minimum": 0,
+                },
+                "bringToFront": {
+                    "type": "boolean",
+                    "description": "Bring the selected page to the foreground before returning.",
+                },
             },
             required=["pageId"],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="close_page",
-            description="Close one page by pageId.",
-            path="/browser/close_page",
-            properties={
-                "pageId": {"type": "integer", "minimum": 0},
-            },
-            required=["pageId"],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_handle_dialog",
-            description="Handle next browser dialog by accepting or dismissing it.",
-            path="/browser/handle_dialog",
-            properties={
-                "action": {"type": "string", "enum": ["accept", "dismiss"], "default": "accept"},
-                "prompt_text": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 10000, "minimum": 1, "maximum": 300000},
-            },
-            required=[],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_select_option",
-            description="Select options in a select element.",
-            path="/browser/select_option",
-            properties={
-                "uid": {"type": "string"},
-                "selector": {"type": "string"},
-                "values": {"type": "array", "items": {"type": "string"}},
-                "labels": {"type": "array", "items": {"type": "string"}},
-                "indexes": {"type": "array", "items": {"type": "integer"}},
-                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-            },
-            required=[],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_take_screenshot",
-            description="Take a screenshot of page or target element.",
-            path="/browser/take_screenshot",
-            properties={
-                "uid": {"type": "string"},
-                "selector": {"type": "string"},
-                "full_page": {"type": "boolean", "default": True},
-                "format": {"type": "string", "enum": ["png", "jpeg", "webp"], "default": "png"},
-                "quality": {"type": "integer", "minimum": 0, "maximum": 100},
-            },
-            required=[],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_close",
-            description="Disconnect current CDP browser session (does not kill GUI Chrome process).",
-            path="/browser/close",
-            properties={},
-            required=[],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_drag",
-            description="Drag from one element to another.",
-            path="/browser/drag",
-            properties={
-                "from_uid": {"type": "string"},
-                "from_selector": {"type": "string"},
-                "to_uid": {"type": "string"},
-                "to_selector": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-            },
-            required=[],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_evaluate",
-            description="Evaluate JavaScript expression in current page context.",
-            path="/browser/evaluate",
-            properties={
-                "expression": {"type": "string"},
-                "arg": _json_any_schema(),
-            },
-            required=["expression"],
-        )
-        _register_browser_tool(
-            registry,
-            client,
-            name="browser_hover",
-            description="Hover over an element.",
-            path="/browser/hover",
-            properties={
-                "uid": {"type": "string"},
-                "selector": {"type": "string"},
-                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1, "maximum": 300000},
-            },
-            required=[],
-        )
-    return SandboxToolRuntime(client)
+        ),
+    ),
+)
+
+
+def register_sandbox_tools(registry: ToolRegistry, sandbox_cfg: dict[str, Any] | None = None) -> SandboxToolRuntime:
+    runtime = SandboxToolRuntime(sandbox_cfg)
+    for spec in TOOL_SPECS:
+        registry.register(SandboxHttpTool(runtime, spec))
+    return runtime

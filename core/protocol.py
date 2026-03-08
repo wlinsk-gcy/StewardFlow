@@ -93,6 +93,36 @@ class ActionType(str, Enum):
     ERROR = "error"                    # 发生错误
 
 
+@dataclass
+class HitlTicket:
+    ticket_id: str = field(default_factory=lambda: get_sonyflake("hitl_"))
+    kind: Literal["tool_confirm", "request_input", "request_confirm"] = "tool_confirm"
+    status: Literal["open", "resolved", "cancelled"] = "open"
+    turn_id: Optional[str] = None
+    step_id: Optional[str] = None
+    action_id: Optional[str] = None
+    request_id: Optional[str] = None
+    prompt: Optional[str] = None
+    decision: Optional[Literal["approved", "denied"]] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+
+    def to_dict(self):
+        return {
+            "ticket_id": self.ticket_id,
+            "kind": self.kind,
+            "status": self.status,
+            "turn_id": self.turn_id,
+            "step_id": self.step_id,
+            "action_id": self.action_id,
+            "request_id": self.request_id,
+            "prompt": self.prompt,
+            "decision": self.decision,
+            "created_at": self.created_at.isoformat() if isinstance(self.created_at, datetime) else self.created_at,
+            "resolved_at": self.resolved_at.isoformat() if isinstance(self.resolved_at, datetime) and self.resolved_at else self.resolved_at,
+        }
+
+
 
 
 @dataclass
@@ -110,6 +140,7 @@ class Trace:
     current_turn_id: Optional[str] = None
     current_step_id: Optional[str] = None
     pending_action_id: Optional[str] = None  # 等 confirm 或正在执行的 action
+    hitl_ticket: Optional["HitlTicket"] = None
 
     turns: List["Turn"] = field(default_factory=list)
     max_turns: int = 100
@@ -131,6 +162,7 @@ class Trace:
             "current_turn_id": self.current_turn_id,
             "current_step_id": self.current_step_id,
             "pending_action_id": self.pending_action_id,
+            "hitl_ticket": self.hitl_ticket.to_dict() if self.hitl_ticket else None,
             "turns": [turn.to_dict() for turn in self.turns],
             "max_turns": self.max_turns,
             "token_info": self.token_info,
@@ -280,8 +312,9 @@ class Observation:
     type: ObservationType
 
     ok: bool
-    content: Any  # 建议存 compact 结果（长结果落盘用 ref）
-    full_ref: Optional[Dict[str, Any]] = None  # 可选：{store:"blob", key:"..."}
+    content: str
+    metadata: Optional[Dict[str, Any]] = None
+    full_ref: Optional[Dict[str, Any]] = None  # deprecated
     created_at: datetime = field(default_factory=datetime.utcnow)
 
     def to_dict(self):
@@ -291,6 +324,6 @@ class Observation:
             "type": self.type.value,
             "ok": self.ok,
             "content": self.content,
-            "full_ref": self.full_ref,
+            "metadata": self.metadata,
             "created_at": self.created_at.isoformat(),  # datetime -> str
         }

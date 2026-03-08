@@ -32,21 +32,23 @@ from core.services.sandbox_manager import SandboxManager, SandboxManagerError
 from api.routes import router as agent_router
 from api.sandbox_routes import router as sandbox_router
 from ws.connection_manager import ConnectionManager
-from core.cache_manager import InMemoryCacheManager
+from core.cache_manager import CacheManagerConfig, InMemoryCacheManager
 from core.builder.build import build_system_prompt
-from core.trace_event_logger import configure_trace_event_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+#TODO: debug-only full context snapshot path, remove after context manager refactor.
+DEBUG_FULL_CONTEXT_PATH = PROJECT_ROOT / "data" / "llm_context_full_debug.json"
 
 with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-runtime_cfg = config.get("runtime") or {}
-configure_trace_event_logger(
-    mode=runtime_cfg.get("trace_event_log_mode"),
-    preview_chars=runtime_cfg.get("trace_event_log_preview_chars"),
-    rate_limit_sec=runtime_cfg.get("trace_event_log_rate_limit_sec"),
-)
+
+def _cfg_bool(raw: Any, default: bool) -> bool:
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
 class RequestIdFilter(logging.Filter):
@@ -155,6 +157,19 @@ def _prune_empty_data_dirs(data_root: Path) -> Tuple[int, int]:
     return removed, failed
 
 
+def _clear_debug_full_context_file() -> None:
+    #TODO: debug-only cleanup hook, remove after context manager refactor.
+    for candidate in (
+        DEBUG_FULL_CONTEXT_PATH,
+        DEBUG_FULL_CONTEXT_PATH.with_suffix(DEBUG_FULL_CONTEXT_PATH.suffix + ".tmp"),
+    ):
+        try:
+            if candidate.exists():
+                candidate.unlink()
+        except Exception as exc:
+            logger.warning("Failed to delete debug context file '%s': %s", candidate, exc)
+
+
 def init_load_tools():
     registry = ToolRegistry()
     sandbox_runtime = register_sandbox_tools(registry, config.get("sandbox") or {})
@@ -166,11 +181,11 @@ async def _auto_create_sandbox(app: FastAPI, manager: SandboxManager, sandbox_cf
         manager.create,
         sandbox_id=None,
         image=sandbox_cfg.get("image"),
-        start_url=str(sandbox_cfg.get("start_url", "https://www.baidu.com/")),
+        start_url=str(sandbox_cfg.get("start_url", "chrome://new-tab-page/")),
         display_width=int(sandbox_cfg.get("display_width", 1920)),
         display_height=int(sandbox_cfg.get("display_height", 1080)),
-        user_id=1000,
-        group_id=1000,
+        user_id=0, # 全局root权限
+        group_id=0, # 全局root权限
         keep_app_running=True,
         novnc_port=None,
         vnc_port=None,
@@ -218,6 +233,7 @@ async def lifespan(app: FastAPI):
     tool_registry, browser_manager = init_load_tools()
     # Disable MCP tool injection for now: only local sandbox tools should be available.
     mcp_client = MCPClient(config={"mcpServers": {}})
+    # mcp_client = MCPClient(config="./mcp_config.json")
     mcp_cfg = config.get("mcp") or {}
     startup_wait_seconds = float(mcp_cfg.get("startup_wait_seconds", 2.0))
     mcp_init_task = await start_mcp_initialization(
@@ -233,9 +249,13 @@ async def lifespan(app: FastAPI):
                         tool_registry,
                         ws_manager,
                         config.get("context"))
-    cache_manager = InMemoryCacheManager(model=llm_config.get("model"), api_key=llm_config.get("api_key"),
-                                         base_url=llm_config.get("base_url"),
-                                         build_system_prompt_fn=build_system_prompt)
+    cache_manager = InMemoryCacheManager(
+        model=llm_config.get("model"),
+        api_key=llm_config.get("api_key"),
+        base_url=llm_config.get("base_url"),
+        build_system_prompt_fn=build_system_prompt,
+        config=CacheManagerConfig(),
+    )
 
     task_service = TaskService(
         checkpoint,
@@ -284,6 +304,7 @@ async def lifespan(app: FastAPI):
             logger.warning("Sandbox auto-delete failed during shutdown: %s", exc)
         app_sandbox_manager.close()
     clear_tool_artifacts()
+    _clear_debug_full_context_file()
     data_root = PROJECT_ROOT / "data"
     _close_data_file_handlers(data_root)
     deleted_count, failed_count = _clear_data_files(data_root)

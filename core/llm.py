@@ -13,13 +13,7 @@ from utils.id_util import get_sonyflake
 logger = logging.getLogger(__name__)
 
 THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-ACTION_TYPE_ALIASES = {
-    "done": "finish",
-    "final": "finish",
-    "completed": "finish",
-    "complete": "finish",
-    "confirm": "request_confirm",
-}
+LLM_LOG_PREVIEW_CHARS = 120
 
 
 def _parse_json_dict(s: str) -> Optional[dict]:
@@ -158,64 +152,22 @@ def _extract_first_balanced_json_object(text: str) -> Optional[str]:
 
     return None
 
-JSON_CODEBLOCK_RE = re.compile(
-    r"```(?:json)?\s*([\s\S]*?)\s*```",
-    re.IGNORECASE
-)
-
-def extract_json(s: str) -> str:
-    s = (s or "").strip()
-    # markdown code block
-    m = JSON_CODEBLOCK_RE.search(s)
-    if m:
-        return m.group(1).strip()
-    else:
-        res =  _extract_first_balanced_json_object(s)
-        return res if res else s
-
-
-def _coerce_content_action(content: str) -> tuple[ActionType, str, str]:
-    extracted = extract_json(content)
-    try:
-        parsed = json.loads(extracted)
-    except Exception as e:
-        logger.error(f"parse llm raw content error: {e}")
-        # 兜底：让用户补充输入，避免抛 KeyError/ValueError 打断流程
-        msg = extracted or content or ""
-        raw_ref = json.dumps({"type": "request_input", "message": msg}, ensure_ascii=False)
-        return ActionType.REQUEST_INPUT, msg, raw_ref
-
-    if not isinstance(parsed, dict):
-        # 非对象输出统一收敛为 finish，message 为文本化结果
-        msg = parsed if isinstance(parsed, str) else json.dumps(parsed, ensure_ascii=False)
-        raw_ref = json.dumps({"type": "finish", "message": msg}, ensure_ascii=False)
-        return ActionType.FINISH, msg, raw_ref
-
-    raw_ref = json.dumps(parsed, ensure_ascii=False)
-
-    action_type_raw = parsed.get("type")
-    normalized_type = None
-    if isinstance(action_type_raw, str):
-        candidate = action_type_raw.strip().lower()
-        candidate = ACTION_TYPE_ALIASES.get(candidate, candidate)
-        if candidate in {ActionType.FINISH.value, ActionType.REQUEST_INPUT.value, ActionType.REQUEST_CONFIRM.value}:
-            normalized_type = candidate
-
-    message_raw = parsed.get("message")
-    if isinstance(message_raw, str):
-        message = message_raw.strip()
-    elif message_raw is None:
-        message = ""
-    else:
-        message = json.dumps(message_raw, ensure_ascii=False)
-
-    # 没有 type/message 时，默认视为任务结果并 finish
-    if not normalized_type:
-        normalized_type = ActionType.FINISH.value
+def _coerce_natural_finish(content: str, fallback: str = "") -> str:
+    message = (content or "").strip()
     if not message:
-        message = json.dumps(parsed, ensure_ascii=False)
+        message = (fallback or "").strip()
+    if not message:
+        message = "No actionable result returned."
+    # Keep context history in plain text to avoid re-conditioning the model into
+    # JSON control-style replies on subsequent turns.
+    return message
 
-    return ActionType(normalized_type), message, raw_ref
+
+def _clip_for_log(text: str, *, limit: int = LLM_LOG_PREVIEW_CHARS) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
 
 
 
@@ -261,7 +213,8 @@ class Provider:
         reasoning = (think_match.group(1).strip() if think_match else response.choices[0].message.reasoning_content) if is_thinking else ""
         content = THINK_PATTERN.sub("", content).strip()
         actions = []
-        if response.choices[0].finish_reason == "tool_calls":
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == "tool_calls":
             calls = response.choices[0].message.tool_calls
             step.tool_calls = normalize_tool_calls(response.choices[0].message.tool_calls)
             for call in calls:
@@ -270,31 +223,57 @@ class Provider:
                                 type=ActionType.TOOL,
                                 tool_name=call.function.name,
                                 args=safe_parse_tool_args(call.function.arguments),
-                                requires_confirm=tool.requires_confirmation,
-                                confirm_status="pending" if tool.requires_confirmation else None)
+                                requires_confirm=bool(getattr(tool, "requires_confirmation", False)),
+                                confirm_status="pending" if bool(getattr(tool, "requires_confirmation", False)) else None)
                 actions.append(action)
         else:
-            logger.info(f"llm result: {content}")
-            action_type, action_message, raw = _coerce_content_action(content)
-            logger.info(f"llm output json: {raw}")
+            fallback_text = getattr(response.choices[0].message, "refusal", "") or ""
+            action_message = _coerce_natural_finish(content, fallback=fallback_text)
             actions.append(
                 Action(
                     action_id=get_sonyflake("action_"),
-                    type=action_type,
+                    type=ActionType.FINISH,
                     message=action_message,
-                    full_ref=raw,
+                    full_ref=action_message,
                 )
             )
+            logger.info(
+                "llm_finish finish_reason=%s content_chars=%s preview=%r",
+                finish_reason,
+                len(action_message),
+                _clip_for_log(action_message),
+            )
 
-        if response.usage.prompt_tokens_details:
-            logger.info(f"Cache Tokens: {response.usage.prompt_tokens_details.cached_tokens}")
+        if not actions:
+            action_message = _coerce_natural_finish(content)
+            actions.append(
+                Action(
+                    action_id=get_sonyflake("action_"),
+                    type=ActionType.FINISH,
+                    message=action_message,
+                    full_ref=action_message,
+                )
+            )
+            logger.warning(
+                "llm_no_actions_fallback finish_reason=%s content_chars=%s",
+                finish_reason,
+                len(action_message),
+            )
+
+        cached_tokens = 0
+        if response.usage.prompt_tokens_details and response.usage.prompt_tokens_details.cached_tokens:
+            cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
         logger.info(
-            f"Prompt Token: {response.usage.prompt_tokens}, "
-            f"Completion Token: {response.usage.completion_tokens}, "
-            f"Total Token: {response.usage.total_tokens}"
+            "llm_usage finish_reason=%s actions=%s prompt=%s completion=%s total=%s cache=%s",
+            finish_reason,
+            len(actions),
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+            response.usage.total_tokens,
+            cached_tokens,
         )
         token_info = {
-            "cache_tokens": response.usage.prompt_tokens_details.cached_tokens if (response.usage.prompt_tokens_details and response.usage.prompt_tokens_details.cached_tokens) else 0,
+            "cache_tokens": cached_tokens,
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens

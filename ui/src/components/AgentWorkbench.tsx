@@ -287,6 +287,36 @@ export const AgentWorkbench: React.FC = () => {
       });
     }
 
+    // 3. 处理 Final 收尾消息（尤其是 code-first barrier handoff 场景）
+    if (event_type === "final") {
+      setIsRunning(false);
+      const finalText = typeof data?.content === "string" ? data.content : "";
+      if (finalText.trim()) {
+        setChatHistory((prev) => {
+          const last = prev.length > 0 ? prev[prev.length - 1] : undefined;
+          // Avoid duplicate bubble when answer already rendered the same text.
+          if (
+            last &&
+            last.role === "assistant" &&
+            String(last.content ?? "").trim() === finalText.trim()
+          ) {
+            return prev;
+          }
+          return [
+            ...prev,
+            {
+              id: uuidv4(),
+              role: "assistant",
+              content: finalText,
+              timestamp: new Date(timestamp).getTime(),
+              msg_id: msg_id,
+            },
+          ];
+        });
+      }
+      return;
+    }
+
     if (event_type === "hitl_confirm") {
       setIsRunning(false);
       const promptText = data?.prompt || "Please confirm the action.";
@@ -327,10 +357,11 @@ export const AgentWorkbench: React.FC = () => {
       setIsRunning(false);
     }
 
-    // if (event_type === 'end' || event_type === 'error') {
-    //     // console.log('stop running')
-    //     setIsRunning(false);
-    // }
+    // 4. 统一结束标记（后端可能在不同路径发送 end）
+    if (event_type === "end") {
+      setIsRunning(false);
+      return;
+    }
   }, [refreshNoVncUrl]);
 
   const fetchRegistrySummary = useCallback(async () => {

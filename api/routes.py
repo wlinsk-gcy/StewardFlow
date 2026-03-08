@@ -2,7 +2,6 @@
 FastAPI route definitions for agent endpoints.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -13,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.protocol import AgentStatus, NodeType, RunAgentRequest, RunAgentResponse
 from core.registry_summary import build_registry_summary
-from core.services.task_service import TaskService
+from core.services.task_service import QueueRejectedError, TaskService
 from core.storage.checkpoint import CheckpointStore
 
 logger = logging.getLogger(__name__)
@@ -56,34 +55,45 @@ async def run_agent(
     request: RunAgentRequest,
     task_service: TaskService = Depends(get_task_service),
 ):
-    def callback(task: asyncio.Task) -> None:
-        try:
-            exc = task.exception()
-            if exc:
-                logger.error("Captured exception: %s: %s", type(exc).__name__, exc)
-        except asyncio.CancelledError:
-            logger.warning("run_agent task was cancelled")
+    try:
+        if request.trace_id:
+            trace = await task_service.get_trace(request.trace_id)
+            if not trace:
+                raise HTTPException(status_code=404, detail="Trace not found")
+            if trace.status == AgentStatus.WAITING and trace.node == NodeType.HITL:
+                admission = await task_service.dispatch_hitl(trace, request.task)
+                return RunAgentResponse(
+                    trace_id=request.trace_id,
+                    status="accepted",
+                    message=f"queued wait_ms={admission.wait_ms} queue_length={admission.queue_length}",
+                )
+            if trace.status in {AgentStatus.DONE, AgentStatus.FAILED} and trace.node == NodeType.END:
+                await task_service.new_turn(trace, request.task)
+                admission = await task_service.dispatch_start(trace)
+                return RunAgentResponse(
+                    trace_id=request.trace_id,
+                    status="accepted",
+                    message=f"queued wait_ms={admission.wait_ms} queue_length={admission.queue_length}",
+                )
+            raise HTTPException(status_code=404, detail="Trace status is invalid")
 
-    if request.trace_id:
-        trace = await task_service.get_trace(request.trace_id)
-        if not trace:
-            raise HTTPException(status_code=404, detail="Trace not found")
-        if trace.status == AgentStatus.WAITING and trace.node == NodeType.HITL:
-            hitl_task = asyncio.create_task(task_service.submit_hitl(trace, request.task))
-            hitl_task.add_done_callback(callback)
-            return RunAgentResponse(trace_id=request.trace_id)
-        if trace.status == AgentStatus.DONE and trace.node == NodeType.END:
-            await task_service.new_turn(trace, request.task)
-            task = asyncio.create_task(task_service.start(trace))
-            task.add_done_callback(callback)
-            return RunAgentResponse(trace_id=request.trace_id)
-        raise HTTPException(status_code=404, detail="Trace status is invalid")
-
-    trace = await task_service.initialize(request.task, request.client_id)
-    task = asyncio.create_task(task_service.start(trace))
-    task.add_done_callback(callback)
-
-    return RunAgentResponse(trace_id=trace.trace_id)
+        trace = await task_service.initialize(request.task, request.client_id)
+        admission = await task_service.dispatch_start(trace)
+        return RunAgentResponse(
+            trace_id=trace.trace_id,
+            status="accepted",
+            message=f"queued wait_ms={admission.wait_ms} queue_length={admission.queue_length}",
+        )
+    except QueueRejectedError as exc:
+        trace_id = request.trace_id or "-"
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "reason": exc.reason,
+                "queue_length": exc.queue_length,
+                "wait_ms": exc.wait_ms,
+            },
+        ) from exc
 
 
 @router.get("/health")
@@ -101,58 +111,3 @@ async def registry_summary(
     except Exception as exc:
         logger.exception("Failed to build registry summary: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to load registry summary") from exc
-
-
-@router.get("/context")
-async def context_report(
-    trace_id: str = Query(..., min_length=1),
-    cache_manager: Any = Depends(get_cache_manager),
-) -> dict[str, Any]:
-    report = await cache_manager.context_report(trace_id)
-    if report is None:
-        raise HTTPException(status_code=404, detail="Context not found")
-    return report
-
-
-@router.get("/context/events")
-async def context_events(
-    trace_id: str = Query(..., min_length=1),
-    limit: int = Query(default=200, ge=1, le=5000),
-) -> dict[str, Any]:
-    root = Path(os.getenv("STEWARDFLOW_AUDIT_ROOT", "data/audit")).resolve()
-    events_path = (root / trace_id / "events.jsonl").resolve()
-    try:
-        events_path.relative_to(root)
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid trace_id")
-
-    if not events_path.exists():
-        return {
-            "trace_id": trace_id,
-            "count": 0,
-            "items": [],
-            "path": str(events_path),
-        }
-
-    items: list[dict[str, Any]] = []
-    try:
-        with events_path.open("r", encoding="utf-8") as fp:
-            for line in fp:
-                raw = line.strip()
-                if not raw:
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except Exception:
-                    obj = {"raw": raw}
-                items.append(obj)
-    except Exception as exc:
-        logger.exception("Failed to read audit events for trace=%s: %s", trace_id, exc)
-        raise HTTPException(status_code=500, detail="Failed to read context events") from exc
-
-    return {
-        "trace_id": trace_id,
-        "count": len(items),
-        "items": items[-limit:],
-        "path": str(events_path),
-    }

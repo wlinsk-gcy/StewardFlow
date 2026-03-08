@@ -1,9 +1,10 @@
-"""
+﻿"""
 ReAct execution engine.
 Implements the Thought -> Action -> Observation loop.
 """
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -11,16 +12,14 @@ from typing import Any, Optional
 from .protocol import (
     AgentStatus, NodeType,
     ActionType, Event, EventType,
-    Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus
+    Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus, HitlTicket
 )
 from .llm import Provider
-from .trace_event_logger import bind_event_context, emit_trace_event
-from .tool_raw_store import ToolRawStore
 from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
 from ws.connection_manager import ConnectionManager
-from core.cache_manager import CacheManager
+from core.cache_manager import CacheManager, ContextOverflowUnresolved
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +33,24 @@ HITL_BARRIER_KEYWORDS = (
     "captcha",
     "2fa",
     "two-factor",
+    "otp",
+    "mfa",
     "authenticate",
     "authorization required",
     "access denied",
     "unauthorized",
     "please authorize",
     "please login",
-    "扫码",
+    "scan qr",
+    "qr code",
     "登录",
     "验证码",
+    "短信验证码",
+    "扫码登录",
+    "人机验证",
+    "身份验证",
+    "二次验证",
     "授权",
-    "验证",
 )
 HITL_BARRIER_NEGATIVE_KEYWORDS = (
     "login successful",
@@ -52,35 +58,80 @@ HITL_BARRIER_NEGATIVE_KEYWORDS = (
     "验证通过",
     "授权成功",
 )
-CLI_TOOL_NAMES = {"bash", "glob", "read", "search", "grep", "rg"}
-
-
-def _extract_tool_args_keys(raw_args: Any) -> list[str]:
-    if isinstance(raw_args, dict):
-        return sorted(str(k) for k in raw_args.keys())
-    if isinstance(raw_args, str):
-        try:
-            parsed = json.loads(raw_args)
-        except Exception:
-            return []
-        if isinstance(parsed, dict):
-            return sorted(str(k) for k in parsed.keys())
-    return []
-
-
-def _summarize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summarized: list[dict[str, Any]] = []
-    for tc in tool_calls or []:
-        function = tc.get("function") if isinstance(tc, dict) else {}
-        function = function if isinstance(function, dict) else {}
-        summarized.append(
-            {
-                "tool_call_id": tc.get("id") if isinstance(tc, dict) else None,
-                "name": function.get("name"),
-                "args_keys": _extract_tool_args_keys(function.get("arguments")),
-            }
-        )
-    return summarized
+CONFIRM_TRUE_SET = {
+    "yes", "y", "confirm", "ok", "true", "1",
+    "sure", "approve", "approved", "continue", "go ahead",
+    "是", "好的", "确认", "同意", "继续", "可以", "行", "好",
+}
+CONFIRM_FALSE_SET = {
+    "no", "n", "deny", "denied", "reject", "false", "0", "cancel", "stop",
+    "否", "不", "拒绝", "取消", "停止", "不用", "不要",
+}
+READ_ONLY_BASH_PREFIXES = (
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git rev-parse",
+    "git --version",
+    "ls",
+    "pwd",
+    "whoami",
+    "uname",
+    "cat ",
+    "head ",
+    "tail ",
+    "sed -n",
+    "grep ",
+    "rg ",
+    "find ",
+    "echo ",
+    "printf ",
+    "wc ",
+    "stat ",
+    "file ",
+    "which ",
+)
+BASH_HIGH_RISK_MARKERS = (
+    "rm ",
+    "mv ",
+    "cp ",
+    "chmod ",
+    "chown ",
+    "mkdir ",
+    "rmdir ",
+    "touch ",
+    "ln ",
+    "tee ",
+    "curl ",
+    "wget ",
+    "pip ",
+    "npm ",
+    "pnpm ",
+    "yarn ",
+    "apt ",
+    "yum ",
+    "dnf ",
+    "apk ",
+    "docker ",
+    "kubectl ",
+    "systemctl ",
+    "service ",
+    "shutdown",
+    "reboot",
+    "kill ",
+    "pkill ",
+    "dd ",
+    "mkfs",
+    "mount ",
+    "umount ",
+    "useradd ",
+    "userdel ",
+    "passwd ",
+    "git push",
+)
+BASH_OPERATOR_MARKERS = (">", ">>", "<", "<<", "| tee", "$(", "`")
 
 
 def _serialize_observation_content(payload: Any) -> str:
@@ -91,6 +142,11 @@ def _serialize_observation_content(payload: Any) -> str:
     if isinstance(payload, (dict, list)):
         return json.dumps(payload, ensure_ascii=False)
     return str(payload)
+
+
+
+
+
 
 class TaskExecutor:
     stream: bool = False
@@ -103,7 +159,10 @@ class TaskExecutor:
         self.checkpoint = checkpoint
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
-        self.tool_raw_store = ToolRawStore()
+        self.schema_v2_enabled = True
+        self.hitl_code_first_enabled = True
+        self.obs_card_v1_enabled = True
+        self.toolset_schema_version = "tools_v2" if self.schema_v2_enabled else "tools_v1"
 
     @staticmethod
     def _try_parse_tool_payload(payload: Any) -> Any:
@@ -117,135 +176,123 @@ class TaskExecutor:
         return payload
 
     @staticmethod
-    def _is_cli_envelope(tool_name: str, payload: Any) -> bool:
-        if str(tool_name or "").strip().lower() not in CLI_TOOL_NAMES:
-            return False
-        if not isinstance(payload, dict):
-            return False
-        if not {"ok", "data", "artifacts", "error"}.issubset(payload.keys()):
-            return False
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            return False
-        return ("exit_code" in data) or ("timed_out" in data)
+    def _bash_requires_confirmation(command: str) -> bool:
+        text = str(command or "").strip()
+        if not text:
+            return True
+        lowered = text.lower()
 
-    @staticmethod
-    def _build_cli_summary(tool_name: str, payload: dict[str, Any]) -> str:
-        ok = bool(payload.get("ok"))
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        exit_code = data.get("exit_code")
-        timed_out = bool(data.get("timed_out"))
-        engine_used = data.get("engine_used")
-        fallback_from = data.get("fallback_from")
-        if ok:
-            if engine_used:
-                msg = f"{tool_name} completed, engine={engine_used}, exit_code={exit_code}."
-                if fallback_from:
-                    msg = f"{tool_name} completed, engine={engine_used}, fallback_from={fallback_from}, exit_code={exit_code}."
-                return msg
-            return f"{tool_name} completed, exit_code={exit_code}."
+        if any(marker in lowered for marker in BASH_OPERATOR_MARKERS):
+            return True
+        if any(marker in lowered for marker in BASH_HIGH_RISK_MARKERS):
+            return True
+        if any(token in lowered for token in ("&&", "||", ";")):
+            return True
 
-        err = payload.get("error") if isinstance(payload.get("error"), dict) else {}
-        err_type = err.get("type") if isinstance(err, dict) else None
-        if timed_out:
-            return f"{tool_name} failed, timed_out=true, exit_code={exit_code}."
-        if err_type:
-            return f"{tool_name} failed, type={err_type}, exit_code={exit_code}."
-        return f"{tool_name} failed, exit_code={exit_code}."
+        for prefix in READ_ONLY_BASH_PREFIXES:
+            if lowered.startswith(prefix):
+                return False
+        return True
 
-    def _build_cli_observation_card(
-        self,
-        *,
-        tool_name: str,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
-
-        refs: list[dict[str, Any]] = []
-        preview_chars = 0
-        truncated = False
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                continue
-            ref = {
-                "name": str(artifact.get("name", "")),
-                "kind": str(artifact.get("kind", "text")),
-            }
-            path = artifact.get("path")
-            if isinstance(path, str) and path.strip():
-                ref["path"] = path.strip()
-            by = artifact.get("by")
-            if isinstance(by, str) and by.strip():
-                ref["by"] = by.strip()
-            if artifact.get("truncated") is True:
-                ref["truncated"] = True
-                truncated = True
-            preview_chars += len(str(artifact.get("preview", "")))
-            refs.append(ref)
-
-        facts: dict[str, Any] = {
-            "ok": bool(payload.get("ok")),
-            "timed_out": bool(data.get("timed_out")),
-            "exit_code": data.get("exit_code"),
-            "truncated": truncated,
-            "trim_mode": "none",
-            "raw_chars": preview_chars,
-            "kept_head_chars": preview_chars,
-            "kept_tail_chars": 0,
-        }
-        if "engine_used" in data:
-            facts["engine_used"] = data.get("engine_used")
-        if "fallback_from" in data:
-            facts["fallback_from"] = data.get("fallback_from")
-
-        return {
-            "type": "observation_card_v1",
-            "tool_name": tool_name,
-            "outcome": "success" if bool(payload.get("ok")) else "error",
-            "summary": self._build_cli_summary(tool_name, payload),
-            "facts": facts,
-            "refs": {"artifacts": refs},
-        }
 
     async def run(self, trace: Trace):
-        trace.started_at = datetime.utcnow()
-        turn = [turn for turn in trace.turns if trace.current_turn_id == turn.turn_id][0]
-        step = None
-        if trace.current_step_id:
-            step = [step for step in turn.steps if step.step_id == trace.current_step_id][0]
-        while (turn.index < trace.max_turns and
-               trace.status not in [AgentStatus.DONE, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.PAUSED]):
-            match trace.node:
-                case NodeType.THINK:
-                    if trace.current_step_id:
-                        trace.node = NodeType.DECIDE
-                    else:
-                        step = await self._think(trace, turn)
-                case NodeType.DECIDE:
-                    await self._decide(trace, turn, step)
-                case NodeType.EXECUTE:
-                    await self._action(trace, turn, step)
-                case NodeType.HITL:
-                    await self._hitl(trace, turn, step)
-                case NodeType.OBSERVE:
-                    await self._observe(trace, turn, step)
-                case NodeType.GUARD:
-                    await self._guard(trace, turn, step)
-                case NodeType.END:
-                    await self._end(trace, turn, step)
-                case _:
-                    trace.status = AgentStatus.FAILED
-                    trace.error_message = f"Unknown node: {trace.node}"
-                    self.checkpoint.save(trace)
-                    return
+        turn: Turn | None = None
+        step: Step | None = None
+        try:
+            trace.started_at = datetime.utcnow()
+            turn = [item for item in trace.turns if trace.current_turn_id == item.turn_id][0]
+            if trace.current_step_id:
+                step = [item for item in turn.steps if item.step_id == trace.current_step_id][0]
+            while (
+                turn.index < trace.max_turns
+                and trace.status not in [AgentStatus.DONE, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.PAUSED]
+            ):
+                match trace.node:
+                    case NodeType.THINK:
+                        if trace.current_step_id:
+                            trace.node = NodeType.DECIDE
+                        else:
+                            step = await self._think(trace, turn)
+                    case NodeType.DECIDE:
+                        await self._decide(trace, turn, step)
+                    case NodeType.EXECUTE:
+                        await self._action(trace, turn, step)
+                    case NodeType.HITL:
+                        await self._hitl(trace, turn, step)
+                    case NodeType.OBSERVE:
+                        await self._observe(trace, turn, step)
+                    case NodeType.GUARD:
+                        await self._guard(trace, turn, step)
+                    case NodeType.END:
+                        await self._end(trace, turn, step)
+                    case _:
+                        trace.status = AgentStatus.FAILED
+                        trace.error_message = f"Unknown node: {trace.node}"
+                        self.checkpoint.save(trace)
+                        return
+        except Exception as exc:
+            finished_at = datetime.utcnow()
+            trace.status = AgentStatus.FAILED
+            trace.node = NodeType.END
+            trace.finished_at = finished_at
+            trace.error_count = int(trace.error_count or 0) + 1
+            trace.error_message = f"{type(exc).__name__}: {exc}"
+            trace.pending_action_id = None
+            trace.hitl_ticket = None
+
+            if turn and turn.status != TurnStatus.DONE:
+                turn.status = TurnStatus.FAILED
+                turn.finished_at = finished_at
+            if step and step.status != StepStatus.DONE:
+                step.status = StepStatus.FAILED
+                step.finished_at = finished_at
+            self.checkpoint.save(trace)
+
+            turn_id = turn.turn_id if turn else (trace.current_turn_id or "-")
+            step_id = step.step_id if step else (trace.current_step_id or "-")
+
+
+            error_message = f"执行中断：{type(exc).__name__}: {exc}"
+            try:
+                event = Event(EventType.ERROR, trace.trace_id, step_id, {"content": error_message})
+                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            except Exception:
+                logger.exception("Failed to push error event for trace=%s", trace.trace_id)
+            try:
+                event = Event(EventType.END, trace.trace_id, step_id, {"content": "failed"})
+                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            except Exception:
+                logger.exception("Failed to push end event for trace=%s", trace.trace_id)
+            logger.exception("Executor run failed: trace=%s error=%s", trace.trace_id, exc)
+            return
 
     async def _think(self, trace: Trace, turn: Turn) -> Step:
         step = Step(index=len(turn.steps) + 1)
         turn.steps.append(step)
         trace.current_step_id = step.step_id
         schemas = self.tool_registry.get_all_schemas()
-        messages = await self.cache_manager.build_messages(trace, schemas, toolset_version="tools_v1", response_schema_version="resp_v1")
+        try:
+            messages = await self.cache_manager.build_messages(
+                trace,
+                schemas,
+                toolset_version=self.toolset_schema_version,
+            )
+        except ContextOverflowUnresolved as exc:
+            fallback_action = Action(
+                action_id=get_sonyflake("action_"),
+                type=ActionType.FINISH,
+                message=exc.user_message,
+                full_ref=exc.user_message,
+                status=ActionStatus.DONE,
+            )
+            step.actions = [fallback_action]
+            event = Event(EventType.ANSWER, trace.trace_id, step.step_id, {"content": fallback_action.message})
+            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            event = Event(EventType.END, trace.trace_id, step.step_id, {"content": "done"})
+            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            trace.node = NodeType.DECIDE
+            self.checkpoint.save(trace)
+            return step
         context = {
             "trace": trace,
             "step": step,
@@ -253,7 +300,12 @@ class TaskExecutor:
             "messages": messages,
         }
         reasoning, actions, token_info = self.llm.generate(context)
-        await self.cache_manager.update_calibration(trace.trace_id, token_info["prompt_tokens"], schemas, toolset_version="tools_v1", response_schema_version="resp_v1")
+        await self.cache_manager.update_calibration(
+            trace.trace_id,
+            token_info["prompt_tokens"],
+            schemas,
+            toolset_version=self.toolset_schema_version,
+        )
         if trace.token_info:
             trace.token_info["cache_tokens"] += token_info["cache_tokens"]
             trace.token_info["prompt_tokens"] += token_info["prompt_tokens"]
@@ -267,24 +319,13 @@ class TaskExecutor:
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
         step.thought = reasoning
         step.actions = actions
-        emit_trace_event(
-            logger,
-            event="llm_response",
-            trace_id=trace.trace_id,
-            turn_id=turn.turn_id,
-            step_id=step.step_id,
-            action_count=len(actions or []),
-            tool_calls=_summarize_tool_calls(step.tool_calls or []),
-        )
         action = actions[0]
         # Non-stream mode: emit answer/end events directly.
-        if actions[0].type != ActionType.TOOL:
-            type = actions[0].type
-            if type == ActionType.FINISH:
-                event = Event(EventType.ANSWER, trace.trace_id, step.step_id, {"content": action.message})
-                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-                event = Event(EventType.END, trace.trace_id, step.step_id, {"content": "done"})
-                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+        if action.type == ActionType.FINISH:
+            event = Event(EventType.ANSWER, trace.trace_id, step.step_id, {"content": action.message})
+            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            event = Event(EventType.END, trace.trace_id, step.step_id, {"content": "done"})
+            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
 
         trace.node = NodeType.DECIDE
         self.checkpoint.save(trace)
@@ -316,16 +357,35 @@ class TaskExecutor:
             action = step.actions[-1]
             action.status = ActionStatus.DONE
             trace.node = NodeType.GUARD
-        elif ActionType.REQUEST_INPUT in types or ActionType.REQUEST_CONFIRM in types:
-            # Treat model HITL output as candidate only; GUARD decides final transition.
-            trace.node = NodeType.GUARD
         else:
+            # Code-side policy: keep confirmations for risky bash only.
+            for action in step.actions or []:
+                if action.type != ActionType.TOOL:
+                    continue
+                if not action.requires_confirm:
+                    continue
+                if (action.tool_name or "").strip().lower() != "bash":
+                    continue
+                command = str((action.args or {}).get("command") or "")
+                if not self._bash_requires_confirmation(command): # 针对bash做过滤，避免每一行都need confirm
+                    action.requires_confirm = False
+                    action.confirm_status = None
+
             # Tool execution path: confirm one action at a time if needed.
             action_list = [action for action in step.actions if
                            action.status == ActionStatus.PLANNED and action.requires_confirm]
             if action_list:
                 action = action_list[0]  # Handle one confirmation at a time.
                 trace.pending_action_id = action.action_id
+                trace.hitl_ticket = HitlTicket(
+                    kind="tool_confirm",
+                    status="open",
+                    turn_id=turn.turn_id,
+                    step_id=step.step_id,
+                    action_id=action.action_id,
+                    request_id=action.action_id,
+                    prompt=f"Confirm to execute tool '{action.tool_name}' with args: {action.args}",
+                )
                 action.status = ActionStatus.WAITING_CONFIRM
                 step.status = StepStatus.WAITING_CONFIRM
                 prompt = f"Confirm to execute tool '{action.tool_name}' with args: {action.args}"
@@ -340,6 +400,7 @@ class TaskExecutor:
                 trace.status = AgentStatus.WAITING
                 trace.node = NodeType.HITL
             else:
+                trace.hitl_ticket = None
                 trace.node = NodeType.EXECUTE
                 await self._emit_action_batch(trace, turn, step)
         self.checkpoint.save(trace)
@@ -390,51 +451,21 @@ class TaskExecutor:
             return
 
         barrier_signal = self._detect_hitl_barrier(step)
-        if barrier_signal:
+        if self.hitl_code_first_enabled and barrier_signal:
             action = Action(
                 action_id=get_sonyflake("action_"),
-                type=ActionType.REQUEST_INPUT,
+                type=ActionType.FINISH,
                 message=(
-                    "检测到页面可能需要人工介入（登录/验证码/授权）。"
-                    "请完成页面操作后回复 done 继续。"
+                    "检测到页面可能需要人工操作（登录/验证码/授权）。"
+                    "请先在浏览器完成操作，然后在下一轮输入 done 继续。"
                 ),
-                status=ActionStatus.PLANNED,
+                status=ActionStatus.DONE,
             )
             step.actions.append(action)
-            trace.pending_action_id = action.action_id
-            trace.node = NodeType.HITL
-            emit_trace_event(
-                logger,
-                event="hitl_guard_trigger",
-                trace_id=trace.trace_id,
-                turn_id=turn.turn_id,
-                step_id=step.step_id,
-                reason_code="barrier_detected",
-                barrier_signal=barrier_signal,
-            )
-            self.checkpoint.save(trace)
-            return
+            trace.pending_action_id = None
+            trace.hitl_ticket = None
+            trace.node = NodeType.END
 
-        # If model requested HITL explicitly, GUARD still owns the final transition.
-        model_hitl_action = next(
-            (
-                action for action in reversed(step.actions)
-                if action.type in {ActionType.REQUEST_INPUT, ActionType.REQUEST_CONFIRM}
-                and action.status in {ActionStatus.PLANNED, ActionStatus.WAITING_INPUT, ActionStatus.WAITING_CONFIRM}
-            ),
-            None,
-        )
-        if model_hitl_action is not None:
-            trace.pending_action_id = model_hitl_action.action_id
-            trace.node = NodeType.HITL
-            emit_trace_event(
-                logger,
-                event="hitl_guard_trigger",
-                trace_id=trace.trace_id,
-                turn_id=turn.turn_id,
-                step_id=step.step_id,
-                reason_code="model_hitl_candidate",
-            )
             self.checkpoint.save(trace)
             return
 
@@ -510,6 +541,7 @@ class TaskExecutor:
         trace.current_turn_id = None
         trace.current_step_id = None
         trace.pending_action_id = None
+        trace.hitl_ticket = None
         self.checkpoint.save(trace)
 
 
@@ -521,147 +553,66 @@ class TaskExecutor:
                       turn.turn_id,
                       {"content": final_content})
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-        tool_state = {
-            tc.get("function", {}).get("name")
-            for step in (turn.steps or [])
-            for tc in (step.tool_calls or [])
-            if tc.get("function", {}).get("name")
-        }
-        step_ids = [getattr(s, "step_id", None) for s in (turn.steps or []) if getattr(s, "step_id", None)]
-        await self.cache_manager.finalize_turn_to_result_card(trace_id=trace.trace_id,
-                                                              turn_id=turn.turn_id,
-                                                              user_input=turn.user_input,
-                                                              final_answer=final_content,
-                                                              tool_state=sorted(tool_state),
-                                                              step_ids=step_ids)
+        # tool_state = {
+        #     tc.get("function", {}).get("name")
+        #     for step in (turn.steps or [])
+        #     for tc in (step.tool_calls or [])
+        #     if tc.get("function", {}).get("name")
+        # }
+        # step_ids = [getattr(s, "step_id", None) for s in (turn.steps or []) if getattr(s, "step_id", None)]
+        # await self.cache_manager.finalize_turn_to_result_card(trace_id=trace.trace_id,
+        #                                                       turn_id=turn.turn_id,
+        #                                                       user_input=turn.user_input,
+        #                                                       final_answer=final_content,
+        #                                                       tool_state=sorted(tool_state),
+        #                                                       step_ids=step_ids)
 
 
     async def _execute_tool(self, trace: Trace, turn: Turn, step: Step, action: Action):
         tool_name = action.tool_name
         args = action.args
-        trace_id = trace.trace_id
-        turn_id = turn.turn_id
-        step_id = step.step_id
-        tool_call_id = action.action_id
         observation_id = get_sonyflake("observation_")
         if action.confirm_status == "denied":
-            # User denied this tool action.
             action.status = ActionStatus.DONE
-            denied_payload = {
-                "ok": False,
-                "tool_name": tool_name or "unknown_tool",
-                "error": "The user refuses to perform the current tool call",
-            }
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.HITL_DENIED,
                 ok=True,
-                content=_serialize_observation_content(denied_payload),
+                content="The user refuses to perform the current tool call",
             )
         tool = self.tool_registry.get(tool_name)
         if not tool:
             action.status = ActionStatus.FAILED
-            not_found_payload = {
-                "ok": False,
-                "tool_name": tool_name or "unknown_tool",
-                "error": f"Tool '{tool_name}' not found",
-            }
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_ERROR,
                 ok=False,
-                content=_serialize_observation_content(not_found_payload),
+                content=f"Tool '{tool_name}' not found"
             )
-        started_at = time.perf_counter()
-        tool_ok = False
-        emit_trace_event(
-            logger,
-            event="tool_start",
-            trace_id=trace_id,
-            turn_id=turn_id,
-            step_id=step_id,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name or "unknown_tool",
-            elapsed_ms=0,
-            ok=None,
-        )
         try:
-            with bind_event_context(
-                trace_id=trace_id,
-                turn_id=turn_id,
-                step_id=step_id,
-                tool_call_id=tool_call_id,
-                tool_name=tool_name or "unknown_tool",
-            ):
-                execute_result = await tool.execute(**(args or {}))
-            action.status = ActionStatus.DONE
-            with bind_event_context(
-                trace_id=trace_id,
-                turn_id=turn_id,
-                step_id=step_id,
-                tool_call_id=tool_call_id,
-                tool_name=tool_name or "unknown_tool",
-            ):
-                observation_payload = execute_result
-            observation_full_ref: dict[str, Any] | None = None
+            execute_result = await tool.execute(**(args or {}))
             parsed_payload = self._try_parse_tool_payload(execute_result)
-            if self._is_cli_envelope(tool_name or "unknown_tool", parsed_payload):
-                raw_path = self.tool_raw_store.write(
-                    trace_id=trace_id,
-                    turn_id=turn_id,
-                    step_id=step_id,
-                    action_id=tool_call_id,
-                    tool_name=tool_name or "unknown_tool",
-                    ok=bool(parsed_payload.get("ok")),
-                    payload=parsed_payload,
-                )
-                observation_full_ref = {
-                    "store": "tool_raw_file",
-                    "path": raw_path,
-                }
-                observation_payload = self._build_cli_observation_card(
-                    tool_name=tool_name or "unknown_tool",
-                    payload=parsed_payload,
-                )
-            tool_ok = True
+            action.status = ActionStatus.DONE
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_RESULT,
                 ok=True,
-                content=_serialize_observation_content(observation_payload),
-                full_ref=observation_full_ref,
+                content=parsed_payload.get("output"),
+                metadata=parsed_payload.get("metadata")
             )
         except Exception as e:
             action.status = ActionStatus.FAILED
-            tool_ok = False
-            error_payload = {
-                "ok": False,
-                "tool_name": tool_name or "unknown_tool",
-                "error": f"Tool '{tool_name}' executed error: {str(e)}",
-            }
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_ERROR,
                 ok=False,
-                content=_serialize_observation_content(error_payload),
+                content=f"Tool '{tool_name}' executed error: {str(e)}"
             )
-        finally:
-            elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000))
-            emit_trace_event(
-                logger,
-                event="tool_end",
-                trace_id=trace_id,
-                turn_id=turn_id,
-                step_id=step_id,
-                tool_call_id=tool_call_id,
-                tool_name=tool_name or "unknown_tool",
-                elapsed_ms=elapsed_ms,
-                ok=bool(tool_ok),
-            )
+
 
     async def _request_confirm(self, client_id: str, trace_id: str, turn_id: str, pending_action_id:str, prompt: str,
                                tool_name: Optional[str] = None,
@@ -683,7 +634,13 @@ class TaskExecutor:
     async def execute_hitl(self, trace: Trace, request_input: str):
         turn = [turn for turn in trace.turns if turn.turn_id == trace.current_turn_id][0]
         step = [step for step in turn.steps if step.step_id == trace.current_step_id][0]
-        action = [action for action in step.actions if action.action_id == trace.pending_action_id][0]
+        ticket = trace.hitl_ticket if isinstance(trace.hitl_ticket, HitlTicket) else None
+        pending_action_id = (
+            ticket.action_id
+            if ticket and ticket.status == "open" and ticket.action_id
+            else trace.pending_action_id
+        )
+        action = [action for action in step.actions if action.action_id == pending_action_id][0]
         if action.type == ActionType.REQUEST_INPUT:
             # Current state: AgentStatus.WAITING + NodeType.HITL.
             action.request_input = request_input
@@ -698,6 +655,7 @@ class TaskExecutor:
 
             trace.pending_action_id = None
             trace.current_step_id = None
+            trace.hitl_ticket = None
 
         elif action.type == ActionType.REQUEST_CONFIRM:
             # Handle LLM confirmation response.
@@ -713,12 +671,20 @@ class TaskExecutor:
 
             trace.pending_action_id = None
             trace.current_step_id = None
+            trace.hitl_ticket = None
 
         elif action.type == ActionType.TOOL:
             accepted = self._parse_confirmation(request_input)
             action.confirm_status = "approved" if accepted else "denied"
             action.requires_confirm = False
             action.status = ActionStatus.PLANNED
+            if ticket and ticket.status == "open":
+                ticket.status = "resolved"
+                ticket.resolved_at = datetime.utcnow()
+                ticket.decision = action.confirm_status
+                trace.hitl_ticket = ticket
+            trace.pending_action_id = None
+
 
             trace.status = AgentStatus.RUNNING
             trace.node = NodeType.EXECUTE
@@ -730,5 +696,15 @@ class TaskExecutor:
 
     def _parse_confirmation(self, input_text: str) -> bool:
         normalized = (input_text or "").strip().lower()
-        return normalized in {"yes", "y", "confirm", "ok", "true", "1"}
-
+        if not normalized:
+            return False
+        if normalized in CONFIRM_TRUE_SET:
+            return True
+        if normalized in CONFIRM_FALSE_SET:
+            return False
+        # Prefix fallback keeps behavior predictable for short free-form replies.
+        if normalized.startswith(("yes", "ok", "confirm", "是", "好", "同意", "继续")):
+            return True
+        if normalized.startswith(("no", "deny", "reject", "否", "不", "拒绝", "取消", "停止")):
+            return False
+        return False

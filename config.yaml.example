@@ -4,11 +4,6 @@ app:
 log:
   level: info
 
-runtime:
-  trace_event_log_mode: human
-  trace_event_log_preview_chars: 80
-  trace_event_log_rate_limit_sec: 1
-
 llm:
   model: qwen3.5-plus
   api_key: "replace-with-your-key"
@@ -20,7 +15,7 @@ sandbox:
   public_host: "The server IP where your sandbox is located"
   docker_base_url: "your docker url, like tcp://127.0.0.1:2375"
   healthcheck_host: "The server IP where your sandbox is located"
-  start_url: https://www.baidu.com/
+  start_url: chrome://new-tab-page/
   display_width: 1920
   display_height: 1080
 

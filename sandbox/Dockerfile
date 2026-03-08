@@ -58,7 +58,7 @@ RUN apt-get update \
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
-    'START_URL="${START_URL:-https://www.baidu.com/}"' \
+    'START_URL="${START_URL:-chrome://new-tab-page/}"' \
     'WIDTH="${DISPLAY_WIDTH:-1920}"' \
     'HEIGHT="${DISPLAY_HEIGHT:-1080}"' \
     'CDP_PORT="${CHROME_REMOTE_DEBUGGING_PORT:-9222}"' \
