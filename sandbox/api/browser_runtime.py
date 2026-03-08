@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -15,6 +16,77 @@ from .tool_runtime import (
 TextArtifactWriter = Callable[[str, str], str]
 BinaryArtifactWriter = Callable[[str, bytes, str], str]
 DIALOG_OPEN_WAIT_SECONDS = 1.0
+_WHITESPACE_RE = re.compile(r"\s+")
+_LOGIN_SUCCESS_MARKERS = (
+    "login successful",
+    "logged in",
+    "sign in successful",
+    "signed in",
+    "验证通过",
+    "授权成功",
+)
+_CAPTCHA_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "i'm not a robot",
+    "robot check",
+    "security check",
+    "cloudflare",
+    "人机验证",
+    "滑块",
+)
+_OTP_MARKERS = (
+    "otp",
+    "2fa",
+    "mfa",
+    "two-factor",
+    "two factor",
+    "one-time password",
+    "one time password",
+    "verification code",
+    "sms code",
+    "验证码",
+    "短信验证码",
+    "二次验证",
+)
+_ACCESS_DENIED_MARKERS = (
+    "access denied",
+    "unauthorized",
+    "forbidden",
+    "403",
+    "拒绝访问",
+    "无权访问",
+)
+_LOGIN_TEXT_MARKERS = (
+    "log in",
+    "login",
+    "sign in",
+    "signin",
+    "登录",
+)
+_PASSWORD_MARKERS = (
+    "password",
+    "密码",
+)
+_OAUTH_MARKERS = (
+    "authorize",
+    "authorization required",
+    "grant access",
+    "allow access",
+    "consent",
+    "授权",
+)
+_LOGIN_URL_MARKERS = (
+    "/login",
+    "/signin",
+    "/sign-in",
+    "/auth/login",
+)
+_OAUTH_URL_MARKERS = (
+    "/oauth",
+    "/authorize",
+    "/consent",
+)
 
 
 def _default_artifact_writer(tool_name: str, text: str) -> str:
@@ -34,6 +106,63 @@ def _record_value(record: Any, key: str) -> Any:
     if isinstance(record, dict):
         return record.get(key)
     return getattr(record, key, None)
+
+
+def _normalize_barrier_text(value: Any) -> str:
+    return _WHITESPACE_RE.sub(" ", str(value or "")).strip().lower()
+
+
+def _collect_marker_signals(source: str, haystack: str, markers: tuple[str, ...]) -> list[str]:
+    signals: list[str] = []
+    for marker in markers:
+        normalized = _normalize_barrier_text(marker)
+        if normalized and normalized in haystack:
+            signals.append(f"{source}:{marker}")
+    return signals
+
+
+def _detect_hitl_barrier(*, text: str, url: str = "", title: str = "") -> dict[str, Any] | None:
+    normalized_text = _normalize_barrier_text(text)
+    normalized_url = _normalize_barrier_text(url)
+    normalized_title = _normalize_barrier_text(title)
+
+    if not any((normalized_text, normalized_url, normalized_title)):
+        return None
+    if any(marker in normalized_text for marker in _LOGIN_SUCCESS_MARKERS):
+        return None
+
+    kinds_and_signals = (
+        ("captcha", _collect_marker_signals("text", normalized_text, _CAPTCHA_MARKERS)),
+        ("otp", _collect_marker_signals("text", normalized_text, _OTP_MARKERS)),
+        (
+            "oauth_consent",
+            _collect_marker_signals("text", normalized_text, _OAUTH_MARKERS)
+            + _collect_marker_signals("url", normalized_url, _OAUTH_URL_MARKERS),
+        ),
+        ("access_denied", _collect_marker_signals("text", normalized_text, _ACCESS_DENIED_MARKERS)),
+    )
+    for kind, signals in kinds_and_signals:
+        if signals:
+            return {
+                "required": True,
+                "kind": kind,
+                "confidence": "high" if len(signals) > 1 else "medium",
+                "signals": signals,
+            }
+
+    login_signals = _collect_marker_signals("text", normalized_text, _LOGIN_TEXT_MARKERS)
+    login_signals.extend(_collect_marker_signals("url", normalized_url, _LOGIN_URL_MARKERS))
+    login_signals.extend(_collect_marker_signals("title", normalized_title, _LOGIN_TEXT_MARKERS))
+    password_signals = _collect_marker_signals("text", normalized_text, _PASSWORD_MARKERS)
+    if password_signals and login_signals:
+        signals = login_signals + password_signals
+        return {
+            "required": True,
+            "kind": "login",
+            "confidence": "high",
+            "signals": signals,
+        }
+    return None
 
 
 async def _read_page_title(page: Any) -> str:
@@ -64,6 +193,32 @@ async def _page_summary_metadata(state: Any, *, active_page_id: int) -> dict[str
         "pageCount": len(pages),
         "pages": pages,
     }
+
+
+async def _probe_page_barrier(page: Any) -> dict[str, Any] | None:
+    evaluate = getattr(page, "evaluate", None)
+    payload: dict[str, Any] = {}
+    if callable(evaluate):
+        try:
+            raw = await evaluate(
+                """
+                () => ({
+                    text: document?.body?.innerText || document?.body?.textContent || "",
+                    title: document?.title || "",
+                    url: window?.location?.href || ""
+                })
+                """
+            )
+        except Exception:
+            raw = {}
+        if isinstance(raw, dict):
+            payload = raw
+
+    return _detect_hitl_barrier(
+        text=str(payload.get("text", "")),
+        url=str(payload.get("url") or getattr(page, "url", "")),
+        title=str(payload.get("title", "")) or await _read_page_title(page),
+    )
 
 
 async def _require_selected_page(state: Any) -> tuple[int, Any]:
@@ -100,6 +255,12 @@ async def _format_browser_result(
 ) -> dict[str, Any]:
     payload_metadata = await _page_summary_metadata(state, active_page_id=page_id)
     payload_metadata.update(dict(metadata or {}))
+    if "hitlBarrier" not in payload_metadata:
+        page = (getattr(state, "page_id_to_page", {}) or {}).get(page_id)
+        if page is not None:
+            hitl_barrier = await _probe_page_barrier(page)
+            if hitl_barrier is not None:
+                payload_metadata["hitlBarrier"] = hitl_barrier
     payload_metadata["pageId"] = int(page_id)
     return apply_unified_truncation(
         {
@@ -247,7 +408,7 @@ async def _append_snapshot_output(
     metadata = {
         key: value
         for key, value in snapshot_payload.get("metadata", {}).items()
-        if key in {"documentId", "snapshotId", "uidCount", "path", "outputPath", "truncated"}
+        if key in {"documentId", "snapshotId", "uidCount", "path", "outputPath", "truncated", "hitlBarrier"}
     }
     return f"{output}\n\n{snapshot_payload['output']}", metadata
 
@@ -295,6 +456,13 @@ async def take_snapshot(
         "snapshotId": snapshot_id,
         "uidCount": len(uids),
     }
+    hitl_barrier = _detect_hitl_barrier(
+        text=output,
+        url=str(getattr(page, "url", "")),
+        title=await _read_page_title(page),
+    )
+    if hitl_barrier is not None:
+        metadata["hitlBarrier"] = hitl_barrier
     if file_path:
         target = resolve_path(file_path, base_dir=base_dir)
         target.parent.mkdir(parents=True, exist_ok=True)

@@ -4,8 +4,6 @@ Implements the Thought -> Action -> Observation loop.
 """
 import json
 import logging
-import re
-import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -19,45 +17,10 @@ from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
 from ws.connection_manager import ConnectionManager
-from core.cache_manager import CacheManager, ContextOverflowUnresolved
+from core.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
-HITL_BARRIER_KEYWORDS = (
-    "log in",
-    "login",
-    "sign in",
-    "signin",
-    "verify",
-    "verification",
-    "captcha",
-    "2fa",
-    "two-factor",
-    "otp",
-    "mfa",
-    "authenticate",
-    "authorization required",
-    "access denied",
-    "unauthorized",
-    "please authorize",
-    "please login",
-    "scan qr",
-    "qr code",
-    "登录",
-    "验证码",
-    "短信验证码",
-    "扫码登录",
-    "人机验证",
-    "身份验证",
-    "二次验证",
-    "授权",
-)
-HITL_BARRIER_NEGATIVE_KEYWORDS = (
-    "login successful",
-    "logged in",
-    "验证通过",
-    "授权成功",
-)
 CONFIRM_TRUE_SET = {
     "yes", "y", "confirm", "ok", "true", "1",
     "sure", "approve", "approved", "continue", "go ahead",
@@ -160,7 +123,6 @@ class TaskExecutor:
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
         self.schema_v2_enabled = True
-        self.hitl_code_first_enabled = True
         self.obs_card_v1_enabled = True
         self.toolset_schema_version = "tools_v2" if self.schema_v2_enabled else "tools_v1"
 
@@ -270,29 +232,8 @@ class TaskExecutor:
         step = Step(index=len(turn.steps) + 1)
         turn.steps.append(step)
         trace.current_step_id = step.step_id
-        schemas = self.tool_registry.get_all_schemas()
-        try:
-            messages = await self.cache_manager.build_messages(
-                trace,
-                schemas,
-                toolset_version=self.toolset_schema_version,
-            )
-        except ContextOverflowUnresolved as exc:
-            fallback_action = Action(
-                action_id=get_sonyflake("action_"),
-                type=ActionType.FINISH,
-                message=exc.user_message,
-                full_ref=exc.user_message,
-                status=ActionStatus.DONE,
-            )
-            step.actions = [fallback_action]
-            event = Event(EventType.ANSWER, trace.trace_id, step.step_id, {"content": fallback_action.message})
-            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-            event = Event(EventType.END, trace.trace_id, step.step_id, {"content": "done"})
-            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-            trace.node = NodeType.DECIDE
-            self.checkpoint.save(trace)
-            return step
+        messages = await self.cache_manager.build_messages_v2(trace)
+
         context = {
             "trace": trace,
             "step": step,
@@ -300,12 +241,7 @@ class TaskExecutor:
             "messages": messages,
         }
         reasoning, actions, token_info = self.llm.generate(context)
-        await self.cache_manager.update_calibration(
-            trace.trace_id,
-            token_info["prompt_tokens"],
-            schemas,
-            toolset_version=self.toolset_schema_version,
-        )
+
         if trace.token_info:
             trace.token_info["cache_tokens"] += token_info["cache_tokens"]
             trace.token_info["prompt_tokens"] += token_info["prompt_tokens"]
@@ -430,18 +366,14 @@ class TaskExecutor:
 
         self.checkpoint.save(trace)
 
-    def _detect_hitl_barrier(self, step: Step) -> str | None:
+    def _detect_hitl_barrier(self, step: Step) -> dict[str, Any] | None:
         if not step or not step.observations:
             return None
         for observation in reversed(step.observations):
-            content = _serialize_observation_content(observation.content).lower()
-            if not content:
-                continue
-            if any(noise in content for noise in HITL_BARRIER_NEGATIVE_KEYWORDS):
-                continue
-            for keyword in HITL_BARRIER_KEYWORDS:
-                if keyword in content:
-                    return keyword
+            metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+            barrier = metadata.get("hitlBarrier")
+            if isinstance(barrier, dict) and barrier.get("required") is True:
+                return barrier
         return None
 
     async def _guard(self, trace: Trace, turn: Turn, step: Step):
@@ -451,20 +383,21 @@ class TaskExecutor:
             return
 
         barrier_signal = self._detect_hitl_barrier(step)
-        if self.hitl_code_first_enabled and barrier_signal:
+        if barrier_signal:
             action = Action(
                 action_id=get_sonyflake("action_"),
-                type=ActionType.FINISH,
+                type=ActionType.REQUEST_INPUT,
                 message=(
                     "检测到页面可能需要人工操作（登录/验证码/授权）。"
-                    "请先在浏览器完成操作，然后在下一轮输入 done 继续。"
+                    "请先在浏览器完成操作，然后输入 done，流程将继续执行。"
                 ),
-                status=ActionStatus.DONE,
+                status=ActionStatus.PLANNED,
             )
             step.actions.append(action)
-            trace.pending_action_id = None
+            trace.pending_action_id = action.action_id
+            trace.current_step_id = step.step_id
             trace.hitl_ticket = None
-            trace.node = NodeType.END
+            trace.node = NodeType.HITL
 
             self.checkpoint.save(trace)
             return

@@ -32,23 +32,14 @@ from core.services.sandbox_manager import SandboxManager, SandboxManagerError
 from api.routes import router as agent_router
 from api.sandbox_routes import router as sandbox_router
 from ws.connection_manager import ConnectionManager
-from core.cache_manager import CacheManagerConfig, InMemoryCacheManager
+from core.cache_manager import InMemoryCacheManager
 from core.builder.build import build_system_prompt
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-#TODO: debug-only full context snapshot path, remove after context manager refactor.
-DEBUG_FULL_CONTEXT_PATH = PROJECT_ROOT / "data" / "llm_context_full_debug.json"
 
 with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-
-def _cfg_bool(raw: Any, default: bool) -> bool:
-    if raw is None:
-        return bool(default)
-    if isinstance(raw, bool):
-        return raw
-    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
 class RequestIdFilter(logging.Filter):
@@ -157,19 +148,6 @@ def _prune_empty_data_dirs(data_root: Path) -> Tuple[int, int]:
     return removed, failed
 
 
-def _clear_debug_full_context_file() -> None:
-    #TODO: debug-only cleanup hook, remove after context manager refactor.
-    for candidate in (
-        DEBUG_FULL_CONTEXT_PATH,
-        DEBUG_FULL_CONTEXT_PATH.with_suffix(DEBUG_FULL_CONTEXT_PATH.suffix + ".tmp"),
-    ):
-        try:
-            if candidate.exists():
-                candidate.unlink()
-        except Exception as exc:
-            logger.warning("Failed to delete debug context file '%s': %s", candidate, exc)
-
-
 def init_load_tools():
     registry = ToolRegistry()
     sandbox_runtime = register_sandbox_tools(registry, config.get("sandbox") or {})
@@ -250,11 +228,7 @@ async def lifespan(app: FastAPI):
                         ws_manager,
                         config.get("context"))
     cache_manager = InMemoryCacheManager(
-        model=llm_config.get("model"),
-        api_key=llm_config.get("api_key"),
-        base_url=llm_config.get("base_url"),
         build_system_prompt_fn=build_system_prompt,
-        config=CacheManagerConfig(),
     )
 
     task_service = TaskService(
@@ -304,7 +278,6 @@ async def lifespan(app: FastAPI):
             logger.warning("Sandbox auto-delete failed during shutdown: %s", exc)
         app_sandbox_manager.close()
     clear_tool_artifacts()
-    _clear_debug_full_context_file()
     data_root = PROJECT_ROOT / "data"
     _close_data_file_handlers(data_root)
     deleted_count, failed_count = _clear_data_files(data_root)
