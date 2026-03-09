@@ -108,6 +108,7 @@ export const AgentWorkbench: React.FC = () => {
   const [goal, setGoal] = useState("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [activeTab, setActiveTab] = useState<"runner" | "browser">("runner");
   const [novncUrl, setNovncUrl] = useState<string | null>(null);
@@ -242,6 +243,7 @@ export const AgentWorkbench: React.FC = () => {
     if (event_type === "answer" || event_type === "hitl_request") {
       // console.log('receive answer or hitl_request');
       setIsRunning((prev) => (prev ? false : prev));
+      setIsStopping(false);
       setChatHistory((prev) => {
         const isHitlRequest = event_type === "hitl_request";
         const lastIndex = prev.length - 1;
@@ -290,6 +292,7 @@ export const AgentWorkbench: React.FC = () => {
     // 3. 处理 Final 收尾消息（尤其是 code-first barrier handoff 场景）
     if (event_type === "final") {
       setIsRunning(false);
+      setIsStopping(false);
       const finalText = typeof data?.content === "string" ? data.content : "";
       if (finalText.trim()) {
         setChatHistory((prev) => {
@@ -319,6 +322,7 @@ export const AgentWorkbench: React.FC = () => {
 
     if (event_type === "hitl_confirm") {
       setIsRunning(false);
+      setIsStopping(false);
       const promptText = data?.prompt || "Please confirm the action.";
       const requestId = data?.request_id || uuidv4();
       setPendingConfirm({
@@ -355,11 +359,13 @@ export const AgentWorkbench: React.FC = () => {
       };
       setChatHistory((prev) => [...prev, newMessage]);
       setIsRunning(false);
+      setIsStopping(false);
     }
 
     // 4. 统一结束标记（后端可能在不同路径发送 end）
     if (event_type === "end") {
       setIsRunning(false);
+      setIsStopping(false);
       return;
     }
   }, [refreshNoVncUrl]);
@@ -460,7 +466,7 @@ export const AgentWorkbench: React.FC = () => {
 
   // --- 新增：事件分流处理器 ---
   const handleConfirm = async (decision: "confirm" | "reject") => {
-    if (!traceId || isRunning) return;
+    if (!traceId || isRunning || isStopping) return;
 
     const userMessage: ChatMessage = {
       id: uuidv4(),
@@ -501,7 +507,7 @@ export const AgentWorkbench: React.FC = () => {
   };
 
   const handleRun = async () => {
-    if (!goal.trim() || isRunning || pendingConfirm) return;
+    if (!goal.trim() || isRunning || isStopping || pendingConfirm) return;
 
     // 1. UI 反馈
     const userMessage: ChatMessage = {
@@ -553,6 +559,36 @@ export const AgentWorkbench: React.FC = () => {
     }
   };
 
+  const handleStop = async () => {
+    if (!traceId || !isRunning || pendingConfirm || isStopping) return;
+
+    setIsStopping(true);
+    try {
+      const response = await fetch(`${apiBase}/agent/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trace_id: traceId }),
+      });
+
+      if (!response.ok) throw new Error("Failed to stop agent");
+
+      setIsRunning(false);
+    } catch (e) {
+      console.error(e);
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          id: uuidv4(),
+          role: "assistant",
+          content: "停止当前运行失败，请稍后重试。",
+          timestamp: Date.now(),
+        },
+      ]);
+    } finally {
+      setIsStopping(false);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -565,6 +601,7 @@ export const AgentWorkbench: React.FC = () => {
     setSteps([]);
     setPendingConfirm(null);
     setIsRunning(false);
+    setIsStopping(false);
     setGoal("");
     setTokenInfo(null);
     setTraceId(null);
@@ -575,6 +612,10 @@ export const AgentWorkbench: React.FC = () => {
   const builtInCount = registrySummary?.counts.built_in_tools ?? 0;
   const mcpServerCount = registrySummary?.counts.mcp_servers ?? 0;
   const mcpToolCount = registrySummary?.counts.mcp_tools ?? 0;
+  const showStopButton = isRunning && !pendingConfirm;
+  const isAwaitingTraceId = showStopButton && !traceId;
+  const sendDisabled = isRunning || isStopping || Boolean(pendingConfirm) || !goal.trim();
+  const stopDisabled = isStopping || isAwaitingTraceId;
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
@@ -932,21 +973,29 @@ export const AgentWorkbench: React.FC = () => {
                   value={goal}
                   onChange={(e) => setGoal(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  disabled={isRunning || Boolean(pendingConfirm)}
+                  disabled={isRunning || isStopping || Boolean(pendingConfirm)}
                 />
                 <button
-                  onClick={handleRun}
-                  disabled={
-                    isRunning || Boolean(pendingConfirm) || !goal.trim()
-                  }
+                  onClick={showStopButton ? handleStop : handleRun}
+                  disabled={showStopButton ? stopDisabled : sendDisabled}
                   className={`absolute right-3 bottom-3 rounded-xl p-3 transition-all ${
-                    isRunning || Boolean(pendingConfirm) || !goal.trim()
-                      ? "bg-gray-100 text-gray-400"
-                      : "bg-indigo-600 text-white shadow-lg shadow-indigo-200 hover:bg-indigo-700 active:scale-95"
+                    showStopButton
+                      ? isAwaitingTraceId
+                        ? "bg-gray-100 text-gray-400"
+                        : stopDisabled
+                        ? "bg-rose-100 text-rose-300"
+                        : "bg-rose-600 text-white shadow-lg shadow-rose-200 hover:bg-rose-700 active:scale-95"
+                      : sendDisabled
+                        ? "bg-gray-100 text-gray-400"
+                        : "bg-indigo-600 text-white shadow-lg shadow-indigo-200 hover:bg-indigo-700 active:scale-95"
                   }`}
                 >
-                  {isRunning ? (
-                    <Loader2 className="h-5 w-5 animate-spin" />
+                  {showStopButton ? (
+                    isAwaitingTraceId || isStopping ? (
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    ) : (
+                      <X className="h-5 w-5" />
+                    )
                   ) : (
                     <Send className="h-5 w-5" />
                   )}

@@ -2,6 +2,7 @@
 ReAct execution engine.
 Implements the Thought -> Action -> Observation loop.
 """
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -156,6 +157,44 @@ class TaskExecutor:
                 return False
         return True
 
+    @staticmethod
+    def _cancel_pending_actions(step: Step | None) -> None:
+        if not step:
+            return
+        cancellable_statuses = {
+            ActionStatus.PLANNED,
+            ActionStatus.RUNNING,
+            ActionStatus.WAITING_CONFIRM,
+            ActionStatus.WAITING_INPUT,
+        }
+        for action in step.actions or []:
+            if action.status in cancellable_statuses:
+                action.status = ActionStatus.CANCELLED
+
+    def _mark_trace_cancelled(self, trace: Trace, turn: Turn | None, step: Step | None) -> str:
+        finished_at = datetime.utcnow()
+        step_id = step.step_id if step else (trace.current_step_id or "-")
+
+        trace.status = AgentStatus.CANCELLED
+        trace.node = NodeType.END
+        trace.finished_at = finished_at
+        trace.error_message = None
+        trace.pending_action_id = None
+        trace.hitl_ticket = None
+        trace.current_step_id = None
+        trace.current_turn_id = None
+
+        if turn and turn.status not in {TurnStatus.DONE, TurnStatus.FAILED, TurnStatus.CANCELLED}:
+            turn.status = TurnStatus.CANCELLED
+            turn.finished_at = finished_at
+        if step and step.status not in {StepStatus.DONE, StepStatus.FAILED, StepStatus.CANCELLED}:
+            step.status = StepStatus.CANCELLED
+            step.finished_at = finished_at
+            self._cancel_pending_actions(step)
+
+        self.checkpoint.save(trace)
+        return step_id
+
 
     async def run(self, trace: Trace):
         turn: Turn | None = None
@@ -167,7 +206,13 @@ class TaskExecutor:
                 step = [item for item in turn.steps if item.step_id == trace.current_step_id][0]
             while (
                 turn.index < trace.max_turns
-                and trace.status not in [AgentStatus.DONE, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.PAUSED]
+                and trace.status not in [
+                    AgentStatus.DONE,
+                    AgentStatus.FAILED,
+                    AgentStatus.CANCELLED,
+                    AgentStatus.WAITING,
+                    AgentStatus.PAUSED,
+                ]
             ):
                 match trace.node:
                     case NodeType.THINK:
@@ -190,6 +235,15 @@ class TaskExecutor:
                         trace.error_message = f"Unknown node: {trace.node}"
                         self.checkpoint.save(trace)
                         return
+        except asyncio.CancelledError:
+            step_id = self._mark_trace_cancelled(trace, turn, step)
+            try:
+                event = Event(EventType.END, trace.trace_id, step_id, {"content": "cancelled"})
+                await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+            except Exception:
+                logger.exception("Failed to push cancel event for trace=%s", trace.trace_id)
+            logger.info("Executor run cancelled: trace=%s step=%s", trace.trace_id, step_id)
+            return
         except Exception as exc:
             finished_at = datetime.utcnow()
             trace.status = AgentStatus.FAILED
@@ -230,7 +284,7 @@ class TaskExecutor:
         step = Step(index=len(turn.steps) + 1)
         turn.steps.append(step)
         trace.current_step_id = step.step_id
-        messages = await self.cache_manager.build_messages_v2(trace)
+        messages = await self.cache_manager.build_messages(trace)
 
         context = {
             "trace": trace,
@@ -506,6 +560,9 @@ class TaskExecutor:
                 content=parsed_payload.get("output"),
                 metadata=parsed_payload.get("metadata")
             )
+        except asyncio.CancelledError:
+            action.status = ActionStatus.CANCELLED
+            raise
         except Exception as e:
             action.status = ActionStatus.FAILED
             return Observation(

@@ -3,6 +3,7 @@ import logging
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Optional
 
 from core.cache_manager import CacheManager
 from core.executor import TaskExecutor
@@ -53,6 +54,7 @@ class TaskService:
         self._queue_counter_lock = asyncio.Lock()
         self._queued_tasks: int = 0
         self._trace_locks: dict[str, asyncio.Lock] = {}
+        self._active_tasks: dict[str, asyncio.Task] = {}
 
         self.executor = TaskExecutor(
             checkpoint,
@@ -74,6 +76,37 @@ class TaskService:
                 logger.exception("background run failed: trace=%s err=%s", trace_id, exc)
 
         task.add_done_callback(_callback)
+
+    def _track_active_task(self, trace_id: str, task: asyncio.Task) -> None:
+        self._active_tasks[trace_id] = task
+
+        def _cleanup(done: asyncio.Task) -> None:
+            current = self._active_tasks.get(trace_id)
+            if current is done:
+                self._active_tasks.pop(trace_id, None)
+
+        task.add_done_callback(_cleanup)
+        self._attach_background_log(task, trace_id=trace_id)
+
+    def has_active_task(self, trace_id: str) -> bool:
+        task = self._active_tasks.get(trace_id)
+        if task is None:
+            return False
+        if task.done():
+            self._active_tasks.pop(trace_id, None)
+            return False
+        return True
+
+    async def cancel_active_task(self, trace_id: str) -> bool:
+        task = self._active_tasks.get(trace_id)
+        if task is None:
+            return False
+        if task.done():
+            self._active_tasks.pop(trace_id, None)
+            return False
+        task.cancel()
+        await asyncio.sleep(0)
+        return True
 
     def _get_trace_lock(self, trace_id: str) -> asyncio.Lock:
         lock = self._trace_locks.get(trace_id)
@@ -133,6 +166,7 @@ class TaskService:
                 await self._leave_queue()
 
         worker_task = asyncio.create_task(_worker())
+        self._track_active_task(trace.trace_id, worker_task)
         try:
             admission: QueueAdmission = await asyncio.wait_for(
                 start_gate,
@@ -149,21 +183,16 @@ class TaskService:
     async def dispatch_start(self, trace: Trace) -> QueueAdmission:
         if not self.queue_lanes_enabled:
             task = asyncio.create_task(self.start(trace))
-            self._attach_background_log(task, trace_id=trace.trace_id)
-            admission = QueueAdmission(queue_length=0, wait_ms=0)
-            return admission
-        admission = await self._admit_and_run(trace, self.start)
-        return admission
+            self._track_active_task(trace.trace_id, task)
+            return QueueAdmission(queue_length=0, wait_ms=0)
+        return await self._admit_and_run(trace, self.start)
 
     async def dispatch_hitl(self, trace: Trace, request_input: str) -> QueueAdmission:
         if not self.queue_lanes_enabled:
             task = asyncio.create_task(self.submit_hitl(trace, request_input))
-            self._attach_background_log(task, trace_id=trace.trace_id)
-            admission = QueueAdmission(queue_length=0, wait_ms=0)
-            return admission
-        admission = await self._admit_and_run(trace, self.submit_hitl, request_input=request_input)
-
-        return admission
+            self._track_active_task(trace.trace_id, task)
+            return QueueAdmission(queue_length=0, wait_ms=0)
+        return await self._admit_and_run(trace, self.submit_hitl, request_input=request_input)
 
     async def initialize(self, goal: str, client_id: str) -> Trace:
         trace = Trace(client_id=client_id, node=NodeType.THINK)
@@ -173,34 +202,52 @@ class TaskService:
         self.checkpoint.save(trace)
         return trace
 
-    async def new_turn(self, trace: Trace, goal: str):
+    async def new_turn(self, trace: Trace, goal: str) -> None:
         trace.status = AgentStatus.RUNNING
         trace.node = NodeType.THINK
+        trace.error_message = None
+        trace.started_at = None
+        trace.finished_at = None
+        trace.current_step_id = None
+        trace.pending_action_id = None
+        trace.hitl_ticket = None
         turn = Turn(index=len(trace.turns) + 1, user_input=goal)
         trace.turns.append(turn)
         trace.current_turn_id = turn.turn_id
         self.checkpoint.save(trace)
 
-    async def start(self, trace: Trace):
+    async def start(self, trace: Trace) -> None:
         await self.executor.run(trace)
 
-    async def get_trace(self, trace_id: str) -> Trace:
-        trace = self.checkpoint.load(trace_id)
+    async def get_trace(self, trace_id: str) -> Optional[Trace]:
+        try:
+            trace = self.checkpoint.load(trace_id)
+        except KeyError:
+            return None
+
         if isinstance(trace.hitl_ticket, dict):
             trace.hitl_ticket = HitlTicket(**trace.hitl_ticket)
-        turns = [Turn(**turn) for turn in trace.turns]
-        for turn in turns:
-            steps = [Step(**step) for step in turn.steps]
-            for step in steps:
-                actions = [Action(**action) for action in step.actions]
-                step.actions = actions
-                if step.observations:
-                    observations = [Observation(**observation) for observation in step.observations]
-                    step.observations = observations
-            turn.steps = steps
-        trace.turns = turns
+
+        trace.turns = [self._rehydrate_turn(turn) for turn in trace.turns]
         return trace
 
-    async def submit_hitl(self, trace: Trace, request_input: str):
+    def _rehydrate_turn(self, turn: Turn | dict) -> Turn:
+        hydrated_turn = turn if isinstance(turn, Turn) else Turn(**turn)
+        hydrated_turn.steps = [self._rehydrate_step(step) for step in hydrated_turn.steps]
+        return hydrated_turn
+
+    def _rehydrate_step(self, step: Step | dict) -> Step:
+        hydrated_step = step if isinstance(step, Step) else Step(**step)
+        hydrated_step.actions = [
+            action if isinstance(action, Action) else Action(**action)
+            for action in (hydrated_step.actions or [])
+        ]
+        hydrated_step.observations = [
+            observation if isinstance(observation, Observation) else Observation(**observation)
+            for observation in (hydrated_step.observations or [])
+        ]
+        return hydrated_step
+
+    async def submit_hitl(self, trace: Trace, request_input: str) -> None:
         await self.executor.execute_hitl(trace, request_input)
         await self.executor.run(trace)
