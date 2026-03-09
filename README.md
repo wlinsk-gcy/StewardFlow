@@ -1,188 +1,217 @@
-﻿# StewardFlow: ReAct & HITL Agent
+# StewardFlow: ReAct & HITL Agent
 
 ![StewardFlow Banner](public/banner.png)
 
- 中文 | [English](README_en.md)
+中文 | [English](README_en.md)
 
-StewardFlow 是一个基于 FastAPI 的 ReAct + HITL（人机协作）智能体系统，提供可视化前端工作台、可追踪的执行日志，以及可扩展的工具与 MCP 服务接入。它适合快速构建“可控、可追溯、可复现”的智能助手。
+StewardFlow 是一个基于 `FastAPI` + `React` 的可视化 `ReAct Agent`。
+
+支持通过 `stdio` / `http` 两种方式接入 `MCP Servers`。
+
+内置 `Docker-sandbox`，所有工具内置工具均在沙箱内运行。
+
+提供可追踪的执行事件流、浏览器 noVNC 视图、HITL 恢复机制，以及面向 Trace 的内存态 checkpoint 与上下文重建能力。
 
 ## Demo
 
-本案例使用的LLM为：qwen3.5-plus
+本案例使用的 LLM 为：`qwen3.5-plus`
 
-> 如果你没有qwen的API Key，你有两种方式可以体验Agent项目。
-> 
-> 1. 到 `https://www.modelscope.cn/` 获取免费的API Key，支持每天免费20次模型调用
-> 2. 到 `https://bailian.console.aliyun.com/` 申请免费API Key，新用户可以获取qwen3.5-plus模型100万tokens的免费体验额度。
+> 如果你没有 qwen 的 API Key，可以通过以下方式体验：
+>
+> 1. 到 `https://www.modelscope.cn/` 获取免费 API Key，每天可免费调用 20 次
+> 2. 到 `https://bailian.console.aliyun.com/` 申请免费 API Key，新用户可获得 `qwen3.5-plus` 的免费体验额度
 
-### 1. 打开小红书，搜索千问大模型的主页，并总结
+### 1. 打开小红书，搜索千问大模型主页并总结
 
-**可以观看`public/demo1.mp4`视频**
+可观看 `public/demo1.mp4`
 
-### 2. 查看当前目录有哪些文件？
+### 2. 查看当前目录有哪些文件
 
-**可以观看`public/demo2.mp4`视频**
+可观看 `public/demo2.mp4`
 
-### 3. 使用 `exec` 工具在 docker-sandbox 内执行命令
+### 3. 使用 `bash` 工具在 docker sandbox 内执行命令
 
-**可以观看`public/demo3.mp4`视频**
+可观看 `public/demo3.mp4`
+
 
 ## 功能概览
-- ReAct + HITL 任务编排：支持需要用户确认或补充输入的步骤
-- 工具系统：内置 docker-sandbox 工具（`bash` / `glob` / `read` / `search` / 任务向 `browser_*`）
-- Docker Sandbox：服务启动自动创建，服务关闭自动删除
-- VNC 浏览视图：前端直接渲染沙箱 noVNC 地址
-- WebSocket 实时推送：展示 Thought/Action/Observation/Final 等执行日志
-- 前后端分离：FastAPI 后端 + Vite/React 前端工作台
 
-## 目录结构（关键）
-- `main.py`：后端入口
-- `config.yaml.example`：后端配置示例
-- `mcp_config.json.example`：MCP 服务配置示例
-- `ui/`：前端项目（Vite + React）
-- `public/banner.png`：README 顶部横幅
+- ReAct 执行循环：`THINK -> DECIDE -> EXECUTE -> OBSERVE -> GUARD -> END`
+- HITL 两类等待点：
+  - 高风险 `bash` 命令确认
+  - 浏览器页面阻塞信号（登录 / 验证码 / OAuth 授权 / 拒绝访问）
+- WebSocket 实时事件：`thought/action/observation/final/hitl_confirm/hitl_request/token_info/error/end`
+- 自动 sandbox 生命周期：后端启动自动创建 1 个 sandbox，关闭时自动删除
+- 前端双工作区：`AgentWorkbench` 用于聊天与执行轨迹，`SandboxConsole` 用于健康检查与日志查看
+- 调度保护：`TaskService` 内置全局并发上限 `4`、排队上限 `128`、排队等待超时 `15s`
 
-## Docker Sandbox 构建与联通性检查（必读）
-默认你已安装 Docker。本项目的后端会通过 `sandbox.docker_base_url` 连接远端 Docker Engine，并在服务启动时自动创建沙箱容器。
+## 代码架构
 
-### 1. 检查 Docker 是否开放 2375
-在 Docker 所在机器执行：
-```bash
-ss -lntp | grep 2375
-```
+![stewardflow-state-machine](public/stewardflow-architecture.png)
 
-如果没有监听 `2375`，建议使用 `systemd override` 开启 TCP 监听（仅限可信内网，不要直接暴露公网）：
-```bash
-sudo mkdir -p /etc/systemd/system/docker.service.d
-sudo tee /etc/systemd/system/docker.service.d/override.conf > /dev/null <<'EOF'
-[Service]
-ExecStart=
-ExecStart=/usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2375 --containerd=/run/containerd/containerd.sock
-EOF
-```
-然后重载并重启 Docker：
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-```
+### 架构说明
 
-如需撤销该配置：
-```bash
-sudo rm -f /etc/systemd/system/docker.service.d/override.conf
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-```
+- `main.py` 负责组装 `ToolRegistry`、`TaskService`、`SandboxManager`、`MCPClient`、`ConnectionManager` 与 FastAPI 生命周期。
+- `TaskService` 负责 trace 初始化、排队调度、trace 级串行锁，以及 WAITING 状态任务的恢复。
+- `TaskExecutor` 负责状态机推进，并把 `thought/action/observation/final` 等事件写入 WebSocket。
+- `CheckpointStore` 与 `InMemoryCacheManager` 当前都仅存内存，不做磁盘持久化。
+- `SandboxToolRuntime` 把工具调用转发到 sandbox 内部 HTTP API；浏览器工具会在 `metadata` 中附带页签信息，并可能附加 `metadata.hitlBarrier`。
+- `SandboxManager` 负责 Docker 容器的创建、删除、健康检查和日志读取，但当前 Agent 运行时只会绑定启动时自动创建的那个 sandbox。
 
-从 StewardFlow 所在机器验证连通：
-```bash
-curl http://<docker-vm-ip>:2375/_ping
-```
-预期返回：`OK`
+## 状态机流转
 
-### 2. 检查防火墙策略（随机端口 vs 固定端口）
-查看防火墙状态：
-```bash
-sudo ufw status
-```
+![stewardflow-state-machine](public/stewardflow-state-machine.png)
 
-当前后端自动创建沙箱时，`noVNC/VNC/API` 端口默认使用随机宿主机端口。  
-如果防火墙未关闭，不建议用随机端口（难以逐个放行）。建议改固定端口并显式放行。
+## 快速启动
 
-固定端口示例（修改 `main.py` 里的 `_auto_create_sandbox()`）：
-```python
-novnc_port=5800,
-vnc_port=5900,
-api_port=8899,
-```
-然后放行这 3 个端口。
+### 1. 构建 sandbox 镜像
 
-### 3. 构建 docker-sandbox 镜像
 ```bash
 cd sandbox
 docker build -t gui-sandbox:dev .
 ```
 
-### 4. 配置 `config.yaml`
-先复制配置：
+### 2. 配置后端
+
+复制配置文件：
+
 ```bash
 cp config.yaml.example config.yaml
+# PowerShell
+Copy-Item config.yaml.example config.yaml
 ```
 
 至少确认以下字段：
-- `sandbox.image: gui-sandbox:dev`
-- `sandbox.tool_profile: task`（默认，仅暴露 9 个任务向浏览器工具：`navigate_page/take_snapshot/wait_for/browser_click/fill/type_text/browser_press_key/upload_file/browser_tabs`；设为 `debug` 可额外暴露细粒度页签与调试工具）
-- `sandbox.public_host: <docker-vm-ip>`（前端访问 noVNC 用）
-- `sandbox.healthcheck_host: <docker-vm-ip>`（后端调用沙箱 API 用）
-- `sandbox.docker_base_url: tcp://<docker-vm-ip>:2375`
-- `sandbox.start_url` / `sandbox.display_width` / `sandbox.display_height`
-- `llm.model` / `llm.api_key` / `llm.base_url`
 
-### 5. 启动后端（自动拉起沙箱容器）
-```bash
-python main.py
-```
-后端启动时会自动创建沙箱容器；后端关闭时会自动删除沙箱容器。  
-可通过 `GET /sandboxes?include_exited=false` 查看当前运行中的沙箱实例和映射端口。
-
-## 快速启动
-
-### 1. 配置后端
-```
-cp config.yaml.example config.yaml
-```
-编辑 `config.yaml`，至少填写：
 - `llm.api_key`
 - `llm.model`
 - `llm.base_url`
+- `sandbox.image`
+- `sandbox.public_host`
+- `sandbox.healthcheck_host`
+- `sandbox.docker_base_url`
+- `sandbox.start_url`
 
-如果你需要 MCP 服务（可选）：
-```
-cp mcp_config.json.example mcp_config.json
-```
+`sandbox.public_host` 指StewardFlow请求sandbox-api的节点ip地址
 
-### 2. 启动后端
-```
+`sandbox.healthcheck_host` 同public_host保持一致即可
+
+`sandbox.docker_base_url` 指向后端可访问的 Docker Engine，例如：`tcp://192.168.130.147:2375`
+
+### 3. 启动后端
+
+```bash
 python -m venv .venv
-.\.venv\Scripts\activate
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python main.py
 ```
-默认端口：`8000`（可在 `config.yaml` 的 `app.port` 修改）
 
-### 3. 启动前端
-```
+默认端口是 `8000`。后端启动后会自动创建一个 sandbox，并把 Agent 工具运行时绑定到该 sandbox。
+
+### 4. 启动前端
+
+```bash
 cd ui
 npm install
 npm run dev
 ```
-默认地址：`http://localhost:5173`
 
-### 4. 访问前端并开始使用
-- 前端会通过 `http://localhost:8000` 与后端通信
-- WebSocket 会连接 `ws://localhost:8000/ws/{client_id}` 以获取实时事件
+默认前端地址：`http://localhost:5173`
+
+### 5. 访问前端
+
+- 前端默认通过 `http://localhost:8000` 调用后端
+- WebSocket 地址为 `ws://localhost:8000/ws/{client_id}`
+- 浏览器视图使用 sandbox 的 noVNC 地址；可通过 `GET /sandboxes?include_exited=false` 查看当前映射端口
+
+## Sandbox 与端口说明
+
+- 当前自动创建 sandbox 时，`5800/5900/8899` 会映射到随机宿主机端口。
+- 如果你的环境有严格防火墙策略，建议通过 `POST /sandboxes` 手动创建固定端口实例，或预先放通一段可用端口范围。因为当前系统自动创建沙箱时，端口号随机分配。
+- `SandboxConsole` 当前只提供健康检查和日志查看，不提供交互式 shell。
+
+## 内置工具清单
+
+### 文件与命令工具
+
+- `bash`
+- `glob`
+- `read`
+- `grep`
+- `edit`
+- `write`
+
+### 浏览器工具
+
+- `browser_navigate_page`
+- `browser_take_snapshot`
+- `browser_click`
+- `browser_fill`
+- `browser_wait_for`
+- `browser_take_screenshot`
+- `browser_press_key`
+- `browser_handle_dialog`
+- `browser_hover`
+- `browser_upload_file`
+- `browser_select_page`
+
+### 当前工具契约
+
+- 所有工具都会返回 `output` 与可选 `metadata`
+- 当输出过大时，统一通过 `metadata.truncated=true` 与 `metadata.outputPath` 指向完整结果
+- 浏览器工具会补充当前页签摘要；若检测到登录、验证码、OAuth 授权等阻塞页面，还会附带 `metadata.hitlBarrier`
 
 ## 配置说明
+
 ### `config.yaml`
+
 - `app.port`：后端监听端口
-- `log.level`：日志级别（如 `info`）
-- `sandbox.image`：沙箱镜像名（例如 `gui-sandbox:dev`）
-- `sandbox.tool_profile`：浏览器工具暴露配置。`task`（默认）仅暴露 9 个任务向浏览器工具；`debug` 额外暴露 `list_pages/new_page/select_page/close_page/browser_handle_dialog/browser_select_option/browser_take_screenshot/browser_close/browser_drag/browser_evaluate/browser_hover`
-- `sandbox.public_host`：用于前端 noVNC 访问的宿主机地址
-- `sandbox.healthcheck_host`：后端访问沙箱 API 的地址
-- `sandbox.docker_base_url`：Docker Engine 地址（例如 `tcp://192.168.130.147:2375`）
-- `sandbox.start_url`：容器启动后 Chromium 首次打开地址
-- `sandbox.display_width` / `sandbox.display_height`：VNC 虚拟桌面分辨率
-- `llm.model` / `llm.api_key` / `llm.base_url`：LLM 提供商配置
+- `log.level`：日志级别
+- `llm.model` / `llm.api_key` / `llm.base_url`：OpenAI Compatible LLM 配置
+- `sandbox.image`：默认 sandbox 镜像
+- `sandbox.public_host`：前端访问 noVNC 使用的宿主机地址
+- `sandbox.healthcheck_host`：后端探测 sandbox `/health` 使用的地址
+- `sandbox.docker_base_url`：Docker Engine 地址
+- `sandbox.start_url`：Chromium 首次打开地址
+- `sandbox.display_width` / `sandbox.display_height`：虚拟桌面分辨率
 
-## 工具结果约定
-- 工具结果由沙箱 API 直接返回，不再做本地 `tool_result` 外部化封装。
-- 仅命令行工具（`bash/glob/read/search`）使用 envelope：`{"ok":bool,"data":...,"artifacts":[...],"error":...}`。
-- 上述命令行工具的 `artifacts` 内包含 `stdout/stderr`（含 `preview`，必要时包含 `path`）。
-- 当 `artifacts[].truncated=true` 时，可继续用 `bash` 在对应 `path` 上做精确查询（如 `sed/head/tail/search`）。
-- 其他工具（尤其浏览器工具）保持原有返回格式；仅在内容过大时返回 `output.preview/path/truncated` 外部化结构。
-- 未截断时默认不返回 `path`；如需强制保留文件，可传 `persist_output=true`。
+### `mcp_config.json.example`
 
-## API 入口
-- `POST /agent/run`：启动或继续一次任务
-- `GET /agent/health`：Agent 子系统健康检查
-- `GET /health`：服务健康检查
+- 当前仓库包含 MCP 客户端与连接器实现
+- 支持stdio / http两种方式接入MCP Servers
+
+## API 概览
+
+### Agent API
+
+- `POST /agent/run`
+  - 无 `trace_id`：创建新 Trace 并入队执行
+  - `trace_id` 对应 `WAITING + HITL`：恢复一次 HITL 输入
+  - `trace_id` 对应 `DONE/FAILED + END`：在同一 Trace 上开启新 turn
+- `GET /agent/health`
+- `GET /agent/registry-summary`
+
+### Sandbox API
+
+- `GET /sandboxes`
+- `POST /sandboxes`
+- `GET /sandboxes/{sandbox_id}`
+- `POST /sandboxes/{sandbox_id}/start`
+- `POST /sandboxes/{sandbox_id}/stop`
+- `DELETE /sandboxes/{sandbox_id}`
+- `GET /sandboxes/{sandbox_id}/health`
+- `GET /sandboxes/{sandbox_id}/logs`
+
+## 已知限制
+
+- 当前 checkpoint、消息缓存、WebSocket 连接状态均为进程内存态，服务重启不会恢复运行中的 Trace。
+- 当前 Agent 运行时只会绑定启动时自动创建的 sandbox；手动新建 sandbox 不会自动切换为 Agent 的活跃执行目标。
+
+## 特别鸣谢
+
+- 提供基础镜像的 `docker-baseimage-gui`：
+  https://github.com/jlesage/docker-baseimage-gui
+- 提供工具运行时与交互设计参考的 `opencode`：
+  https://github.com/anomalyco/opencode

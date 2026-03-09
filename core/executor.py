@@ -179,8 +179,6 @@ class TaskExecutor:
                         await self._decide(trace, turn, step)
                     case NodeType.EXECUTE:
                         await self._action(trace, turn, step)
-                    case NodeType.HITL:
-                        await self._hitl(trace, turn, step)
                     case NodeType.OBSERVE:
                         await self._observe(trace, turn, step)
                     case NodeType.GUARD:
@@ -286,6 +284,52 @@ class TaskExecutor:
         event = Event(EventType.OBSERVATION, trace.trace_id, turn.turn_id, data)
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
 
+    async def _enter_tool_confirm_wait(self, trace: Trace, turn: Turn, step: Step, action: Action) -> None:
+        trace.pending_action_id = action.action_id
+        prompt = f"Confirm to execute tool '{action.tool_name}' with args: {action.args}"
+        description = action.args.get("description")
+        if description:
+            prompt = description
+        trace.hitl_ticket = HitlTicket(
+            kind="tool_confirm",
+            status="open",
+            turn_id=turn.turn_id,
+            step_id=step.step_id,
+            action_id=action.action_id,
+            request_id=action.action_id,
+            prompt=prompt,
+        )
+        action.status = ActionStatus.WAITING_CONFIRM
+        step.status = StepStatus.WAITING_CONFIRM
+        await self._request_confirm(
+            trace.client_id,
+            trace.trace_id,
+            turn.turn_id,
+            action.action_id,
+            prompt=prompt,
+            tool_name=action.tool_name,
+            tool_args=action.args,
+        )
+        await self._emit_action_batch(trace, turn, step)
+        trace.status = AgentStatus.WAITING
+        trace.node = NodeType.HITL
+
+    async def _enter_request_input_wait(self, trace: Trace, step: Step, action: Action) -> None:
+        trace.pending_action_id = action.action_id
+        trace.current_step_id = step.step_id
+        trace.hitl_ticket = None
+        trace.status = AgentStatus.WAITING
+        trace.node = NodeType.HITL
+        step.status = StepStatus.WAITING_INPUT
+        action.status = ActionStatus.WAITING_INPUT
+        event = Event(
+            EventType.HITL_REQUEST,
+            trace.trace_id,
+            action.action_id,
+            {"content": action.message},
+        )
+        await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+
     async def _decide(self, trace: Trace, turn: Turn, step: Step):
         types = [action.type for action in step.actions]
         if ActionType.FINISH in types:
@@ -311,29 +355,7 @@ class TaskExecutor:
                            action.status == ActionStatus.PLANNED and action.requires_confirm]
             if action_list:
                 action = action_list[0]  # Handle one confirmation at a time.
-                trace.pending_action_id = action.action_id
-                trace.hitl_ticket = HitlTicket(
-                    kind="tool_confirm",
-                    status="open",
-                    turn_id=turn.turn_id,
-                    step_id=step.step_id,
-                    action_id=action.action_id,
-                    request_id=action.action_id,
-                    prompt=f"Confirm to execute tool '{action.tool_name}' with args: {action.args}",
-                )
-                action.status = ActionStatus.WAITING_CONFIRM
-                step.status = StepStatus.WAITING_CONFIRM
-                prompt = f"Confirm to execute tool '{action.tool_name}' with args: {action.args}"
-                await self._request_confirm(
-                    trace.client_id, trace.trace_id, turn.turn_id,
-                    action.action_id,
-                    prompt=prompt,
-                    tool_name=action.tool_name,
-                    tool_args=action.args
-                )
-                await self._emit_action_batch(trace, turn, step)
-                trace.status = AgentStatus.WAITING
-                trace.node = NodeType.HITL
+                await self._enter_tool_confirm_wait(trace, turn, step, action)
             else:
                 trace.hitl_ticket = None
                 trace.node = NodeType.EXECUTE
@@ -393,68 +415,18 @@ class TaskExecutor:
                 status=ActionStatus.PLANNED,
             )
             step.actions.append(action)
-            trace.pending_action_id = action.action_id
-            trace.current_step_id = step.step_id
-            trace.hitl_ticket = None
-            trace.node = NodeType.HITL
-
+            await self._enter_request_input_wait(trace, step, action)
             self.checkpoint.save(trace)
             return
 
+        step.status = StepStatus.DONE
+        step.finished_at = datetime.utcnow()
+        trace.current_step_id = None
         has_finish = any(action.type == ActionType.FINISH for action in (step.actions or []))
         if has_finish:
             trace.node = NodeType.END
         else:
             trace.node = NodeType.THINK
-        self.checkpoint.save(trace)
-
-    async def _hitl(self, trace: Trace, turn: Turn, step: Step):
-        trace.status = AgentStatus.WAITING
-
-        action = None
-        if trace.pending_action_id:
-            action = next((a for a in step.actions if a.action_id == trace.pending_action_id), None)
-        if action is None and step.actions:
-            action = step.actions[-1]
-        if action is None:
-            raise Exception("Hitl action not found")
-
-        trace.pending_action_id = action.action_id
-
-        if action.type == ActionType.REQUEST_INPUT:
-            step.status = StepStatus.WAITING_INPUT
-            action.status = ActionStatus.WAITING_INPUT
-            # if not stream
-            event = Event(
-                EventType.HITL_REQUEST,
-                trace.trace_id,
-                action.action_id,
-                {"content": action.message},
-            )
-            await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-        else:
-            # error
-            raise Exception(f"Hitl Unknown action: {action.type}")
-
-        # if action.type == ActionType.REQUEST_CONFIRM:
-        #     # For LLM-issued request_confirm action.
-        #     step.status = StepStatus.WAITING_CONFIRM
-        #     action.status = ActionStatus.WAITING_CONFIRM
-        #     await self._request_confirm(trace.client_id, trace.trace_id, turn.turn_id, action.action_id, action.message, action.tool_name, action.args)
-        # elif action.type == ActionType.REQUEST_INPUT:
-        #     step.status = StepStatus.WAITING_INPUT
-        #     action.status = ActionStatus.WAITING_INPUT
-        #     # if not stream
-        #     event = Event(
-        #         EventType.HITL_REQUEST,
-        #         trace.trace_id,
-        #         action.action_id,
-        #         {"content": action.message},
-        #     )
-        #     await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-        # else:
-        #     # error
-        #     raise Exception(f"Hitl Unknown action: {action.type}")
         self.checkpoint.save(trace)
 
     async def _observe(self, trace: Trace, turn: Turn, step: Step):
@@ -470,11 +442,8 @@ class TaskExecutor:
         if actions:
             trace.node = NodeType.THINK
         else:
-            step.status = StepStatus.DONE
-            step.finished_at = datetime.utcnow()
-            trace.node = NodeType.GUARD
             await self._emit_observation_batch(trace, turn, step)
-            trace.current_step_id = None
+            trace.node = NodeType.GUARD
         self.checkpoint.save(trace)
 
     async def _end(self, trace: Trace, turn: Turn, step: Step):
@@ -500,19 +469,6 @@ class TaskExecutor:
                       turn.turn_id,
                       {"content": final_content})
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-        # tool_state = {
-        #     tc.get("function", {}).get("name")
-        #     for step in (turn.steps or [])
-        #     for tc in (step.tool_calls or [])
-        #     if tc.get("function", {}).get("name")
-        # }
-        # step_ids = [getattr(s, "step_id", None) for s in (turn.steps or []) if getattr(s, "step_id", None)]
-        # await self.cache_manager.finalize_turn_to_result_card(trace_id=trace.trace_id,
-        #                                                       turn_id=turn.turn_id,
-        #                                                       user_input=turn.user_input,
-        #                                                       final_answer=final_content,
-        #                                                       tool_state=sorted(tool_state),
-        #                                                       step_ids=step_ids)
 
 
     async def _execute_tool(self, trace: Trace, turn: Turn, step: Step, action: Action):
@@ -589,7 +545,7 @@ class TaskExecutor:
         )
         action = [action for action in step.actions if action.action_id == pending_action_id][0]
         if action.type == ActionType.REQUEST_INPUT:
-            # Current state: AgentStatus.WAITING + NodeType.HITL.
+            # Come from _guard node. Current state: AgentStatus.WAITING + NodeType.HITL.
             action.request_input = request_input
             action.status = ActionStatus.DONE
 
@@ -603,22 +559,6 @@ class TaskExecutor:
             trace.pending_action_id = None
             trace.current_step_id = None
             trace.hitl_ticket = None
-
-        # elif action.type == ActionType.REQUEST_CONFIRM:
-        #     # Handle LLM confirmation response.
-        #     accepted = self._parse_confirmation(request_input)
-        #     action.request_input = "I've followed your instructions to complete the operation, please start the next step" if accepted else "I refuse to do the current action, skip it, and if you can't skip it, terminate the process"
-        #
-        #     # Start next step.
-        #     trace.status = AgentStatus.RUNNING
-        #     trace.node = NodeType.THINK
-        #
-        #     step.status = StepStatus.DONE
-        #     step.finished_at = datetime.utcnow()
-        #
-        #     trace.pending_action_id = None
-        #     trace.current_step_id = None
-        #     trace.hitl_ticket = None
 
         elif action.type == ActionType.TOOL:
             # Come from _decide node. Current state: AgentStatus.WAITING + NodeType.HITL.

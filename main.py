@@ -209,9 +209,7 @@ async def lifespan(app: FastAPI):
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
     tool_registry, browser_manager = init_load_tools()
-    # Disable MCP tool injection for now: only local sandbox tools should be available.
-    mcp_client = MCPClient(config={"mcpServers": {}})
-    # mcp_client = MCPClient(config="./mcp_config.json")
+    mcp_client = MCPClient(config="./mcp_config.json")
     mcp_cfg = config.get("mcp") or {}
     startup_wait_seconds = float(mcp_cfg.get("startup_wait_seconds", 2.0))
     mcp_init_task = await start_mcp_initialization(

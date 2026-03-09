@@ -11,7 +11,6 @@ llm:
 
 sandbox:
   image: gui-sandbox:dev
-  tool_profile: task
   public_host: "The server IP where your sandbox is located"
   docker_base_url: "your docker url, like tcp://127.0.0.1:2375"
   healthcheck_host: "The server IP where your sandbox is located"
