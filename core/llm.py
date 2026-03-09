@@ -192,7 +192,7 @@ class Provider:
         self.system_prompt = build_system_prompt()
         self.ws_manager = ws_manager
 
-    def generate(self, context: Dict[str, Any]) -> tuple[str, list, dict]:
+    def generate(self, context: Dict[str, Any]) -> tuple[str, str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
         is_thinking = context.get("is_thinking", True)
         # TODO 针对 429 Error Code 做重试
@@ -278,5 +278,5 @@ class Provider:
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens
         }
-        return reasoning, actions, token_info
+        return finish_reason, reasoning, actions, token_info
 

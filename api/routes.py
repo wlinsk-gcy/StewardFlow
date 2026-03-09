@@ -60,6 +60,7 @@ async def run_agent(
             trace = await task_service.get_trace(request.trace_id)
             if not trace:
                 raise HTTPException(status_code=404, detail="Trace not found")
+            # require_confirmation
             if trace.status == AgentStatus.WAITING and trace.node == NodeType.HITL:
                 admission = await task_service.dispatch_hitl(trace, request.task)
                 return RunAgentResponse(
@@ -67,6 +68,7 @@ async def run_agent(
                     status="accepted",
                     message=f"queued wait_ms={admission.wait_ms} queue_length={admission.queue_length}",
                 )
+            # new turn
             if trace.status in {AgentStatus.DONE, AgentStatus.FAILED} and trace.node == NodeType.END:
                 await task_service.new_turn(trace, request.task)
                 admission = await task_service.dispatch_start(trace)
@@ -76,7 +78,7 @@ async def run_agent(
                     message=f"queued wait_ms={admission.wait_ms} queue_length={admission.queue_length}",
                 )
             raise HTTPException(status_code=404, detail="Trace status is invalid")
-
+        # new Trace
         trace = await task_service.initialize(request.task, request.client_id)
         admission = await task_service.dispatch_start(trace)
         return RunAgentResponse(
@@ -85,7 +87,6 @@ async def run_agent(
             message=f"queued wait_ms={admission.wait_ms} queue_length={admission.queue_length}",
         )
     except QueueRejectedError as exc:
-        trace_id = request.trace_id or "-"
         raise HTTPException(
             status_code=429,
             detail={

@@ -240,7 +240,7 @@ class TaskExecutor:
             "user_input": turn.user_input,
             "messages": messages,
         }
-        reasoning, actions, token_info = self.llm.generate(context)
+        finish_reason, reasoning, actions, token_info = self.llm.generate(context)
 
         if trace.token_info:
             trace.token_info["cache_tokens"] += token_info["cache_tokens"]
@@ -255,10 +255,9 @@ class TaskExecutor:
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
         step.thought = reasoning
         step.actions = actions
-        action = actions[0]
         # Non-stream mode: emit answer/end events directly.
-        if action.type == ActionType.FINISH:
-            event = Event(EventType.ANSWER, trace.trace_id, step.step_id, {"content": action.message})
+        if finish_reason != "tool_calls":
+            event = Event(EventType.ANSWER, trace.trace_id, step.step_id, {"content": actions[0].message})
             await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
             event = Event(EventType.END, trace.trace_id, step.step_id, {"content": "done"})
             await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
@@ -422,12 +421,7 @@ class TaskExecutor:
 
         trace.pending_action_id = action.action_id
 
-        if action.type == ActionType.REQUEST_CONFIRM:
-            # For LLM-issued request_confirm action.
-            step.status = StepStatus.WAITING_CONFIRM
-            action.status = ActionStatus.WAITING_CONFIRM
-            await self._request_confirm(trace.client_id, trace.trace_id, turn.turn_id, action.action_id, action.message, action.tool_name, action.args)
-        elif action.type == ActionType.REQUEST_INPUT:
+        if action.type == ActionType.REQUEST_INPUT:
             step.status = StepStatus.WAITING_INPUT
             action.status = ActionStatus.WAITING_INPUT
             # if not stream
@@ -441,6 +435,26 @@ class TaskExecutor:
         else:
             # error
             raise Exception(f"Hitl Unknown action: {action.type}")
+
+        # if action.type == ActionType.REQUEST_CONFIRM:
+        #     # For LLM-issued request_confirm action.
+        #     step.status = StepStatus.WAITING_CONFIRM
+        #     action.status = ActionStatus.WAITING_CONFIRM
+        #     await self._request_confirm(trace.client_id, trace.trace_id, turn.turn_id, action.action_id, action.message, action.tool_name, action.args)
+        # elif action.type == ActionType.REQUEST_INPUT:
+        #     step.status = StepStatus.WAITING_INPUT
+        #     action.status = ActionStatus.WAITING_INPUT
+        #     # if not stream
+        #     event = Event(
+        #         EventType.HITL_REQUEST,
+        #         trace.trace_id,
+        #         action.action_id,
+        #         {"content": action.message},
+        #     )
+        #     await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+        # else:
+        #     # error
+        #     raise Exception(f"Hitl Unknown action: {action.type}")
         self.checkpoint.save(trace)
 
     async def _observe(self, trace: Trace, turn: Turn, step: Step):
@@ -590,23 +604,24 @@ class TaskExecutor:
             trace.current_step_id = None
             trace.hitl_ticket = None
 
-        elif action.type == ActionType.REQUEST_CONFIRM:
-            # Handle LLM confirmation response.
-            accepted = self._parse_confirmation(request_input)
-            action.request_input = "I've followed your instructions to complete the operation, please start the next step" if accepted else "I refuse to do the current action, skip it, and if you can't skip it, terminate the process"
-
-            # Start next step.
-            trace.status = AgentStatus.RUNNING
-            trace.node = NodeType.THINK
-
-            step.status = StepStatus.DONE
-            step.finished_at = datetime.utcnow()
-
-            trace.pending_action_id = None
-            trace.current_step_id = None
-            trace.hitl_ticket = None
+        # elif action.type == ActionType.REQUEST_CONFIRM:
+        #     # Handle LLM confirmation response.
+        #     accepted = self._parse_confirmation(request_input)
+        #     action.request_input = "I've followed your instructions to complete the operation, please start the next step" if accepted else "I refuse to do the current action, skip it, and if you can't skip it, terminate the process"
+        #
+        #     # Start next step.
+        #     trace.status = AgentStatus.RUNNING
+        #     trace.node = NodeType.THINK
+        #
+        #     step.status = StepStatus.DONE
+        #     step.finished_at = datetime.utcnow()
+        #
+        #     trace.pending_action_id = None
+        #     trace.current_step_id = None
+        #     trace.hitl_ticket = None
 
         elif action.type == ActionType.TOOL:
+            # Come from _decide node. Current state: AgentStatus.WAITING + NodeType.HITL.
             accepted = self._parse_confirmation(request_input)
             action.confirm_status = "approved" if accepted else "denied"
             action.requires_confirm = False

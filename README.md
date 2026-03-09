@@ -186,8 +186,3 @@ npm run dev
 - `POST /agent/run`：启动或继续一次任务
 - `GET /agent/health`：Agent 子系统健康检查
 - `GET /health`：服务健康检查
-
-
-codex resume 019cbc29-c47f-7541-a0f1-1c4706ca1b77
-做code review
-做好工具执行结果schema

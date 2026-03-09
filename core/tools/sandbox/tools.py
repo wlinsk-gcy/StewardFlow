@@ -267,7 +267,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="navigate_page",
+        name="browser_navigate_page",
         path="/tools/navigate_page",
         description=(
             "Navigate the active page to a URL, or move the page back, forward, or reload it."
@@ -298,7 +298,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="take_snapshot",
+        name="browser_take_snapshot",
         path="/tools/take_snapshot",
         description=(
             "Capture a text snapshot of the current page that is optimized for subsequent interactions. "
@@ -318,7 +318,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="click",
+        name="browser_click",
         path="/tools/click",
         description=(
             "Click an element from the latest page snapshot by `uid`."
@@ -343,7 +343,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="fill",
+        name="browser_fill",
         path="/tools/fill",
         description=(
             "Fill an input, textarea, or select element from the latest page snapshot by `uid`."
@@ -368,7 +368,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="wait_for",
+        name="browser_wait_for",
         path="/tools/wait_for",
         description=(
             "Wait until any expected text appears on the active page."
@@ -391,7 +391,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="take_screenshot",
+        name="browser_take_screenshot",
         path="/tools/take_screenshot",
         description=(
             "Capture a screenshot of the active page or of a snapshot-referenced element."
@@ -425,7 +425,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="press_key",
+        name="browser_press_key",
         path="/tools/press_key",
         description=(
             "Press a keyboard key on the active page or focused element."
@@ -446,7 +446,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="handle_dialog",
+        name="browser_handle_dialog",
         path="/tools/handle_dialog",
         description=(
             "Accept or dismiss the currently open JavaScript dialog."
@@ -467,7 +467,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="hover",
+        name="browser_hover",
         path="/tools/hover",
         description=(
             "Hover over an element from the latest page snapshot by `uid`."
@@ -488,7 +488,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="upload_file",
+        name="browser_upload_file",
         path="/tools/upload_file",
         description=(
             "Upload a sandbox file to a file input from the latest page snapshot by `uid`."
@@ -514,7 +514,7 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         ),
     ),
     SandboxToolSpec(
-        name="select_page",
+        name="browser_select_page",
         path="/tools/select_page",
         description=(
             "Switch the active browser page by `pageId`."

@@ -211,11 +211,12 @@ def _binary_artifact_writer(tool_name: str, data: bytes, suffix: str) -> str:
 
 
 def _tool_error_payload(exc: Exception, *, metadata: dict[str, object] | None = None) -> dict[str, Any]:
-    if isinstance(exc, ToolInputError):
-        return build_tool_error_result(str(exc), metadata=metadata)
-    if isinstance(exc, ToolExecutionError):
-        return build_tool_error_result(str(exc), metadata=metadata)
-    raise exc
+    return build_tool_error_result(str(exc), metadata=metadata)
+    # if isinstance(exc, ToolInputError):
+    #     return build_tool_error_result(str(exc), metadata=metadata)
+    # if isinstance(exc, ToolExecutionError):
+    #     return build_tool_error_result(str(exc), metadata=metadata)
+    # raise exc
 
 
 async def _execute_bash_command(command: str, *, workdir: str | None, timeout_ms: int) -> dict[str, Any]:
