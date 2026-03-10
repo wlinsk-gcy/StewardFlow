@@ -1,4 +1,10 @@
-﻿import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
+﻿import React, {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+} from "react";
 import { v4 as uuidv4 } from "uuid";
 import {
   Play,
@@ -34,7 +40,7 @@ function normalizeText(s: string) {
 
 const MessageContent: React.FC<{ content: string }> = ({ content }) => {
   return (
-    <div className="prose prose-sm prose-p:my-2 prose-li:my-1 prose-ul:my-2 prose-ol:my-2 prose-a:text-indigo-600 prose-a:no-underline hover:prose-a:underline max-w-none">
+    <div className="sf-markdown max-w-none text-[14px] leading-7">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -104,7 +110,9 @@ const BROWSER_VIEWPORT_TRANSITION_EASING = "cubic-bezier(0.22, 1, 0.36, 1)";
 export const AgentWorkbench: React.FC = () => {
   const apiBase = useMemo(() => {
     const configured = import.meta.env.VITE_API_BASE as string | undefined;
-    const base = configured?.trim() ? configured.trim() : "http://localhost:8000";
+    const base = configured?.trim()
+      ? configured.trim()
+      : "http://localhost:8000";
     return base.endsWith("/") ? base.slice(0, -1) : base;
   }, []);
 
@@ -136,18 +144,17 @@ export const AgentWorkbench: React.FC = () => {
     completion_tokens: number;
     total_tokens: number;
   } | null>(null);
-  const [wsStatus, setWsStatus] = useState<"online" | "offline" | "reconnecting">(
-    "offline",
-  );
+  const [wsStatus, setWsStatus] = useState<
+    "online" | "offline" | "reconnecting"
+  >("offline");
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
     null,
   );
   const [registryOpen, setRegistryOpen] = useState(false);
   const [registryLoading, setRegistryLoading] = useState(false);
   const [registryError, setRegistryError] = useState<string | null>(null);
-  const [registrySummary, setRegistrySummary] = useState<RegistrySummary | null>(
-    null,
-  );
+  const [registrySummary, setRegistrySummary] =
+    useState<RegistrySummary | null>(null);
   const [isResettingSession, setIsResettingSession] = useState(false);
 
   // --- 新增：WebSocket 相关状态 ---
@@ -173,7 +180,8 @@ export const AgentWorkbench: React.FC = () => {
       if (!response.ok) return;
       const payload = (await response.json()) as SandboxListResponse;
       const items = Array.isArray(payload?.items) ? payload.items : [];
-      const running = items.find((item) => item.status === "running") || items[0];
+      const running =
+        items.find((item) => item.status === "running") || items[0];
       const next = running?.urls?.novnc?.trim() || null;
       setNovncUrl(next);
     } catch {
@@ -241,7 +249,8 @@ export const AgentWorkbench: React.FC = () => {
       if (!normalizedNoVncUrl) return;
 
       const targetRect = measureBrowserViewportRect(expand);
-      const originRect = browserViewportRect ?? measureBrowserViewportRect(!expand);
+      const originRect =
+        browserViewportRect ?? measureBrowserViewportRect(!expand);
       if (!targetRect || !originRect) {
         clearBrowserTransition();
         setIsBrowserAnimating(false);
@@ -281,242 +290,248 @@ export const AgentWorkbench: React.FC = () => {
   );
 
   // --- 新增：初始化 WebSocket ---
-  const handleIncomingEvent = useCallback((event: any) => {
-    const { event_type, data, timestamp, msg_id } = event;
-    // console.log('incoming event', event);
+  const handleIncomingEvent = useCallback(
+    (event: any) => {
+      const { event_type, data, timestamp, msg_id } = event;
+      // console.log('incoming event', event);
 
-    if (event_type === "token_info") {
-      setTokenInfo({
-        cache_tokens: Number(data?.cache_tokens ?? 0),
-        prompt_tokens: Number(data?.prompt_tokens ?? 0),
-        completion_tokens: Number(data?.completion_tokens ?? 0),
-        total_tokens: Number(data?.total_tokens ?? 0),
-      });
-      return;
-    }
+      if (event_type === "token_info") {
+        setTokenInfo({
+          cache_tokens: Number(data?.cache_tokens ?? 0),
+          prompt_tokens: Number(data?.prompt_tokens ?? 0),
+          completion_tokens: Number(data?.completion_tokens ?? 0),
+          total_tokens: Number(data?.total_tokens ?? 0),
+        });
+        return;
+      }
 
-    // 1. 处理执行日志 (Execution Trace)
-    // 同一步骤可能收到多次状态快照，前端需要按 step 维度更新而不是盲目追加。
-    if (["thought", "action", "observation", "final"].includes(event_type)) {
-      // console.log('receive execute trace', event);
-      const MAX_LEN = 500;
-      const actionBatch =
-        event_type === "action" && Array.isArray(data?.actions)
-          ? data.actions
-          : undefined;
-      const observationBatch =
-        event_type === "observation" && Array.isArray(data?.observations)
-          ? data.observations
-          : undefined;
-      const rawContent =
-        data?.content ??
-        (actionBatch
-          ? `Action batch (${actionBatch.length})`
-          : observationBatch
-            ? `Observation batch (${observationBatch.length})`
-            : "");
-      const content =
-        rawContent.length > MAX_LEN ? rawContent.slice(0, MAX_LEN) + "..." : rawContent;
-      const stepMsgId = typeof msg_id === "string" ? msg_id : undefined;
-      const newStep: AgentStep = {
-        stepId: stepMsgId,
-        msgId: stepMsgId,
-        type: event_type,
-        content: content,
-        tool: data.tool_name,
-        toolInput: data.args,
-        actions: actionBatch,
-        observations: observationBatch,
-        timestamp: new Date(timestamp).getTime(),
-      };
-      setSteps((prev) => {
-        if (!stepMsgId) {
-          return [...prev, newStep];
-        }
-        const existingIndex = prev.findIndex(
-          (item) => item.type === event_type && item.msgId === stepMsgId,
-        );
-        if (existingIndex < 0) {
-          return [...prev, newStep];
-        }
-        const next = [...prev];
-        next[existingIndex] = {
-          ...next[existingIndex],
-          ...newStep,
+      // 1. 处理执行日志 (Execution Trace)
+      // 同一步骤可能收到多次状态快照，前端需要按 step 维度更新而不是盲目追加。
+      if (["thought", "action", "observation", "final"].includes(event_type)) {
+        // console.log('receive execute trace', event);
+        const MAX_LEN = 500;
+        const actionBatch =
+          event_type === "action" && Array.isArray(data?.actions)
+            ? data.actions
+            : undefined;
+        const observationBatch =
+          event_type === "observation" && Array.isArray(data?.observations)
+            ? data.observations
+            : undefined;
+        const rawContent =
+          data?.content ??
+          (actionBatch
+            ? `Action batch (${actionBatch.length})`
+            : observationBatch
+              ? `Observation batch (${observationBatch.length})`
+              : "");
+        const content =
+          rawContent.length > MAX_LEN
+            ? rawContent.slice(0, MAX_LEN) + "..."
+            : rawContent;
+        const stepMsgId = typeof msg_id === "string" ? msg_id : undefined;
+        const newStep: AgentStep = {
+          stepId: stepMsgId,
+          msgId: stepMsgId,
+          type: event_type,
+          content: content,
+          tool: data.tool_name,
+          toolInput: data.args,
+          actions: actionBatch,
+          observations: observationBatch,
+          timestamp: new Date(timestamp).getTime(),
         };
-        return next;
-      });
-
-      if (event_type === "observation") {
-        const obsHasBrowserAction =
-          typeof data?.tool_name === "string"
-            ? data.tool_name.startsWith("browser_")
-            : false;
-        const batchHasBrowserAction =
-          Array.isArray(observationBatch) &&
-          observationBatch.some(
-            (item: any) =>
-              typeof item?.tool_name === "string" && item.tool_name.startsWith("browser_"),
+        setSteps((prev) => {
+          if (!stepMsgId) {
+            return [...prev, newStep];
+          }
+          const existingIndex = prev.findIndex(
+            (item) => item.type === event_type && item.msgId === stepMsgId,
           );
-        if (obsHasBrowserAction || batchHasBrowserAction) {
+          if (existingIndex < 0) {
+            return [...prev, newStep];
+          }
+          const next = [...prev];
+          next[existingIndex] = {
+            ...next[existingIndex],
+            ...newStep,
+          };
+          return next;
+        });
+
+        if (event_type === "observation") {
+          const obsHasBrowserAction =
+            typeof data?.tool_name === "string"
+              ? data.tool_name.startsWith("browser_")
+              : false;
+          const batchHasBrowserAction =
+            Array.isArray(observationBatch) &&
+            observationBatch.some(
+              (item: any) =>
+                typeof item?.tool_name === "string" &&
+                item.tool_name.startsWith("browser_"),
+            );
+          if (obsHasBrowserAction || batchHasBrowserAction) {
+            setActiveTab("browser");
+            void refreshNoVncUrl();
+          }
+        }
+
+        // 如果是 action 且涉及到浏览器（根据你的业务逻辑），可以切换 Tab
+        if (
+          event_type === "action" &&
+          ((Array.isArray(actionBatch) &&
+            actionBatch.some(
+              (a: any) =>
+                typeof a?.tool_name === "string" &&
+                a.tool_name.startsWith("browser_"),
+            )) ||
+            (typeof data?.tool_name === "string" &&
+              data.tool_name.startsWith("browser_")))
+        ) {
           setActiveTab("browser");
           void refreshNoVncUrl();
         }
       }
 
-      // 如果是 action 且涉及到浏览器（根据你的业务逻辑），可以切换 Tab
-      if (
-        event_type === "action" &&
-        (
-          (Array.isArray(actionBatch) &&
-            actionBatch.some((a: any) =>
-              typeof a?.tool_name === "string" && a.tool_name.startsWith("browser_"),
-            )) ||
-          (typeof data?.tool_name === "string" && data.tool_name.startsWith("browser_"))
-        )
-      ) {
-        setActiveTab("browser");
-        void refreshNoVncUrl();
-      }
-    }
-
-    // --- 2. 处理流式消息 (Answer & HITL Request) ---
-    if (event_type === "answer" || event_type === "hitl_request") {
-      // console.log('receive answer or hitl_request');
-      setIsRunning((prev) => (prev ? false : prev));
-      setIsStopping(false);
-      setChatHistory((prev) => {
-        const isHitlRequest = event_type === "hitl_request";
-        const lastIndex = prev.length - 1;
-        const lastMessage = lastIndex >= 0 ? prev[lastIndex] : undefined;
-        const canAppendToLast =
-          !!msg_id &&
-          !!lastMessage &&
-          lastMessage.role === "assistant" &&
-          lastMessage.msg_id === msg_id &&
-          (
-            (isHitlRequest && lastMessage.hitlType === "request") ||
-            (!isHitlRequest && !lastMessage.isHitl)
-          );
-
-        // 仅当连续分片到达且目标是最后一条 assistant 消息时才拼接
-        if (canAppendToLast && lastMessage) {
-          const newHistory = [...prev];
-          const targetMsg = newHistory[lastIndex];
-          newHistory[lastIndex] = {
-            ...targetMsg,
-            content: targetMsg.content + (data.content || ""),
-            // 如果是 hitl_request，确保标记状态
-            isHitl: event_type.startsWith("hitl") ? true : targetMsg.isHitl,
-            hitlType:
-              event_type === "hitl_request" ? "request" : targetMsg.hitlType,
-          };
-          return newHistory;
-        } else {
-          // 如果是该 msg_id 的第一块数据，创建新消息
-          return [
-            ...prev,
-            {
-              id: uuidv4(),
-              role: "assistant",
-              content: data.content || "",
-              timestamp: new Date(timestamp).getTime(),
-              msg_id: msg_id,
-              isHitl: event_type.startsWith("hitl"),
-              hitlType: event_type === "hitl_request" ? "request" : undefined,
-            },
-          ];
-        }
-      });
-    }
-
-    // 3. 处理 Final 收尾消息（尤其是 code-first barrier handoff 场景）
-    if (event_type === "final") {
-      setIsRunning(false);
-      setIsStopping(false);
-      const finalText = typeof data?.content === "string" ? data.content : "";
-      if (finalText.trim()) {
+      // --- 2. 处理流式消息 (Answer & HITL Request) ---
+      if (event_type === "answer" || event_type === "hitl_request") {
+        // console.log('receive answer or hitl_request');
+        setIsRunning((prev) => (prev ? false : prev));
+        setIsStopping(false);
         setChatHistory((prev) => {
-          const last = prev.length > 0 ? prev[prev.length - 1] : undefined;
-          // Avoid duplicate bubble when answer already rendered the same text.
-          if (
-            last &&
-            last.role === "assistant" &&
-            String(last.content ?? "").trim() === finalText.trim()
-          ) {
-            return prev;
+          const isHitlRequest = event_type === "hitl_request";
+          const lastIndex = prev.length - 1;
+          const lastMessage = lastIndex >= 0 ? prev[lastIndex] : undefined;
+          const canAppendToLast =
+            !!msg_id &&
+            !!lastMessage &&
+            lastMessage.role === "assistant" &&
+            lastMessage.msg_id === msg_id &&
+            ((isHitlRequest && lastMessage.hitlType === "request") ||
+              (!isHitlRequest && !lastMessage.isHitl));
+
+          // 仅当连续分片到达且目标是最后一条 assistant 消息时才拼接
+          if (canAppendToLast && lastMessage) {
+            const newHistory = [...prev];
+            const targetMsg = newHistory[lastIndex];
+            newHistory[lastIndex] = {
+              ...targetMsg,
+              content: targetMsg.content + (data.content || ""),
+              // 如果是 hitl_request，确保标记状态
+              isHitl: event_type.startsWith("hitl") ? true : targetMsg.isHitl,
+              hitlType:
+                event_type === "hitl_request" ? "request" : targetMsg.hitlType,
+            };
+            return newHistory;
+          } else {
+            // 如果是该 msg_id 的第一块数据，创建新消息
+            return [
+              ...prev,
+              {
+                id: uuidv4(),
+                role: "assistant",
+                content: data.content || "",
+                timestamp: new Date(timestamp).getTime(),
+                msg_id: msg_id,
+                isHitl: event_type.startsWith("hitl"),
+                hitlType: event_type === "hitl_request" ? "request" : undefined,
+              },
+            ];
           }
-          return [
-            ...prev,
-            {
-              id: uuidv4(),
-              role: "assistant",
-              content: finalText,
-              timestamp: new Date(timestamp).getTime(),
-              msg_id: msg_id,
-            },
-          ];
         });
       }
-      return;
-    }
 
-    if (event_type === "hitl_confirm") {
-      setIsRunning(false);
-      setIsStopping(false);
-      const promptText = data?.prompt || "Please confirm the action.";
-      const requestId = data?.request_id || uuidv4();
-      setPendingConfirm({
-        requestId,
-        prompt: promptText,
-        toolName: data?.tool_name,
-        args: data?.args,
-        msgId: msg_id,
-      });
-      setChatHistory((prev) => [
-        ...prev,
-        {
+      // 3. 处理 Final 收尾消息（尤其是 code-first barrier handoff 场景）
+      if (event_type === "final") {
+        setIsRunning(false);
+        setIsStopping(false);
+        const finalText = typeof data?.content === "string" ? data.content : "";
+        if (finalText.trim()) {
+          setChatHistory((prev) => {
+            const last = prev.length > 0 ? prev[prev.length - 1] : undefined;
+            // Avoid duplicate bubble when answer already rendered the same text.
+            if (
+              last &&
+              last.role === "assistant" &&
+              String(last.content ?? "").trim() === finalText.trim()
+            ) {
+              return prev;
+            }
+            return [
+              ...prev,
+              {
+                id: uuidv4(),
+                role: "assistant",
+                content: finalText,
+                timestamp: new Date(timestamp).getTime(),
+                msg_id: msg_id,
+              },
+            ];
+          });
+        }
+        return;
+      }
+
+      if (event_type === "hitl_confirm") {
+        setIsRunning(false);
+        setIsStopping(false);
+        const promptText = data?.prompt || "Please confirm the action.";
+        const requestId = data?.request_id || uuidv4();
+        setPendingConfirm({
+          requestId,
+          prompt: promptText,
+          toolName: data?.tool_name,
+          args: data?.args,
+          msgId: msg_id,
+        });
+        setChatHistory((prev) => [
+          ...prev,
+          {
+            id: uuidv4(),
+            role: "assistant",
+            content: promptText,
+            timestamp: new Date(timestamp).getTime(),
+            msg_id: msg_id,
+            requestId,
+            isHitl: true,
+            hitlType: "confirm",
+          },
+        ]);
+      }
+
+      // 2. 处理聊天窗口消息 (Chat Window)
+      if (event_type === "error") {
+        const newMessage: ChatMessage = {
           id: uuidv4(),
           role: "assistant",
-          content: promptText,
+          content: data.content,
           timestamp: new Date(timestamp).getTime(),
-          msg_id: msg_id,
-          requestId,
-          isHitl: true,
-          hitlType: "confirm",
-        },
-      ]);
-    }
+          // 如果是 hitl_confirm，可在这里扩展 type 以便后续展示按钮
+          isHitl: event_type.startsWith("hitl"),
+        };
+        setChatHistory((prev) => [...prev, newMessage]);
+        setIsRunning(false);
+        setIsStopping(false);
+      }
 
-    // 2. 处理聊天窗口消息 (Chat Window)
-    if (event_type === "error") {
-      const newMessage: ChatMessage = {
-        id: uuidv4(),
-        role: "assistant",
-        content: data.content,
-        timestamp: new Date(timestamp).getTime(),
-        // 如果是 hitl_confirm，可在这里扩展 type 以便后续展示按钮
-        isHitl: event_type.startsWith("hitl"),
-      };
-      setChatHistory((prev) => [...prev, newMessage]);
-      setIsRunning(false);
-      setIsStopping(false);
-    }
-
-    // 4. 统一结束标记（后端可能在不同路径发送 end）
-    if (event_type === "end") {
-      setIsRunning(false);
-      setIsStopping(false);
-      return;
-    }
-  }, [refreshNoVncUrl]);
+      // 4. 统一结束标记（后端可能在不同路径发送 end）
+      if (event_type === "end") {
+        setIsRunning(false);
+        setIsStopping(false);
+        return;
+      }
+    },
+    [refreshNoVncUrl],
+  );
 
   const fetchRegistrySummary = useCallback(async () => {
     setRegistryLoading(true);
     setRegistryError(null);
     try {
       const response = await fetch(`${apiBase}/agent/registry-summary`);
-      if (!response.ok) throw new Error("Failed to fetch tool registry summary");
+      if (!response.ok)
+        throw new Error("Failed to fetch tool registry summary");
       const data = (await response.json()) as RegistrySummary;
       setRegistrySummary(data);
     } catch (error) {
@@ -619,7 +634,12 @@ export const AgentWorkbench: React.FC = () => {
     return () => {
       window.removeEventListener("resize", syncBrowserViewport);
     };
-  }, [isBrowserAnimating, isBrowserExpanded, measureBrowserViewportRect, normalizedNoVncUrl]);
+  }, [
+    isBrowserAnimating,
+    isBrowserExpanded,
+    measureBrowserViewportRect,
+    normalizedNoVncUrl,
+  ]);
 
   useEffect(() => {
     if (normalizedNoVncUrl) return;
@@ -691,7 +711,14 @@ export const AgentWorkbench: React.FC = () => {
   };
 
   const handleRun = async () => {
-    if (!goal.trim() || isRunning || isStopping || isResettingSession || pendingConfirm) return;
+    if (
+      !goal.trim() ||
+      isRunning ||
+      isStopping ||
+      isResettingSession ||
+      pendingConfirm
+    )
+      return;
 
     // 1. UI 反馈
     const userMessage: ChatMessage = {
@@ -842,67 +869,85 @@ export const AgentWorkbench: React.FC = () => {
   const showStopButton = isRunning && !pendingConfirm;
   const isAwaitingTraceId = showStopButton && !traceId;
   const sendDisabled =
-    isRunning || isStopping || isResettingSession || Boolean(pendingConfirm) || !goal.trim();
+    isRunning ||
+    isStopping ||
+    isResettingSession ||
+    Boolean(pendingConfirm) ||
+    !goal.trim();
   const stopDisabled = isStopping || isResettingSession || isAwaitingTraceId;
   const canExpandBrowser = Boolean(normalizedNoVncUrl);
-  const shouldRenderBrowserViewport = Boolean(normalizedNoVncUrl && browserViewportRect);
+  const shouldRenderBrowserViewport = Boolean(
+    normalizedNoVncUrl && browserViewportRect,
+  );
+  const wsStatusLabel =
+    wsStatus === "online"
+      ? "System Online"
+      : wsStatus === "reconnecting"
+        ? "Offline · Reconnecting"
+        : "System Offline";
+  const wsStatusChipClass =
+    wsStatus === "online"
+      ? "sf-chip sf-chip-green"
+      : wsStatus === "reconnecting"
+        ? "sf-chip sf-chip-amber"
+        : "sf-chip sf-chip-red";
   const isBrowserViewportVisible =
     activeTab === "browser" || isBrowserVisualExpanded || isBrowserAnimating;
-  const browserViewportStyle: React.CSSProperties | undefined = browserViewportRect
-    ? {
-        top: `${browserViewportRect.top}px`,
-        left: `${browserViewportRect.left}px`,
-        width: `${browserViewportRect.width}px`,
-        height: `${browserViewportRect.height}px`,
-        opacity: isBrowserViewportVisible ? 1 : 0,
-        pointerEvents: isBrowserViewportVisible ? "auto" : "none",
-        transition: [
-          `top ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
-          `left ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
-          `width ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
-          `height ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
-          "opacity 180ms ease",
-          `box-shadow ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
-          "background-color 220ms ease",
-        ].join(", "),
-        boxShadow: isBrowserExpanded
-          ? "0 24px 80px rgba(15, 23, 42, 0.34)"
-          : "0 8px 28px rgba(15, 23, 42, 0.12)",
-      }
-    : undefined;
+  const browserViewportStyle: React.CSSProperties | undefined =
+    browserViewportRect
+      ? {
+          top: `${browserViewportRect.top}px`,
+          left: `${browserViewportRect.left}px`,
+          width: `${browserViewportRect.width}px`,
+          height: `${browserViewportRect.height}px`,
+          opacity: isBrowserViewportVisible ? 1 : 0,
+          visibility: isBrowserViewportVisible ? "visible" : "hidden",
+          pointerEvents: isBrowserViewportVisible ? "auto" : "none",
+          transition: [
+            `top ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+            `left ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+            `width ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+            `height ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+            "opacity 180ms ease",
+            `box-shadow ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+            "background-color 220ms ease",
+          ].join(", "),
+          boxShadow: isBrowserExpanded
+            ? "0 24px 80px rgba(15, 23, 42, 0.34)"
+            : "0 8px 28px rgba(15, 23, 42, 0.12)",
+        }
+      : undefined;
 
   return (
-    <div className="relative flex h-full flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
+    <div className="sf-panel relative flex h-full flex-col overflow-hidden">
       {/* Tab Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-gray-100 bg-white px-6 py-4">
+      <div className="sf-panel-header flex shrink-0 items-center justify-between px-6 py-5">
         <div className="flex items-center gap-3">
-          <div className="rounded-xl bg-indigo-600 p-2.5 shadow-lg shadow-indigo-200">
-            <Cpu className="h-5 w-5 text-white" />
+          <div className="sf-icon-badge sf-icon-badge-accent h-11 w-11">
+            <Cpu className="h-5 w-5" />
           </div>
           <div>
-            <h2 className="font-bold text-gray-900">Steward Flow</h2>
-            <div className="mt-0.5 flex items-center gap-2">
-              <span
-                className={`flex h-2 w-2 rounded-full ${
-                  wsStatus === "online"
-                    ? "bg-green-500"
-                    : wsStatus === "reconnecting"
-                      ? "bg-yellow-500"
-                      : "bg-red-500"
-                }`}
-              ></span>
-              <p className="text-[10px] font-bold tracking-widest text-gray-500 uppercase">
-                {wsStatus === "online"
-                  ? "System Online"
-                  : wsStatus === "reconnecting"
-                    ? "System Offline · Reconnecting..."
-                    : "System Offline"}
-              </p>
+            <h2 className="text-base font-extrabold tracking-tight text-[var(--sf-ink)]">
+              Agent Workspace
+            </h2>
+            <div className="mt-2 flex items-center gap-2">
+              <span className={wsStatusChipClass}>
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    wsStatus === "online"
+                      ? "bg-[var(--sf-success)]"
+                      : wsStatus === "reconnecting"
+                        ? "bg-[var(--sf-warning)]"
+                        : "bg-[var(--sf-danger)]"
+                  }`}
+                />
+                {wsStatusLabel}
+              </span>
             </div>
           </div>
         </div>
 
-        <div className="flex gap-1.5 rounded-xl bg-gray-100 p-1">
+        <div className="sf-tab-group">
           <TabButton
             active={activeTab === "runner"}
             onClick={() => setActiveTab("runner")}
@@ -920,31 +965,37 @@ export const AgentWorkbench: React.FC = () => {
 
       <div
         ref={workbenchBodyRef}
-        className="relative flex flex-1 divide-x divide-gray-100 overflow-hidden"
+        className="relative flex flex-1 divide-x divide-[var(--sf-border)] overflow-hidden"
       >
         {shouldRenderBrowserViewport && (
           <>
             <div
               className={`absolute inset-0 z-20 transition-opacity ${
-                isBrowserExpanded ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+                isBrowserExpanded
+                  ? "pointer-events-auto opacity-100"
+                  : "pointer-events-none opacity-0"
               }`}
-              style={{ transitionDuration: `${BROWSER_VIEWPORT_TRANSITION_MS}ms` }}
+              style={{
+                transitionDuration: `${BROWSER_VIEWPORT_TRANSITION_MS}ms`,
+              }}
             >
               <button
                 onClick={closeBrowserExpanded}
-                className="h-full w-full bg-slate-950/22 backdrop-blur-[1px]"
+                className="h-full w-full bg-[rgba(15,23,42,0.22)] backdrop-blur-[1px]"
                 aria-label="关闭 VNC 全屏遮罩"
                 tabIndex={isBrowserExpanded ? 0 : -1}
               />
             </div>
 
             <div
-              className="absolute z-30 overflow-hidden bg-white"
+              className="absolute z-30 overflow-hidden rounded-[26px] bg-[rgba(255,255,255,0.82)]"
               style={browserViewportStyle}
             >
               <div
                 className={`relative h-full w-full overflow-hidden transition-colors duration-300 ${
-                  isBrowserVisualExpanded ? "bg-slate-950" : "bg-white"
+                  isBrowserVisualExpanded
+                    ? "bg-[var(--sf-panel-dark)]"
+                    : "bg-[rgba(255,255,255,0.92)]"
                 }`}
               >
                 <iframe
@@ -957,7 +1008,7 @@ export const AgentWorkbench: React.FC = () => {
                 <div
                   className={`pointer-events-none absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-3 transition-all duration-300 ${
                     isBrowserVisualExpanded
-                      ? "border-b border-slate-800/80 bg-slate-950/84 px-5 py-3 backdrop-blur-md"
+                      ? "border-b border-white/10 bg-[rgba(15,23,42,0.84)] px-5 py-3 backdrop-blur-md"
                       : "px-4 py-4"
                   }`}
                 >
@@ -965,23 +1016,29 @@ export const AgentWorkbench: React.FC = () => {
                     className={`pointer-events-auto flex items-center gap-2 transition-all duration-300 ${
                       isBrowserVisualExpanded
                         ? "text-sm font-bold tracking-wide text-slate-100"
-                        : "rounded-full border border-white/70 bg-white/85 px-3 py-1.5 text-[10px] font-black tracking-widest text-slate-700 uppercase shadow-lg backdrop-blur"
+                        : "rounded-full border border-white/70 bg-white/[0.88] px-3 py-1.5 text-[10px] font-black tracking-[0.18em] text-[var(--sf-ink-soft)] uppercase shadow-[0_14px_32px_rgba(15,23,42,0.08)] backdrop-blur"
                     }`}
                   >
                     <Globe
                       className={`h-4 w-4 ${
-                        isBrowserVisualExpanded ? "text-emerald-400" : "text-slate-600"
+                        isBrowserVisualExpanded
+                          ? "text-blue-300"
+                          : "text-[var(--sf-ink-soft)]"
                       }`}
                     />
-                    <span>{isBrowserVisualExpanded ? "VNC Browser View" : "Live VNC"}</span>
+                    <span>
+                      {isBrowserVisualExpanded
+                        ? "VNC Browser View"
+                        : "Live VNC"}
+                    </span>
                   </div>
                   <div className="pointer-events-auto flex items-center gap-2">
                     <button
                       onClick={() => void refreshNoVncUrl()}
-                      className={`flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-[10px] font-bold tracking-widest uppercase transition-colors duration-200 ${
+                      className={`sf-btn cursor-pointer px-3 py-2 text-[10px] ${
                         isBrowserVisualExpanded
-                          ? "border border-slate-700 bg-slate-800 text-slate-100 hover:border-slate-600 hover:bg-slate-700"
-                          : "border border-slate-200 bg-white/90 text-slate-700 shadow-lg backdrop-blur hover:border-slate-300 hover:bg-white"
+                          ? "border border-white/10 bg-white/[0.08] text-slate-100 hover:border-white/20 hover:bg-white/[0.12]"
+                          : "sf-btn-secondary text-[var(--sf-ink-soft)]"
                       }`}
                       title="刷新 VNC"
                     >
@@ -990,14 +1047,20 @@ export const AgentWorkbench: React.FC = () => {
                     </button>
                     <button
                       onClick={
-                        isBrowserVisualExpanded ? closeBrowserExpanded : openBrowserExpanded
-                      }
-                      className={`flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-[10px] font-bold tracking-widest uppercase transition-colors duration-200 ${
                         isBrowserVisualExpanded
-                          ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:border-emerald-400 hover:bg-emerald-500/20"
-                          : "border border-emerald-200 bg-emerald-500 text-white shadow-lg shadow-emerald-200 hover:bg-emerald-600"
+                          ? closeBrowserExpanded
+                          : openBrowserExpanded
+                      }
+                      className={`sf-btn cursor-pointer px-3 py-2 text-[10px] ${
+                        isBrowserVisualExpanded
+                          ? "border border-blue-300/20 bg-blue-400/10 text-blue-100 hover:border-blue-300/30 hover:bg-blue-400/15"
+                          : "sf-btn-primary"
                       }`}
-                      title={isBrowserVisualExpanded ? "退出全屏" : "在工作台内全屏显示 VNC"}
+                      title={
+                        isBrowserVisualExpanded
+                          ? "退出全屏"
+                          : "在工作台内全屏显示 VNC"
+                      }
                     >
                       {isBrowserVisualExpanded ? (
                         <Minimize2 className="h-3.5 w-3.5" />
@@ -1014,19 +1077,22 @@ export const AgentWorkbench: React.FC = () => {
         )}
 
         {/* Left Column: Chat History & Input */}
-        <div className="flex w-1/2 flex-col bg-white">
-          <div className="flex items-center justify-between border-b border-gray-100 bg-white px-6 py-3">
-            <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">
-              Chat
-            </span>
+        <div className="flex w-1/2 min-w-0 flex-col bg-transparent">
+          <div className="flex items-center justify-between border-b border-[var(--sf-border)] px-6 py-4">
+            <div>
+              <span className="text-[10px] font-bold tracking-[0.18em] text-[var(--sf-ink-muted)] uppercase">
+                Agent Session
+              </span>
+            </div>
             <button
               onClick={handleNewSession}
-              disabled={isRunning || isStopping || Boolean(pendingConfirm) || isResettingSession}
-              className={`rounded-lg border px-3 py-1.5 text-[10px] font-bold tracking-widest uppercase ${
-                isRunning || isStopping || Boolean(pendingConfirm) || isResettingSession
-                  ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-400"
-                  : "border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:text-gray-800"
-              }`}
+              disabled={
+                isRunning ||
+                isStopping ||
+                Boolean(pendingConfirm) ||
+                isResettingSession
+              }
+              className="sf-btn sf-btn-secondary px-3 py-2 text-[10px]"
             >
               {isResettingSession ? "Resetting..." : "New Session"}
             </button>
@@ -1034,18 +1100,18 @@ export const AgentWorkbench: React.FC = () => {
           {/* Chat Messages */}
           <div
             ref={chatScrollRef}
-            className="flex-1 space-y-6 overflow-y-auto bg-gray-50/30 p-6"
+            className="flex-1 space-y-6 overflow-y-auto bg-[rgba(247,249,252,0.42)] p-6"
           >
             {chatHistory.length === 0 && (
-              <div className="flex h-full flex-col items-center justify-center px-10 text-center">
-                <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-indigo-50">
-                  <Bot className="h-10 w-10 text-indigo-500 opacity-60" />
+              <div className="sf-empty-state flex h-full flex-col items-center justify-center px-10 text-center">
+                <div className="sf-icon-badge sf-icon-badge-dark mb-6 flex h-20 w-20 items-center justify-center rounded-[28px]">
+                  <Bot className="h-10 w-10 text-blue-200" />
                 </div>
-                <h3 className="mb-2 text-xl font-bold text-gray-900">
-                  你好，我是你的私人 AI 管家
+                <h3 className="mb-2 text-xl font-extrabold tracking-tight text-[var(--sf-ink)]">
+                  Hello, I'm your personal AI Steward
                 </h3>
-                <p className="text-sm leading-relaxed text-gray-500">
-                  一站式工具助手：网页自动化 + 文档检索 + 程序执行，输出可复现步骤，关键操作先确认。
+                <p className="max-w-md text-sm leading-7 text-[var(--sf-ink-muted)]">
+                  Web page automation, retrieval, program execution, and manual confirmation are completed in a unified workbench, making the execution process more visible and controllable.
                 </p>
               </div>
             )}
@@ -1058,10 +1124,10 @@ export const AgentWorkbench: React.FC = () => {
                   className={`flex max-w-[85%] gap-3 ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}
                 >
                   <div
-                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg shadow-sm ${
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl shadow-sm ${
                       msg.role === "user"
-                        ? "bg-indigo-600 text-white"
-                        : "border border-gray-200 bg-white text-indigo-600"
+                        ? "sf-icon-badge sf-icon-badge-accent text-white"
+                        : "border border-[var(--sf-border)] bg-white/[0.88] text-[var(--sf-ink-soft)] shadow-[0_10px_24px_rgba(15,23,42,0.06)]"
                     }`}
                   >
                     {msg.role === "user" ? (
@@ -1071,10 +1137,10 @@ export const AgentWorkbench: React.FC = () => {
                     )}
                   </div>
                   <div
-                    className={`rounded-2xl p-4 text-left text-sm leading-relaxed break-words shadow-sm ${
+                    className={`rounded-[24px] p-4 text-left text-sm leading-relaxed break-words shadow-[0_14px_28px_rgba(15,23,42,0.05)] ${
                       msg.role === "user"
-                        ? "rounded-tr-none bg-indigo-600 text-white"
-                        : "rounded-tl-none border border-gray-100 bg-white text-gray-800"
+                        ? "rounded-tr-none bg-[linear-gradient(180deg,var(--sf-accent),var(--sf-accent-strong))] text-white"
+                        : "rounded-tl-none border border-[var(--sf-border)] bg-white/[0.88] text-[var(--sf-ink)]"
                     }`}
                   >
                     <MessageContent content={String(msg.content ?? "")} />
@@ -1083,26 +1149,26 @@ export const AgentWorkbench: React.FC = () => {
                       pendingConfirm &&
                       msg.requestId &&
                       msg.requestId === pendingConfirm.requestId && (
-                        <div className="mt-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3 shadow-inner">
-                          <div className="flex items-center gap-2 text-[10px] font-black tracking-widest text-indigo-600 uppercase">
-                            <span className="h-1.5 w-1.5 rounded-full bg-indigo-500"></span>
+                        <div className="mt-3 rounded-[18px] border border-[rgba(49,94,251,0.16)] bg-[rgba(232,239,255,0.72)] p-3 shadow-inner">
+                          <div className="flex items-center gap-2 text-[10px] font-black tracking-[0.16em] text-[var(--sf-accent-strong)] uppercase">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[var(--sf-accent)]"></span>
                             Tool Call Confirmation
                           </div>
                           {getConfirmCommand(pendingConfirm) && (
-                            <div className="mt-2 rounded-lg border border-slate-900 bg-slate-950 px-3 py-2 font-mono text-[11px] text-slate-100">
+                            <div className="sf-terminal-panel mt-2 rounded-[16px] px-3 py-2 font-mono text-[11px] text-slate-100">
                               $ {getConfirmCommand(pendingConfirm)}
                             </div>
                           )}
                           <div className="mt-3 flex gap-2">
                             <button
                               onClick={() => handleConfirm("confirm")}
-                              className="rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-bold tracking-widest text-white uppercase hover:bg-emerald-700"
+                              className="sf-btn sf-btn-primary px-3 py-2 text-[10px]"
                             >
                               Approve
                             </button>
                             <button
                               onClick={() => handleConfirm("reject")}
-                              className="rounded-lg bg-rose-600 px-3 py-2 text-[10px] font-bold tracking-widest text-white uppercase hover:bg-rose-700"
+                              className="sf-btn border border-[rgba(207,63,83,0.14)] bg-[var(--sf-danger-soft)] px-3 py-2 text-[10px] text-[var(--sf-danger)]"
                             >
                               Reject
                             </button>
@@ -1116,16 +1182,16 @@ export const AgentWorkbench: React.FC = () => {
             {isRunning && (
               <div className="animate-in fade-in slide-in-from-left-2 flex justify-start">
                 <div className="flex gap-3">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-indigo-600">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-2xl border border-[var(--sf-border)] bg-white/[0.88] text-[var(--sf-ink-soft)] shadow-[0_10px_24px_rgba(15,23,42,0.06)]">
                     <Bot className="h-4 w-4" />
                   </div>
-                  <div className="flex items-center gap-2 rounded-2xl rounded-tl-none border border-gray-100 bg-white p-4 shadow-sm">
+                  <div className="flex items-center gap-2 rounded-[24px] rounded-tl-none border border-[var(--sf-border)] bg-white/[0.88] p-4 shadow-[0_14px_28px_rgba(15,23,42,0.05)]">
                     <div className="flex gap-1">
-                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-300"></span>
-                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-400 [animation-delay:0.2s]"></span>
-                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 [animation-delay:0.4s]"></span>
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-300"></span>
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-400 [animation-delay:0.2s]"></span>
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-500 [animation-delay:0.4s]"></span>
                     </div>
-                    <span className="ml-2 text-xs font-bold tracking-widest text-gray-400 uppercase">
+                    <span className="ml-2 text-xs font-bold tracking-[0.16em] text-[var(--sf-ink-muted)] uppercase">
                       Agent is thinking...
                     </span>
                   </div>
@@ -1135,7 +1201,7 @@ export const AgentWorkbench: React.FC = () => {
           </div>
 
           {/* Chat Input */}
-          <div className="border-t border-gray-100 bg-white p-6">
+          <div className="border-t border-[var(--sf-border)] bg-[rgba(255,255,255,0.38)] p-6">
             <div className="relative mb-3 flex justify-end">
               <button
                 onClick={() => {
@@ -1144,36 +1210,36 @@ export const AgentWorkbench: React.FC = () => {
                     void fetchRegistrySummary();
                   }
                 }}
-                className={`flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-[11px] font-bold tracking-wide shadow-sm backdrop-blur-sm transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:outline-none ${
+                className={`sf-btn cursor-pointer px-3 py-2 text-[11px] ${
                   registryOpen
-                    ? "border-indigo-300/80 bg-indigo-100/80 text-indigo-800"
-                    : "border-indigo-200/80 bg-indigo-50/70 text-indigo-700 hover:bg-indigo-100/75"
+                    ? "border border-[rgba(49,94,251,0.18)] bg-[rgba(232,239,255,0.84)] text-[var(--sf-accent-strong)]"
+                    : "sf-btn-secondary text-[var(--sf-accent-strong)]"
                 }`}
               >
                 <Wrench className="h-4 w-4" />
                 <span>Tool {builtInCount}</span>
-                <span className="text-indigo-300">|</span>
+                <span className="text-blue-300">|</span>
                 <span>MCP {mcpServerCount}</span>
               </button>
 
               {registryOpen && (
-                <div className="absolute right-0 bottom-full z-40 mb-2 w-[22rem] max-w-[calc(100vw-3rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
-                  <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-3 py-2">
-                    <div className="flex items-center gap-2 text-[11px] font-bold text-slate-700">
+                <div className="sf-floating-panel absolute right-0 bottom-full z-40 mb-2 w-[22rem] max-w-[calc(100vw-3rem)] overflow-hidden">
+                  <div className="flex items-center justify-between border-b border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] px-3 py-3">
+                    <div className="flex items-center gap-2 text-[11px] font-bold text-[var(--sf-ink-soft)]">
                       <Server className="h-3.5 w-3.5" />
-                      <span>已注册工具与 MCP</span>
+                      <span>Registered tools and MCP</span>
                     </div>
                     <div className="flex items-center gap-1">
                       <button
                         onClick={() => void fetchRegistrySummary()}
-                        className="cursor-pointer rounded-md px-2 py-1 text-[10px] font-semibold text-slate-600 transition-colors hover:bg-slate-200"
+                        className="sf-btn sf-btn-ghost cursor-pointer px-2 py-1 text-[10px]"
                         title="刷新"
                       >
                         <RefreshCw className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setRegistryOpen(false)}
-                        className="cursor-pointer rounded-md px-2 py-1 text-[10px] font-semibold text-slate-600 transition-colors hover:bg-slate-200"
+                        className="sf-btn sf-btn-ghost cursor-pointer px-2 py-1 text-[10px]"
                         title="关闭"
                       >
                         <X className="h-3.5 w-3.5" />
@@ -1183,56 +1249,62 @@ export const AgentWorkbench: React.FC = () => {
 
                   <div className="max-h-[60vh] space-y-4 overflow-y-auto p-4 text-xs">
                     {registryLoading ? (
-                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-600">
+                      <div className="rounded-[18px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-3 text-[var(--sf-ink-soft)]">
                         正在加载工具清单...
                       </div>
                     ) : registryError ? (
-                      <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-rose-700">
+                      <div className="rounded-[18px] border border-[rgba(207,63,83,0.14)] bg-[var(--sf-danger-soft)] p-3 text-[var(--sf-danger)]">
                         {registryError}
                       </div>
                     ) : registrySummary ? (
                       <>
                         <div className="grid grid-cols-3 gap-2 text-center">
-                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
-                            <div className="text-[10px] text-slate-500">内置工具</div>
-                            <div className="mt-1 font-mono text-sm font-bold text-slate-800">
+                          <div className="rounded-[16px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-2">
+                            <div className="text-[10px] text-[var(--sf-ink-muted)]">
+                              Built-in tools
+                            </div>
+                            <div className="mt-1 font-mono text-sm font-bold text-[var(--sf-ink)]">
                               {builtInCount}
                             </div>
                           </div>
-                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
-                            <div className="text-[10px] text-slate-500">MCP 服务</div>
-                            <div className="mt-1 font-mono text-sm font-bold text-slate-800">
+                          <div className="rounded-[16px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-2">
+                            <div className="text-[10px] text-[var(--sf-ink-muted)]">
+                              MCP Servers
+                            </div>
+                            <div className="mt-1 font-mono text-sm font-bold text-[var(--sf-ink)]">
                               {mcpServerCount}
                             </div>
                           </div>
-                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
-                            <div className="text-[10px] text-slate-500">MCP 工具</div>
-                            <div className="mt-1 font-mono text-sm font-bold text-slate-800">
+                          <div className="rounded-[16px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-2">
+                            <div className="text-[10px] text-[var(--sf-ink-muted)]">
+                              MCP Tools
+                            </div>
+                            <div className="mt-1 font-mono text-sm font-bold text-[var(--sf-ink)]">
                               {mcpToolCount}
                             </div>
                           </div>
                         </div>
 
                         <section className="space-y-2">
-                          <div className="text-[11px] font-black tracking-wide text-slate-600 uppercase">
-                            内置工具
+                          <div className="text-[11px] font-black tracking-wide text-[var(--sf-ink-muted)] uppercase">
+                            Built-in tools
                           </div>
                           {registrySummary.built_in_tools.length === 0 ? (
-                            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-slate-500">
-                              暂无内置工具
+                            <div className="rounded-[16px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-2 text-[var(--sf-ink-muted)]">
+                              There are no built-in tools yet
                             </div>
                           ) : (
                             registrySummary.built_in_tools.map((tool) => (
                               <div
                                 key={`builtin-${tool.name}`}
-                                className="rounded-lg border border-slate-200 bg-white p-2"
+                                className="rounded-[16px] border border-[var(--sf-border)] bg-white/[0.82] p-2"
                               >
-                                <div className="font-mono text-[11px] font-bold text-slate-800">
+                                <div className="font-mono text-[11px] font-bold text-[var(--sf-ink)]">
                                   {tool.name}
                                 </div>
                                 {tool.description && (
                                   <div
-                                    className="mt-1 text-[10px] leading-relaxed text-slate-500"
+                                    className="mt-1 text-[10px] leading-relaxed text-[var(--sf-ink-muted)]"
                                     title={tool.description}
                                   >
                                     {truncateWithEllipsis(tool.description, 48)}
@@ -1244,35 +1316,35 @@ export const AgentWorkbench: React.FC = () => {
                         </section>
 
                         <section className="space-y-2">
-                          <div className="text-[11px] font-black tracking-wide text-slate-600 uppercase">
+                          <div className="text-[11px] font-black tracking-wide text-[var(--sf-ink-muted)] uppercase">
                             MCP
                           </div>
                           {registrySummary.mcp_servers.length === 0 ? (
-                            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-slate-500">
-                              暂无 MCP 配置
+                            <div className="rounded-[16px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-2 text-[var(--sf-ink-muted)]">
+                              There is no MCP configuration at this time
                             </div>
                           ) : (
                             registrySummary.mcp_servers.map((server) => (
                               <div
                                 key={`mcp-${server.name}`}
-                                className="rounded-lg border border-slate-200 bg-white p-2"
+                                className="rounded-[16px] border border-[var(--sf-border)] bg-white/[0.82] p-2"
                               >
                                 <div className="flex items-center justify-between gap-2">
-                                  <div className="font-mono text-[11px] font-bold text-slate-800">
+                                  <div className="font-mono text-[11px] font-bold text-[var(--sf-ink)]">
                                     {server.name}
                                   </div>
                                   <div className="flex items-center gap-2 text-[10px]">
                                     <span
                                       className={`h-2 w-2 rounded-full ${
                                         server.connected
-                                          ? "bg-emerald-500"
+                                          ? "bg-[var(--sf-success)]"
                                           : "bg-slate-300"
                                       }`}
                                     ></span>
-                                    <span className="text-slate-500">
+                                    <span className="text-[var(--sf-ink-muted)]">
                                       {server.connected ? "已连接" : "未连接"}
                                     </span>
-                                    <span className="font-mono text-slate-600">
+                                    <span className="font-mono text-[var(--sf-ink-soft)]">
                                       {server.tool_count} tools
                                     </span>
                                   </div>
@@ -1282,14 +1354,14 @@ export const AgentWorkbench: React.FC = () => {
                                     {server.tools.map((tool) => (
                                       <div
                                         key={`mcp-${server.name}-${tool.name}`}
-                                        className="rounded bg-slate-50 px-2 py-1"
+                                        className="rounded-[12px] bg-[rgba(247,249,252,0.86)] px-2 py-1"
                                       >
-                                        <div className="font-mono text-[10px] font-bold text-slate-700">
+                                        <div className="font-mono text-[10px] font-bold text-[var(--sf-ink-soft)]">
                                           {tool.name}
                                         </div>
                                         {tool.description && (
                                           <div
-                                            className="mt-0.5 text-[10px] leading-relaxed text-slate-500"
+                                            className="mt-0.5 text-[10px] leading-relaxed text-[var(--sf-ink-muted)]"
                                             title={tool.description}
                                           >
                                             {truncateWithEllipsis(
@@ -1308,7 +1380,7 @@ export const AgentWorkbench: React.FC = () => {
                         </section>
                       </>
                     ) : (
-                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-500">
+                      <div className="rounded-[18px] border border-[var(--sf-border)] bg-[rgba(247,249,252,0.8)] p-3 text-[var(--sf-ink-muted)]">
                         暂无工具数据
                       </div>
                     )}
@@ -1318,11 +1390,11 @@ export const AgentWorkbench: React.FC = () => {
             </div>
 
             <div className="group relative">
-              <div className="absolute -inset-1 rounded-2xl bg-gradient-to-r from-indigo-500 to-purple-500 opacity-10 blur transition duration-1000 group-focus-within:opacity-25"></div>
-              <div className="relative overflow-hidden rounded-2xl border border-gray-200 bg-white transition-all focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-50">
+              <div className="absolute -inset-1 rounded-[26px] bg-[radial-gradient(circle_at_top_left,rgba(49,94,251,0.16),transparent_55%)] opacity-70 blur-xl transition duration-500 group-focus-within:opacity-100"></div>
+              <div className="sf-panel-muted relative overflow-hidden transition-all">
                 <textarea
-                  className="h-24 w-full resize-none bg-transparent p-4 pr-16 font-sans text-sm outline-none"
-                  placeholder="请告诉我您的需求是什么？..."
+                  className="sf-input h-24 resize-none border-0 bg-transparent p-4 pr-16 text-sm outline-none"
+                  placeholder="Describe the task you want StewardFlow to execute..."
                   value={goal}
                   onChange={(e) => setGoal(e.target.value)}
                   onKeyDown={handleKeyDown}
@@ -1331,16 +1403,16 @@ export const AgentWorkbench: React.FC = () => {
                 <button
                   onClick={showStopButton ? handleStop : handleRun}
                   disabled={showStopButton ? stopDisabled : sendDisabled}
-                  className={`absolute right-3 bottom-3 rounded-xl p-3 transition-all ${
+                  className={`absolute right-3 bottom-3 rounded-[16px] p-3 transition-all ${
                     showStopButton
                       ? isAwaitingTraceId
-                        ? "bg-gray-100 text-gray-400"
+                        ? "bg-slate-100 text-slate-400"
                         : stopDisabled
-                        ? "bg-rose-100 text-rose-300"
-                        : "bg-rose-600 text-white shadow-lg shadow-rose-200 hover:bg-rose-700 active:scale-95"
+                          ? "bg-[var(--sf-danger-soft)] text-[rgba(207,63,83,0.45)]"
+                          : "bg-[var(--sf-danger)] text-white shadow-[0_16px_34px_rgba(207,63,83,0.2)] hover:brightness-95 active:scale-95"
                       : sendDisabled
-                        ? "bg-gray-100 text-gray-400"
-                        : "bg-indigo-600 text-white shadow-lg shadow-indigo-200 hover:bg-indigo-700 active:scale-95"
+                        ? "bg-slate-100 text-slate-400"
+                        : "bg-[linear-gradient(180deg,var(--sf-accent),var(--sf-accent-strong))] text-white shadow-[0_16px_34px_rgba(49,94,251,0.2)] hover:brightness-105 active:scale-95"
                   }`}
                 >
                   {showStopButton ? (
@@ -1355,14 +1427,12 @@ export const AgentWorkbench: React.FC = () => {
                 </button>
               </div>
             </div>
-            <p className="mt-3 text-center text-[10px] font-medium tracking-widest text-gray-400 uppercase">
-              ReAct Protocol v1.0 · Multi-Modality Driven
-            </p>
+
           </div>
         </div>
 
         {/* Right Column: Dynamic View */}
-        <div className="relative flex w-1/2 flex-col bg-gray-50/50">
+        <div className="relative flex w-1/2 min-w-0 flex-col bg-[rgba(247,249,252,0.2)]">
           <div
             className={`absolute inset-0 flex h-full flex-col overflow-hidden transition-opacity duration-150 ${
               activeTab === "runner"
@@ -1370,39 +1440,49 @@ export const AgentWorkbench: React.FC = () => {
                 : "pointer-events-none opacity-0"
             }`}
           >
-            <div className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-4">
-              <div className="flex items-center gap-2">
-                <Terminal className="h-4 w-4 text-indigo-500" />
-                <h3 className="text-sm font-bold tracking-tight text-gray-700 uppercase">
-                  执行日志
-                </h3>
+            <div className="flex items-center justify-between border-b border-[var(--sf-border)] px-6 py-4">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl border border-[rgba(49,94,251,0.12)] bg-[rgba(232,239,255,0.78)] text-[var(--sf-accent-strong)]">
+                  <Terminal className="h-4 w-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-[var(--sf-ink)]">
+                    Execution Trace
+                  </h3>
+
+                </div>
               </div>
               <div className="flex items-center gap-2">
                 {tokenInfo && (
-                  <div className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                  <div className="sf-chip sf-chip-blue gap-2 text-[10px]">
                     <span>Cache {tokenInfo.cache_tokens}</span>
-                    <span className="text-indigo-300">/</span>
+                    <span className="text-blue-300">/</span>
                     <span>Prompt {tokenInfo.prompt_tokens}</span>
-                    <span className="text-indigo-300">/</span>
+                    <span className="text-blue-300">/</span>
                     <span>Completion {tokenInfo.completion_tokens}</span>
-                    <span className="text-indigo-300">/</span>
+                    <span className="text-blue-300">/</span>
                     <span>Total {tokenInfo.total_tokens}</span>
                   </div>
                 )}
-                <span className="rounded-full bg-indigo-500 px-2 py-0.5 text-[10px] font-black text-white">
+                <span className="sf-chip sf-chip-blue text-[10px]">
                   {steps.length} LOGS
                 </span>
               </div>
             </div>
             <div
               ref={traceScrollRef}
-              className="flex-1 space-y-4 overflow-y-auto p-6"
+              className="flex-1 space-y-4 overflow-y-auto bg-[rgba(247,249,252,0.42)] p-6"
             >
               {steps.length === 0 ? (
-                <div className="flex h-full flex-col items-center justify-center opacity-20 grayscale select-none">
-                  <Layers className="mb-4 h-16 w-16" />
-                  <p className="text-sm font-bold tracking-widest uppercase">
-                    Trace visualization inactive
+                <div className="sf-empty-state flex h-full flex-col items-center justify-center select-none">
+                  <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-[28px] border border-[var(--sf-border)] bg-white/80 shadow-[0_16px_34px_rgba(15,23,42,0.05)]">
+                    <Layers className="h-10 w-10 opacity-60" />
+                  </div>
+                  <p className="text-sm font-bold tracking-[0.16em] uppercase">
+                    No trace yet
+                  </p>
+                  <p className="mt-2 max-w-sm text-center text-sm leading-6 text-[var(--sf-ink-muted)]">
+                    No execution trace has been created yet. Start a task to see reasoning steps, tool calls, and observations appear here in real time.
                   </p>
                 </div>
               ) : (
@@ -1417,7 +1497,7 @@ export const AgentWorkbench: React.FC = () => {
           </div>
 
           <div
-            className={`absolute inset-0 flex h-full flex-col overflow-hidden bg-gray-200 transition-opacity duration-150 ${
+            className={`absolute inset-0 flex h-full flex-col overflow-hidden bg-[rgba(247,249,252,0.42)] transition-opacity duration-150 ${
               activeTab === "browser"
                 ? "pointer-events-auto opacity-100"
                 : "pointer-events-none opacity-0"
@@ -1425,19 +1505,19 @@ export const AgentWorkbench: React.FC = () => {
           >
             <div
               ref={normalizedNoVncUrl ? browserDockRef : null}
-              className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner"
+              className="relative flex flex-1 items-center justify-center overflow-hidden bg-[rgba(255,255,255,0.68)] shadow-inner"
             >
               {!canExpandBrowser && (
-                <div className="max-w-sm p-10 text-center">
-                  <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-gray-100">
-                    <Globe className="h-8 w-8 text-gray-300" />
+                <div className="max-w-md p-10 text-center">
+                  <div className="mx-auto mb-4 flex h-[4.5rem] w-[4.5rem] items-center justify-center rounded-[26px] border border-[var(--sf-border)] bg-white/[0.86] shadow-[0_18px_36px_rgba(15,23,42,0.06)]">
+                    <Globe className="h-8 w-8 text-[var(--sf-ink-muted)]" />
                   </div>
-                  <h4 className="text-xs font-bold tracking-widest text-gray-400 uppercase">
+                  <h4 className="text-xs font-bold tracking-[0.18em] text-[var(--sf-ink-muted)] uppercase">
                     Waiting for VNC Session
                   </h4>
-                  <p className="mt-2 text-[11px] text-gray-400">
-                    Browser tools will refresh sandbox noVNC URL from `/sandboxes`,
-                    then render the remote browser here.
+                  <p className="mt-3 text-sm leading-6 text-[var(--sf-ink-muted)]">
+                    Browser tools will refresh sandbox noVNC URL from
+                    `/sandboxes`, then render the remote browser here.
                   </p>
                 </div>
               )}
@@ -1453,14 +1533,11 @@ export const AgentWorkbench: React.FC = () => {
 const TabButton = ({ active, onClick, icon: Icon, label }: any) => (
   <button
     onClick={onClick}
-    className={`flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-bold transition-all duration-200 ${
-      active
-        ? "bg-white text-indigo-600 shadow-md ring-1 ring-black/5"
-        : "text-gray-500 hover:text-gray-800"
-    }`}
+    className="sf-tab-button"
+    data-active={active ? "true" : "false"}
   >
     <Icon className="h-3.5 w-3.5" />
-    <span className="tracking-widest uppercase">{label}</span>
+    <span className="tracking-[0.14em] uppercase">{label}</span>
   </button>
 );
 
@@ -1528,7 +1605,7 @@ const CodeBlock: React.FC<{ value: unknown }> = ({ value }) => {
     typeof value === "string" ? value : JSON.stringify(value, null, 2);
 
   return (
-    <pre className="overflow-x-auto rounded-xl border border-gray-800 bg-gray-900 p-3 text-[11px] whitespace-pre text-gray-300 shadow-lg">
+    <pre className="sf-terminal-panel overflow-x-auto p-4 font-mono text-[11px] whitespace-pre text-slate-200">
       {text}
     </pre>
   );
@@ -1552,24 +1629,24 @@ const SearchResults: React.FC<{ items: SearchItem[] }> = ({ items }) => {
             href={clickable ? it.link : undefined}
             target={clickable ? "_blank" : undefined}
             rel={clickable ? "noreferrer" : undefined}
-            className={`block rounded-xl border p-3 transition ${
+            className={`block rounded-[18px] border p-3 transition ${
               clickable
-                ? "border-gray-200 bg-white hover:bg-gray-50"
-                : "border-gray-200 bg-white"
+                ? "border-[var(--sf-border)] bg-white/80 hover:border-[rgba(49,94,251,0.18)] hover:bg-white"
+                : "border-[var(--sf-border)] bg-white/80"
             }`}
           >
-            <div className="text-[12px] leading-snug font-bold text-gray-900">
+            <div className="text-[12px] leading-snug font-semibold text-[var(--sf-ink)]">
               {it.title || "(no title)"}
             </div>
 
             {it.snippet && (
-              <div className="mt-1 text-[11px] leading-relaxed text-gray-600">
+              <div className="mt-1 text-[11px] leading-relaxed text-[var(--sf-ink-muted)]">
                 {it.snippet}
               </div>
             )}
 
             {it.link && (
-              <div className="mt-2 truncate font-mono text-[10px] text-indigo-600">
+              <div className="mt-2 truncate font-mono text-[10px] text-[var(--sf-accent-strong)]">
                 {it.link}
               </div>
             )}
@@ -1580,7 +1657,7 @@ const SearchResults: React.FC<{ items: SearchItem[] }> = ({ items }) => {
       {items.length > max && (
         <button
           onClick={() => setExpanded((v) => !v)}
-          className="text-[10px] font-bold tracking-widest text-indigo-600 uppercase hover:text-indigo-700"
+          className="text-[10px] font-bold tracking-[0.16em] text-[var(--sf-accent-strong)] uppercase hover:opacity-80"
         >
           {expanded ? "收起" : `展开全部（${items.length}条）`}
         </button>
@@ -1620,33 +1697,63 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
   const isObs = step.type === "observation";
   const isFinal = step.type === "final";
   // const isError = step.type === "error";
+  const tone = isThought
+    ? {
+        shell: "border-[var(--sf-border)] bg-white/[0.86]",
+        header:
+          "border-[var(--sf-border)] bg-[rgba(247,249,252,0.9)] text-[var(--sf-ink-muted)]",
+        nested: "border-[var(--sf-border)] bg-white/90",
+        pill: "bg-[rgba(15,23,42,0.07)] text-[var(--sf-ink-soft)]",
+        title: "text-[var(--sf-ink)]",
+        meta: "text-[var(--sf-ink-muted)]",
+      }
+    : isAction
+      ? {
+          shell: "border-[rgba(49,94,251,0.12)] bg-[rgba(232,239,255,0.58)]",
+          header:
+            "border-[rgba(49,94,251,0.12)] bg-[rgba(232,239,255,0.92)] text-[var(--sf-accent-strong)]",
+          nested: "border-[rgba(49,94,251,0.12)] bg-white/[0.88]",
+          pill: "bg-[var(--sf-accent)] text-white",
+          title: "text-[var(--sf-accent-strong)]",
+          meta: "text-[rgba(35,71,207,0.72)]",
+        }
+      : isObs
+        ? {
+            shell: "border-[rgba(15,143,99,0.12)] bg-[rgba(232,248,241,0.72)]",
+            header:
+              "border-[rgba(15,143,99,0.12)] bg-[rgba(232,248,241,0.92)] text-[#0a6d4b]",
+            nested: "border-[rgba(15,143,99,0.12)] bg-white/[0.88]",
+            pill: "bg-[var(--sf-success)] text-white",
+            title: "text-[#0a6d4b]",
+            meta: "text-[rgba(10,109,75,0.72)]",
+          }
+        : isFinal
+          ? {
+              shell: "border-[rgba(15,23,42,0.1)] bg-[rgba(245,247,251,0.94)]",
+              header:
+                "border-[rgba(15,23,42,0.1)] bg-[rgba(255,255,255,0.86)] text-[var(--sf-ink-soft)]",
+              nested: "border-[var(--sf-border)] bg-white/90",
+              pill: "bg-[var(--sf-ink)] text-white",
+              title: "text-[var(--sf-ink)]",
+              meta: "text-[var(--sf-ink-muted)]",
+            }
+          : {
+              shell:
+                "border-[rgba(207,63,83,0.14)] bg-[rgba(255,240,242,0.92)]",
+              header:
+                "border-[rgba(207,63,83,0.14)] bg-[rgba(255,240,242,0.96)] text-[var(--sf-danger)]",
+              nested: "border-[rgba(207,63,83,0.14)] bg-white/90",
+              pill: "bg-[var(--sf-danger)] text-white",
+              title: "text-[var(--sf-danger)]",
+              meta: "text-[rgba(164,47,64,0.74)]",
+            };
 
   return (
     <div
-      className={`animate-in fade-in slide-in-from-bottom-2 overflow-hidden rounded-2xl border duration-500 ${
-        isThought
-          ? "border-gray-100 bg-white"
-          : isAction
-            ? "border-indigo-100 bg-indigo-50/50"
-            : isObs
-              ? "border-emerald-100 bg-emerald-50/50"
-              : isFinal
-                ? "border-purple-100 bg-purple-50"
-                : "border-rose-100 bg-rose-50"
-      }`}
+      className={`animate-in fade-in slide-in-from-bottom-2 overflow-hidden rounded-[24px] border shadow-[0_14px_32px_rgba(15,23,42,0.05)] duration-500 ${tone.shell}`}
     >
       <div
-        className={`flex items-center gap-2 border-b px-4 py-2 text-[10px] font-black tracking-[0.2em] uppercase ${
-          isThought
-            ? "border-gray-100 bg-gray-50 text-gray-400"
-            : isAction
-              ? "border-indigo-100 bg-indigo-100/30 text-indigo-600"
-              : isObs
-                ? "border-emerald-100 bg-emerald-100/30 text-emerald-700"
-                : isFinal
-                  ? "border-purple-100 bg-purple-100/30 text-purple-600"
-                  : "border-rose-100 bg-rose-100/30 text-rose-600"
-        }`}
+        className={`flex items-center gap-2 border-b px-4 py-3 text-[10px] font-extrabold tracking-[0.18em] uppercase ${tone.header}`}
       >
         {isThought && <MessageSquare className="h-3 w-3" />}
         {isAction && <Terminal className="h-3 w-3" />}
@@ -1663,7 +1770,7 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
       </div>
 
       {/* 关键：强制左对齐 + 分类渲染 */}
-      <div className="overflow-x-auto p-4 !text-left font-mono text-xs leading-relaxed text-gray-700">
+      <div className="overflow-x-auto p-4 !text-left text-sm leading-6 text-[var(--sf-ink-soft)]">
         {isAction ? (
           Array.isArray(step.actions) && step.actions.length > 0 ? (
             <div className="space-y-3">
@@ -1675,13 +1782,19 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
                 return (
                   <div
                     key={`${toolName}-${idx}`}
-                    className="rounded-xl border border-indigo-100 bg-white p-3"
+                    className={`rounded-[18px] border p-3 ${tone.nested}`}
                   >
                     <div className="mb-2 flex items-center gap-2">
-                      <span className="rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
+                      <span
+                        className={`rounded-full px-2 py-1 text-[10px] font-bold uppercase ${tone.pill}`}
+                      >
                         Tool #{idx + 1}
                       </span>
-                      <span className="font-bold text-indigo-700">{toolName}</span>
+                      <span
+                        className={`font-mono text-[11px] font-semibold ${tone.title}`}
+                      >
+                        {toolName}
+                      </span>
                     </div>
                     <ContentRenderer content={action.args} />
                   </div>
@@ -1691,10 +1804,16 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
           ) : (
             <div className="space-y-2">
               <div className="flex items-center gap-2">
-                <span className="rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
+                <span
+                  className={`rounded-full px-2 py-1 text-[10px] font-bold uppercase ${tone.pill}`}
+                >
                   Tool
                 </span>
-                <span className="font-bold text-indigo-700">{step.tool}</span>
+                <span
+                  className={`font-mono text-[11px] font-semibold ${tone.title}`}
+                >
+                  {step.tool}
+                </span>
               </div>
               <ContentRenderer content={step.toolInput} />
             </div>
@@ -1710,20 +1829,28 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
                 return (
                   <div
                     key={`${obsType}-${idx}`}
-                    className="rounded-xl border border-emerald-100 bg-white p-3"
+                    className={`rounded-[18px] border p-3 ${tone.nested}`}
                   >
                     <div className="mb-2 flex items-center gap-2">
-                      <span className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white uppercase">
+                      <span
+                        className={`rounded-full px-2 py-1 text-[10px] font-bold uppercase ${tone.pill}`}
+                      >
                         Obs #{idx + 1}
                       </span>
-                      <span className="font-bold text-emerald-700">{obsType}</span>
+                      <span
+                        className={`font-mono text-[11px] font-semibold ${tone.title}`}
+                      >
+                        {obsType}
+                      </span>
                       {typeof observation.action_id === "string" && (
-                        <span className="text-[10px] text-emerald-700/70">
+                        <span className={`font-mono text-[10px] ${tone.meta}`}>
                           action_id={observation.action_id}
                         </span>
                       )}
                     </div>
-                    <ContentRenderer content={formatObservationPreview(observation.content)} />
+                    <ContentRenderer
+                      content={formatObservationPreview(observation.content)}
+                    />
                   </div>
                 );
               })}
@@ -1738,4 +1865,3 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
     </div>
   );
 };
-
