@@ -1,0 +1,52 @@
+<svg width="1280" height="320" viewBox="0 0 1280 320" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">StewardFlow banner option ops</title>
+  <desc id="desc">Transparent banner with a browser operations symbol and StewardFlow wordmark.</desc>
+  <defs>
+    <linearGradient id="accentOps" x1="72" y1="84" x2="264" y2="236" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8DC4FF"/>
+      <stop offset="1" stop-color="#315EFB"/>
+    </linearGradient>
+    <filter id="softShadowOps" x="26" y="36" width="296" height="252" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#0F172A" flood-opacity="0.11"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#softShadowOps)">
+    <rect x="44" y="60" width="236" height="184" rx="34" fill="white" stroke="#DCE6F6" stroke-width="2"/>
+    <rect x="44" y="60" width="236" height="42" rx="34" fill="#F8FAFC"/>
+    <circle cx="74" cy="81" r="6" fill="#D4DDEB"/>
+    <circle cx="96" cy="81" r="6" fill="#D4DDEB"/>
+    <circle cx="118" cy="81" r="6" fill="#D4DDEB"/>
+    <path d="M78 184H128L154 150H196L228 120" stroke="#0F172A" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M228 120L206 120" stroke="url(#accentOps)" stroke-width="12" stroke-linecap="round"/>
+    <path d="M228 120L228 142" stroke="url(#accentOps)" stroke-width="12" stroke-linecap="round"/>
+    <rect x="72" y="122" width="50" height="18" rx="9" fill="#EEF4FF"/>
+    <rect x="170" y="184" width="54" height="18" rx="9" fill="#EEF4FF"/>
+  </g>
+
+  <g transform="translate(340 92)">
+    <text x="0" y="58" fill="#0F172A" font-family="Manrope, Inter, Segoe UI, Arial, sans-serif" font-size="72" font-weight="800" letter-spacing="-2.4">
+      StewardFlow
+    </text>
+    <text x="2" y="104" fill="#4B5563" font-family="IBM Plex Mono, Consolas, monospace" font-size="24" font-weight="500" letter-spacing="0.3">
+      Browser automation, execution trace, HITL recovery, one workspace
+    </text>
+
+    <g transform="translate(0 138)">
+      <rect width="238" height="44" rx="22" fill="#0F172A"/>
+      <text x="22" y="29" fill="white" font-family="IBM Plex Mono, Consolas, monospace" font-size="16" font-weight="700">
+        SANDBOX + WORKBENCH
+      </text>
+
+      <rect x="254" width="162" height="44" rx="22" fill="#EEF4FF"/>
+      <text x="278" y="29" fill="#315EFB" font-family="IBM Plex Mono, Consolas, monospace" font-size="16" font-weight="700">
+        VNC READY
+      </text>
+
+      <rect x="432" width="180" height="44" rx="22" fill="#F3F4F6"/>
+      <text x="456" y="29" fill="#334155" font-family="IBM Plex Mono, Consolas, monospace" font-size="16" font-weight="700">
+        SAFE INTERRUPTS
+      </text>
+    </g>
+  </g>
+</svg>

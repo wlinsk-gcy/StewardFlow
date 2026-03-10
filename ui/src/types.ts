@@ -1,5 +1,6 @@
 ﻿export interface AgentStep {
-    stepId?: number;
+    stepId?: string;
+    msgId?: string;
     type: 'thought' | 'action' | 'observation' | 'final' | 'error';
     content: string;
     tool?: string;

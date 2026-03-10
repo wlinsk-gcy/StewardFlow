@@ -1,85 +1,86 @@
-# StewardFlow: ReAct & HITL Agent
+# StewardFlow: A Visual ReAct Agent for Browser and Tool Execution
 
-![StewardFlow Banner](public/banner.png)
+![StewardFlow Banner](public/banner-option-ops.svg)
 
 [中文](README.md) | English
 
-StewardFlow is a visual `ReAct Agent` built with `FastAPI` + `React`. It supports `MCP Server` integration, ships with a built-in `Docker sandbox`, and provides traceable execution logs, a browser noVNC view, HITL recovery, and trace-oriented in-memory checkpoints plus context reconstruction.
+StewardFlow is an engineering-first agent workspace built with `FastAPI` + `React`. It combines `ReAct` reasoning, tool
+execution, browser automation, `HITL` recovery, execution trace visualization, and a Docker sandbox runtime in one
+surface. The goal is not just to chat, but to execute in a real environment with visibility, interruption, and recovery.
 
-## Latest Updates
+## Demo Case
 
-- Added frontend stop control: the primary input button now shows loading while waiting for the first `trace_id`, then switches to `Stop` once the backend run can be targeted.
-- Added `POST /agent/stop` so an in-flight trace can be interrupted without shutting down the backend service.
-- Added `CANCELLED` as a terminal trace state; cancelled traces can later start a new turn on the same trace.
-- Context reconstruction now serializes committed history only, so incomplete tool transcripts are not fed back into future LLM messages.
-- HITL synthetic continuation is injected only after `REQUEST_INPUT` is actually completed with `done`.
+### 1. Browser automation
 
-## Demo
+```text
+Open Xiaohongshu. Summary The top 10 blog posts with the most likes and AI topics published in the last week. And count the titles of these ten articles, the content of the articles, whether they are pictures or videos, and the topics they carry.
+```
 
-The LLM used in the demos is `qwen3.5-plus`.
+### 2. Tools are called in parallel
 
-> If you do not have a qwen API key, you can try one of the following:
->
-> 1. Get a free API key from `https://www.modelscope.cn/` with 20 free calls per day
-> 2. Apply for a free API key from `https://bailian.console.aliyun.com/`; new users receive free trial credits for `qwen3.5-plus`
+```text
+Please do a parallel inspection of the current work area. The following tasks are independent of each other, please try to call the tool in parallel, and do not process them one by one: 
+1. Count all '.py' files and total lines of code 
+2. Count all '.md' files and total lines of code 
+3. Search all 'TODO' and 'FIXME' 
+4. Find the 10 largest files by volume 
+5. Check for 'README.md', 'requirements.txt', 'package.json' to exist
+```
 
-### 1. Open Xiaohongshu, search for the Qwen homepage, and summarize it
+### 3. Code writing
 
-Watch `public/demo1.mp4`
+```text
+Create a minimum workable Node.js static page project in your current environment, write the project file and start the local service via npm, then use the browser tool to open the localhost page and verify that the page content interacts with the button correctly. I'll watch the final page effect directly through VNC, so don't just generate code, you have to actually start and open the page.
+```
 
-### 2. Check which files exist in the current directory
+## What StewardFlow Gives You
 
-Watch `public/demo2.mp4`
+StewardFlow is built for the part that many agent demos avoid: once an agent enters the execution environment, you still
+need to see what it is doing, stop it safely, and resume the run without corrupting future context.
 
-### 3. Use the `bash` tool inside the Docker sandbox
+Key capabilities:
 
-Watch `public/demo3.mp4`
+- visual execution trace for `thought`, `action`, `observation`, `final`, and token usage
+- browser execution panel through noVNC plus sandbox browser tools
+- `HITL` pause-and-resume flow for confirmation, login, captcha, OAuth, and access denial
+- stop and context-boundary control so incomplete work does not leak into future LLM context
+- a single sandbox-backed runtime with both `AgentWorkbench` and `SandboxConsole`
 
-## Feature Overview
+## Architecture Overview
 
-- ReAct execution loop: `THINK -> DECIDE -> EXECUTE -> OBSERVE -> GUARD -> END`
-- Two classes of HITL wait points:
-  - high-risk `bash` command confirmation
-  - browser blocking signals such as login, verification code, OAuth consent, or access denial
-- Real-time WebSocket events: `thought`, `action`, `observation`, `final`, `hitl_confirm`, `hitl_request`, `token_info`, `error`, `end`
-- Dual frontend workspaces:
-  - `AgentWorkbench` for chat, run state, execution trace, and browser view
-  - `SandboxConsole` for sandbox health checks and logs
-- Automatic sandbox lifecycle: one sandbox is created on backend startup and removed on shutdown
-- Scheduling safeguards in `TaskService`: global concurrency limit `4`, queue cap `128`, queue timeout `15s`
-- Interruption safeguards:
-  - active runs are stopped by backend task cancellation
-  - traces already in `WAITING/HITL` do not expose `Stop`
-  - interrupted partial steps are excluded from future LLM context
+![StewardFlow Architecture](public/stewardflow-architecture.png)
 
-## Code Architecture
+Key modules:
 
-![stewardflow-state-machine](public/stewardflow-architecture.png)
+- `main.py`: wires `ToolRegistry`, `TaskService`, `SandboxManager`, `MCPClient`, `ConnectionManager`, and FastAPI
+  lifecycle
+- `TaskService`: trace initialization, queueing, active-task tracking, per-trace serialization, and resume flows
+- `TaskExecutor`: advances the state machine and emits `thought/action/observation/final/end` over WebSocket
+- `SandboxToolRuntime`: forwards tool calls into the sandbox-internal HTTP API
+- `SandboxManager`: creates, deletes, health-checks, and tails Docker sandboxes
+- `AgentWorkbench`: chat, execution trace, browser view, HITL, and stop interaction
+- `SandboxConsole`: sandbox health inspection and logs
 
-### Architecture Notes
+## State Machine
 
-- `main.py` wires together `ToolRegistry`, `TaskService`, `SandboxManager`, `MCPClient`, `ConnectionManager`, and the FastAPI lifecycle.
-- `TaskService` handles trace initialization, queue scheduling, active-task tracking, per-trace serialization, and resuming `WAITING/HITL` or new-turn flows.
-- `TaskExecutor` advances the state machine, handles `CancelledError` explicitly, and emits `thought/action/observation/final/end` events over WebSocket.
-- `CheckpointStore` and `InMemoryCacheManager` are still in-memory only.
-- `CacheManager` rebuilds committed context only:
-  - plain-text answer steps enter context only after completion
-  - tool steps enter context only when `assistant.tool_calls` and every tool result are structurally complete
-  - HITL synthetic continuation is injected only after `REQUEST_INPUT(done)`
-- `SandboxToolRuntime` forwards tool calls to the sandbox-internal HTTP API; browser tools attach tab state in `metadata` and may attach `metadata.hitlBarrier`
-- `SandboxManager` creates, deletes, health-checks, and reads logs from Docker containers; the current runtime still binds the agent to the auto-created sandbox from startup
+![StewardFlow State Machine](public/stewardflow-state-machine.png)
 
-## State Machine Flow
+## Quick Start in 5 Minutes
 
-![stewardflow-state-machine](public/stewardflow-state-machine.png)
+### Prerequisites
 
-## Quick Start
+You need:
+
+- Docker Engine
+- a Python virtual environment workflow
+- Node.js and npm
+- an OpenAI-compatible LLM API key
 
 ### 1. Build the sandbox image
 
 ```bash
 cd sandbox
-docker build -t gui-sandbox:dev .
+docker build --progress=plain -t gui-sandbox:dev -f Dockerfile .
 ```
 
 ### 2. Configure the backend
@@ -103,11 +104,13 @@ At minimum, confirm these fields:
 - `sandbox.docker_base_url`
 - `sandbox.start_url`
 
-Notes:
+Field notes:
 
-- `sandbox.public_host`: node IP used by StewardFlow to reach the sandbox API and noVNC
-- `sandbox.healthcheck_host`: address the backend uses for sandbox `/health`, usually the same as `public_host`
-- `sandbox.docker_base_url`: Docker Engine reachable by the backend, for example `tcp://192.168.130.147:2375`
+- `sandbox.image`: default sandbox image, typically `gui-sandbox:dev`
+- `sandbox.public_host`: host used by the frontend to reach noVNC and sandbox APIs
+- `sandbox.healthcheck_host`: address used by the backend for sandbox `/health`, usually the same as `public_host`
+- `sandbox.docker_base_url`: Docker Engine address, for example `tcp://127.0.0.1:2375`
+- `sandbox.start_url`: initial browser page, currently best set to `chrome://new-tab-page/`
 
 ### 3. Start the backend
 
@@ -119,7 +122,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The default port is `8000`. On startup, the backend automatically creates one sandbox and binds the agent runtime to it.
+The backend listens on `8000` by default. On startup it automatically creates one sandbox and binds the active agent
+runtime to it.
 
 ### 4. Start the frontend
 
@@ -131,34 +135,54 @@ npm run dev
 
 Default frontend URL: `http://localhost:5173`
 
-### 5. Open the frontend
+### 5. Open the workspace
 
-- The frontend calls the backend through `http://localhost:8000`
+- the frontend calls the backend at `http://localhost:8000`
 - WebSocket URL: `ws://localhost:8000/ws/{client_id}`
-- The browser panel uses the sandbox noVNC URL; inspect the current mapped ports with `GET /sandboxes?include_exited=false`
+- the browser panel uses the sandbox noVNC endpoint
+- inspect mapped ports with `GET /sandboxes?include_exited=false`
 
-## Run and Stop Semantics
+## Runtime Model
 
-### Primary button behavior
+### ReAct loop
 
-- idle: `Send`
-- first run started but `trace_id` not returned yet: loading
+The main execution flow is:
+
+`THINK -> DECIDE -> EXECUTE -> OBSERVE -> GUARD -> END`
+
+Where:
+
+- `THINK`: the LLM proposes the next step
+- `DECIDE`: the runtime decides between answer, tool call, HITL, or stop path
+- `EXECUTE`: tools or browser actions run
+- `OBSERVE`: results are collected and fed back
+- `GUARD`: blocking signals, confirmations, interruption, and context boundaries are enforced
+
+### Stop / CANCELLED semantics
+
+- idle: the primary button shows `Send`
+- request sent but `trace_id` not returned yet: loading
 - active run with `trace_id`: `Stop`
-- `WAITING/HITL`: no `Stop`; existing HITL interaction takes over
+- trace in `WAITING/HITL`: `Stop` is hidden and HITL takes over
 
-### Backend stop behavior
+Backend behavior:
 
-- `POST /agent/stop` resolves the active worker task for a trace and cancels it
+- `POST /agent/stop` resolves the active worker task for the target trace and cancels it
 - the executor catches `asyncio.CancelledError` and records the trace as `CANCELLED`
-- interrupted draft steps are not persisted as reusable context
+- cancelled traces can later start a new turn on the same trace
 
-### Context boundary rules
+### HITL and context boundaries
 
-- plain-text answer step: only completed answers are serialized back into messages
-- tool step: only complete `assistant.tool_calls` plus all matching tool results are serialized
-- HITL continuation: injected only when `REQUEST_INPUT` has completed with `request_input == "done"`
+The runtime is intentionally strict about what is allowed to enter future context.
 
-## Built-in Tools
+Rules:
+
+- plain-text answers enter future messages only after completion
+- tool steps enter future messages only when `assistant.tool_calls` and all tool results are structurally complete
+- `REQUEST_INPUT` continuation is injected only after the user actually completes it with `done`
+- interrupted partial steps are excluded from future LLM context
+
+## Built-in Tools and Sandbox Runtime
 
 ### File and command tools
 
@@ -183,36 +207,40 @@ Default frontend URL: `http://localhost:5173`
 - `browser_upload_file`
 - `browser_select_page`
 
-### Current tool contract
+### Tool contract
 
-- every tool returns `output` plus optional `metadata`
+- every tool returns `output` with optional `metadata`
 - oversized output is referenced through `metadata.truncated=true` and `metadata.outputPath`
-- browser tools attach current tab summaries and may attach `metadata.hitlBarrier` when blocking pages are detected
+- browser tools attach current tab summaries
+- blocking pages may attach `metadata.hitlBarrier`
 
-## API Overview
+### Sandbox model
+
+- one sandbox is auto-created on backend startup
+- the current agent runtime stays bound to that startup sandbox
+- `New Session` resets browser state but does not destroy the sandbox
+- `SandboxConsole` uses `/sandboxes/health` and `/sandboxes/{sandbox_id}/logs` for diagnostics
+
+## API Summary
 
 ### Agent API
 
-- `POST /agent/run`
-  - without `trace_id`: create a new trace and enqueue execution
-  - with a `trace_id` in `WAITING + HITL`: resume the current turn with one HITL input
-  - with a `trace_id` in `DONE` / `FAILED` / `CANCELLED` + `END`: start a new turn on the same trace
-- `POST /agent/stop`
-  - active task exists: returns accepted and cancels the run
-  - trace already `WAITING/HITL` or already terminal: returns a no-op response
-- `GET /agent/health`
-- `GET /agent/registry-summary`
+- `POST /agent/run`: create a new trace, resume `WAITING/HITL`, or start a new turn on an existing terminal trace
+- `POST /agent/stop`: stop the active run for a trace
+- `GET /agent/health`: agent service health
+- `GET /agent/registry-summary`: current tool registry summary
 
 ### Sandbox API
 
-- `GET /sandboxes`
-- `POST /sandboxes`
-- `GET /sandboxes/{sandbox_id}`
-- `POST /sandboxes/{sandbox_id}/start`
-- `POST /sandboxes/{sandbox_id}/stop`
-- `DELETE /sandboxes/{sandbox_id}`
-- `GET /sandboxes/{sandbox_id}/health`
-- `GET /sandboxes/{sandbox_id}/logs`
+- `GET /sandboxes`: list sandboxes
+- `POST /sandboxes`: create a sandbox
+- `GET /sandboxes/{sandbox_id}`: inspect one sandbox
+- `POST /sandboxes/{sandbox_id}/start`: start a sandbox
+- `POST /sandboxes/{sandbox_id}/stop`: stop a sandbox
+- `DELETE /sandboxes/{sandbox_id}`: delete a sandbox
+- `GET /sandboxes/health?sandbox_id=<optional>`: health-check a specific sandbox or the currently running one
+- `GET /sandboxes/{sandbox_id}/logs`: read sandbox logs
+- `POST /sandboxes/browser/reset`: reset browser tabs in the currently running sandbox
 
 ## Configuration Notes
 
@@ -222,23 +250,31 @@ Default frontend URL: `http://localhost:5173`
 - `log.level`: log level
 - `llm.model` / `llm.api_key` / `llm.base_url`: OpenAI-compatible LLM settings
 - `sandbox.image`: default sandbox image
-- `sandbox.public_host`: host address used by the frontend for noVNC
-- `sandbox.healthcheck_host`: address used by the backend for sandbox `/health`
+- `sandbox.public_host`: host used by the frontend for noVNC
+- `sandbox.healthcheck_host`: host used by the backend for sandbox `/health`
 - `sandbox.docker_base_url`: Docker Engine address
-- `sandbox.start_url`: initial Chromium URL
+- `sandbox.start_url`: initial Chromium page
 - `sandbox.display_width` / `sandbox.display_height`: virtual desktop resolution
 
 ### `mcp_config.json.example`
 
-- the repository includes MCP client and connector implementations
-- supports both `stdio` and `http` MCP integration
+- the repository already includes MCP client and connector implementations
+- both `stdio` and `http` MCP integration are supported
 
 ## Known Limitations
 
-- checkpoints, message caches, and WebSocket connection state are still process-memory only; running traces are not recoverable after service restart
-- the current LLM provider path still uses synchronous chat completion, so stop responsiveness during a blocking LLM request depends on that request returning
-- some tool awaits may not be truly cancellable; the trace can still move to `CANCELLED`, but the underlying I/O latency depends on the tool implementation
-- the agent runtime still binds only to the sandbox auto-created on startup; manually created sandboxes do not automatically become the active execution target
+- checkpoints, message caches, and WebSocket connection state are still process-memory only; in-flight traces are not
+  recoverable after restart
+- the LLM provider path is now async chat completion; stop usually reaches an in-flight LLM await faster, but actual
+  cancellation latency still depends on the OpenAI SDK, underlying HTTP behavior, and upstream compatibility
+- some tool awaits may not be truly cancellable; a trace can move to `CANCELLED` before the underlying I/O fully exits
+- the agent runtime still binds only to the sandbox auto-created on startup; manually created sandboxes do not
+  automatically become the active execution target
+- `CheckpointStore` and `InMemoryCacheManager` are still memory-backed only
+
+## License
+
+This repository is released under the `MIT` License. See [LICENSE](LICENSE).
 
 ## Special Thanks
 

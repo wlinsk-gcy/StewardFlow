@@ -498,3 +498,14 @@ async def tools_select_page(req: SelectPageRequest) -> dict[str, Any]:
         )
     except Exception as exc:
         return _tool_error_payload(exc)
+
+
+@app.post("/browser/reset")
+async def browser_reset() -> dict[str, Any]:
+    try:
+        return await browser_runtime.reset_browser(
+            state=get_browser_state(),
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)

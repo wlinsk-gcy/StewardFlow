@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Literal
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,72 @@ class SandboxCreateRequest(BaseModel):
 
 
 router = APIRouter(prefix="/sandboxes", tags=["Sandboxes"])
+
+
+def _select_running_sandbox(manager: SandboxManager) -> dict[str, Any] | None:
+    items = manager.list(include_exited=False)
+    running = [item for item in items if item.get("status") == "running"]
+    if not running:
+        return None
+    running.sort(key=lambda item: str(item.get("created") or ""), reverse=True)
+    return running[0]
+
+
+def _select_running_sandbox_id(manager: SandboxManager) -> str:
+    target = _select_running_sandbox(manager)
+    if target is None:
+        raise SandboxManagerError("No running sandbox found", status_code=404)
+    sandbox_id = str(target.get("sandbox_id") or "").strip()
+    if not sandbox_id:
+        raise SandboxManagerError(
+            "Running sandbox payload is missing sandbox_id",
+            status_code=500,
+        )
+    return sandbox_id
+
+
+def _reset_sandbox_browser(manager: SandboxManager, sandbox_id: str) -> dict[str, Any]:
+    payload = manager.get(sandbox_id)
+    if payload.get("status") != "running":
+        raise SandboxManagerError(f"Sandbox not running: {sandbox_id}", status_code=409)
+
+    api_port = payload.get("ports", {}).get("api")
+    if not api_port:
+        raise SandboxManagerError(
+            f"Sandbox API port unavailable: {sandbox_id}",
+            status_code=503,
+        )
+
+    url = f"http://{manager.healthcheck_host}:{int(api_port)}/browser/reset"
+    try:
+        response = requests.post(url, json={}, timeout=30)
+    except Exception as exc:
+        raise SandboxManagerError(
+            f"Failed to reset sandbox browser: {exc}",
+            status_code=502,
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise SandboxManagerError(
+            f"Sandbox browser reset failed: {data}",
+            status_code=response.status_code,
+        )
+    if isinstance(data, dict) and str(data.get("output") or "").startswith("ErrorInfo:\n"):
+        raise SandboxManagerError(
+            f"Sandbox browser reset failed: {data['output']}",
+            status_code=502,
+        )
+
+    return {
+        "status": "ok",
+        "sandbox_id": sandbox_id,
+        "result": data,
+    }
 
 
 @router.post("", status_code=201)
@@ -90,6 +157,49 @@ async def list_sandboxes(
     try:
         items = await asyncio.to_thread(manager.list, include_exited=include_exited)
         return {"count": len(items), "items": items}
+    except SandboxManagerError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.get("/health")
+async def sandbox_health(
+    sandbox_id: str | None = Query(default=None),
+    timeout_sec: int = Query(default=3, ge=1, le=30),
+    manager: SandboxManager = Depends(get_sandbox_manager),
+) -> dict[str, Any]:
+    try:
+        resolved_sandbox_id = sandbox_id.strip() if sandbox_id else ""
+        if not resolved_sandbox_id:
+            resolved_sandbox_id = await asyncio.to_thread(_select_running_sandbox_id, manager)
+        return await asyncio.to_thread(
+            manager.health,
+            resolved_sandbox_id,
+            timeout_sec=timeout_sec,
+        )
+    except SandboxManagerError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/browser/reset")
+async def reset_running_sandbox_browser(
+    manager: SandboxManager = Depends(get_sandbox_manager),
+) -> dict[str, Any]:
+    try:
+        target = await asyncio.to_thread(_select_running_sandbox, manager)
+        if target is None:
+            return {
+                "status": "noop",
+                "sandbox_id": None,
+                "reason": "no_running_sandbox",
+            }
+        sandbox_id = str(target.get("sandbox_id") or "").strip()
+        if not sandbox_id:
+            return {
+                "status": "noop",
+                "sandbox_id": None,
+                "reason": "invalid_sandbox_payload_missing_sandbox_id",
+            }
+        return await asyncio.to_thread(_reset_sandbox_browser, manager, sandbox_id)
     except SandboxManagerError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
@@ -155,14 +265,3 @@ async def sandbox_logs(
     except SandboxManagerError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-
-@router.get("/{sandbox_id}/health")
-async def sandbox_health(
-    sandbox_id: str,
-    timeout_sec: int = Query(default=3, ge=1, le=30),
-    manager: SandboxManager = Depends(get_sandbox_manager),
-) -> dict[str, Any]:
-    try:
-        return await asyncio.to_thread(manager.health, sandbox_id, timeout_sec=timeout_sec)
-    except SandboxManagerError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

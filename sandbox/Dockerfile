@@ -2,7 +2,7 @@
 
 # Pin a concrete baseimage-gui release tag to avoid drift.
 # Bump by checking: https://github.com/jlesage/docker-baseimage-gui/releases
-FROM docker.1ms.run/jlesage/baseimage-gui:ubuntu-24.04-v4
+FROM jlesage/baseimage-gui:ubuntu-24.04-v4
 
 # Upstream docs references (baseimage-gui):
 # - Init/service model and custom services under /etc/services.d:
@@ -23,6 +23,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CHROME_REMOTE_DEBUGGING_PORT=9222 \
     SANDBOX_ARTIFACT_ROOT=/config/tool-artifacts \
     SANDBOX_UPLOAD_ROOT=/config/uploads \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=8 \
     PATH=/opt/venv/bin:$PATH
 
 # Set application name shown by baseimage-gui web UI.
@@ -32,25 +35,96 @@ RUN set-cont-env APP_NAME "StewardFlow GUI Sandbox"
 # Chromium is installed via Playwright and launched by /startapp.sh.
 # Basic fonts avoid blank glyph rendering when Playwright screenshots pages.
 COPY api/requirements.txt /tmp/requirements.txt
+ARG UBUNTU_APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu/
+ARG NODE_VERSION=24.14.0
+ARG NODE_DIST_BASE_URL=https://nodejs.org/dist
+ARG NODE_DOWNLOAD_CONNECT_TIMEOUT=30
+ARG NODE_DOWNLOAD_RETRY=5
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+ARG PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=300000
 
+# Force container-side Ubuntu packages to use a faster mirror.
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+      printf 'Types: deb\nURIs: %s\nSuites: noble noble-updates noble-backports\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\nTypes: deb\nURIs: %s\nSuites: noble-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+        "$UBUNTU_APT_MIRROR" "$UBUNTU_APT_MIRROR" \
+        > /etc/apt/sources.list.d/ubuntu.sources; \
+      rm -f /etc/apt/sources.list; \
+    elif [ -f /etc/apt/sources.list ]; then \
+      printf 'deb %s noble main restricted universe multiverse\ndeb %s noble-updates main restricted universe multiverse\ndeb %s noble-backports main restricted universe multiverse\ndeb %s noble-security main restricted universe multiverse\n' \
+        "$UBUNTU_APT_MIRROR" "$UBUNTU_APT_MIRROR" "$UBUNTU_APT_MIRROR" "$UBUNTU_APT_MIRROR" \
+        > /etc/apt/sources.list; \
+    fi
+
+# Base Ubuntu dependencies and fonts.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+       gpg \
        python3.12 \
        python3.12-venv \
        python3-pip \
        ripgrep \
-       ca-certificates \
-       curl \
        git \
        fonts-dejavu-core \
        fonts-liberation \
        fonts-noto-cjk \
        fonts-noto-color-emoji \
     && python3.12 -m venv "$VENV_PATH" \
-    && "$VENV_PATH/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel \
-    && "$VENV_PATH/bin/pip" install --no-cache-dir -r /tmp/requirements.txt \
-    && "$VENV_PATH/bin/python" -m playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/* /root/.cache/pip /tmp/requirements.txt
+    && rm -rf /var/lib/apt/lists/*
+
+# Install a fixed Node.js LTS tarball to avoid NodeSource APT bottlenecks.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       xz-utils \
+    && ARCH="$(dpkg --print-architecture)" \
+    && case "$ARCH" in \
+         amd64) NODE_ARCH="x64" ;; \
+         arm64) NODE_ARCH="arm64" ;; \
+         *) echo "Unsupported Node.js architecture: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && NODE_DIST="node-v${NODE_VERSION}-linux-${NODE_ARCH}" \
+    && echo "Downloading ${NODE_DIST}.tar.xz from ${NODE_DIST_BASE_URL}/v${NODE_VERSION}/" \
+    && curl -fL --progress-bar \
+       --connect-timeout "${NODE_DOWNLOAD_CONNECT_TIMEOUT}" \
+       --retry "${NODE_DOWNLOAD_RETRY}" \
+       --retry-delay 2 \
+       --retry-all-errors \
+       -o "${NODE_DIST}.tar.xz" \
+       "${NODE_DIST_BASE_URL}/v${NODE_VERSION}/${NODE_DIST}.tar.xz" \
+    && echo "Downloading SHASUMS256.txt from ${NODE_DIST_BASE_URL}/v${NODE_VERSION}/" \
+    && curl -fL --progress-bar \
+       --connect-timeout "${NODE_DOWNLOAD_CONNECT_TIMEOUT}" \
+       --retry "${NODE_DOWNLOAD_RETRY}" \
+       --retry-delay 2 \
+       --retry-all-errors \
+       -o SHASUMS256.txt \
+       "${NODE_DIST_BASE_URL}/v${NODE_VERSION}/SHASUMS256.txt" \
+    && grep " ${NODE_DIST}.tar.xz\$" SHASUMS256.txt | sha256sum -c - \
+    && tar -xJf "${NODE_DIST}.tar.xz" -C /usr/local --strip-components=1 \
+    && node --version \
+    && npm --version \
+    && rm -f "${NODE_DIST}.tar.xz" SHASUMS256.txt \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies.
+RUN "$VENV_PATH/bin/pip" install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /tmp/requirements.txt \
+    && rm -rf /root/.cache/pip /tmp/requirements.txt
+
+# Playwright supports custom download hosts and connection timeout via env vars.
+# Default to the verified npmmirror binary CDN for the pinned Playwright build;
+# callers can still override PLAYWRIGHT_DOWNLOAD_HOST at build time when needed.
+RUN if [ -n "$PLAYWRIGHT_DOWNLOAD_HOST" ]; then \
+      export PLAYWRIGHT_DOWNLOAD_HOST="$PLAYWRIGHT_DOWNLOAD_HOST"; \
+      echo "Using custom Playwright download host: $PLAYWRIGHT_DOWNLOAD_HOST"; \
+    else \
+      echo "Using default Playwright download host"; \
+    fi \
+    && PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT="$PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT" \
+       "$VENV_PATH/bin/python" -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a GUI app launcher directly in-image so this Dockerfile can be copied
 # and built independently without requiring external rootfs files.

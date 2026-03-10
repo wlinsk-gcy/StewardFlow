@@ -292,7 +292,7 @@ class TaskExecutor:
             "user_input": turn.user_input,
             "messages": messages,
         }
-        finish_reason, reasoning, actions, token_info = self.llm.generate(context)
+        finish_reason, reasoning, actions, token_info = await self.llm.generate(context)
 
         if trace.token_info:
             trace.token_info["cache_tokens"] += token_info["cache_tokens"]
@@ -301,9 +301,9 @@ class TaskExecutor:
             trace.token_info["total_tokens"] += token_info["total_tokens"]
         else:
             trace.token_info = token_info
-        event = Event(EventType.THOUGHT, trace.trace_id, turn.turn_id, {"content": reasoning})
+        event = Event(EventType.THOUGHT, trace.trace_id, step.step_id, {"content": reasoning})
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-        event = Event(EventType.TOKEN_INFO, trace.trace_id, turn.turn_id, trace.token_info)
+        event = Event(EventType.TOKEN_INFO, trace.trace_id, step.step_id, trace.token_info)
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
         step.thought = reasoning
         step.actions = actions
@@ -325,7 +325,7 @@ class TaskExecutor:
         data = dict(actions[0])
         data["actions"] = actions
         data["count"] = len(actions)
-        event = Event(EventType.ACTION, trace.trace_id, turn.turn_id, data)
+        event = Event(EventType.ACTION, trace.trace_id, step.step_id, data)
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
 
     async def _emit_observation_batch(self, trace: Trace, turn: Turn, step: Step) -> None:
@@ -335,7 +335,7 @@ class TaskExecutor:
         data = dict(observations[-1])
         data["observations"] = observations
         data["count"] = len(observations)
-        event = Event(EventType.OBSERVATION, trace.trace_id, turn.turn_id, data)
+        event = Event(EventType.OBSERVATION, trace.trace_id, step.step_id, data)
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
 
     async def _enter_tool_confirm_wait(self, trace: Trace, turn: Turn, step: Step, action: Action) -> None:
@@ -520,7 +520,7 @@ class TaskExecutor:
         final_content = answer_content if answer_content else tao_observation_content
         event = Event(EventType.FINAL,
                       trace.trace_id,
-                      turn.turn_id,
+                      step.step_id,
                       {"content": final_content})
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
 
