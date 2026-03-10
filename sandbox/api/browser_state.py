@@ -400,6 +400,13 @@ class BrowserState:
             self._dialog_event.clear()
         return dialog
 
+    def clear_runtime_state(self) -> None:
+        self.page_document_ids.clear()
+        self.snapshots_by_id.clear()
+        self.latest_snapshot_by_page.clear()
+        self.dialog_queue.clear()
+        self._dialog_event = asyncio.Event()
+
     async def wait_for_dialog(self, timeout: float) -> bool:
         if self.dialog_queue:
             return True

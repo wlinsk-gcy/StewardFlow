@@ -236,7 +236,7 @@ Default frontend URL: `http://localhost:5173`
 ## Known Limitations
 
 - checkpoints, message caches, and WebSocket connection state are still process-memory only; running traces are not recoverable after service restart
-- the current LLM provider path still uses synchronous chat completion, so stop responsiveness during a blocking LLM request depends on that request returning
+- the LLM provider path now uses async chat completion, so stop can usually interrupt an in-flight LLM await more quickly; actual cancellation latency still depends on the OpenAI SDK, the underlying HTTP connection, and upstream compatibility behavior
 - some tool awaits may not be truly cancellable; the trace can still move to `CANCELLED`, but the underlying I/O latency depends on the tool implementation
 - the agent runtime still binds only to the sandbox auto-created on startup; manually created sandboxes do not automatically become the active execution target
 

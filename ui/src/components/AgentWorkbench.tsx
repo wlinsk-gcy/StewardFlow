@@ -15,6 +15,8 @@ import {
   Server,
   X,
   RefreshCw,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import {
   type AgentStep,
@@ -24,6 +26,7 @@ import {
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useLayoutEffect } from "react";
 
 function normalizeText(s: string) {
   return s.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
@@ -88,6 +91,16 @@ function truncateWithEllipsis(text: string, maxChars = 48): string {
   return `${chars.slice(0, maxChars).join("")}...`;
 }
 
+type BrowserViewportRect = {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+};
+
+const BROWSER_VIEWPORT_TRANSITION_MS = 320;
+const BROWSER_VIEWPORT_TRANSITION_EASING = "cubic-bezier(0.22, 1, 0.36, 1)";
+
 export const AgentWorkbench: React.FC = () => {
   const apiBase = useMemo(() => {
     const configured = import.meta.env.VITE_API_BASE as string | undefined;
@@ -111,6 +124,11 @@ export const AgentWorkbench: React.FC = () => {
   const [isStopping, setIsStopping] = useState(false);
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [activeTab, setActiveTab] = useState<"runner" | "browser">("runner");
+  const [isBrowserExpanded, setIsBrowserExpanded] = useState(false);
+  const [isBrowserAnimating, setIsBrowserAnimating] = useState(false);
+  const [isBrowserVisualExpanded, setIsBrowserVisualExpanded] = useState(false);
+  const [browserViewportRect, setBrowserViewportRect] =
+    useState<BrowserViewportRect | null>(null);
   const [novncUrl, setNovncUrl] = useState<string | null>(null);
   const [tokenInfo, setTokenInfo] = useState<{
     cache_tokens: number;
@@ -130,6 +148,7 @@ export const AgentWorkbench: React.FC = () => {
   const [registrySummary, setRegistrySummary] = useState<RegistrySummary | null>(
     null,
   );
+  const [isResettingSession, setIsResettingSession] = useState(false);
 
   // --- 新增：WebSocket 相关状态 ---
   const [clientId] = useState(() => uuidv4());
@@ -137,6 +156,10 @@ export const AgentWorkbench: React.FC = () => {
   const socketRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const traceScrollRef = useRef<HTMLDivElement>(null);
+  const workbenchBodyRef = useRef<HTMLDivElement>(null);
+  const browserDockRef = useRef<HTMLDivElement>(null);
+  const browserTransitionFrameRef = useRef<number | null>(null);
+  const browserTransitionTimerRef = useRef<number | null>(null);
   const normalizedNoVncUrl = useMemo(() => {
     if (!novncUrl) return null;
     const candidate = novncUrl.trim();
@@ -158,6 +181,105 @@ export const AgentWorkbench: React.FC = () => {
     }
   }, [apiBase]);
 
+  const clearBrowserTransition = useCallback(() => {
+    if (browserTransitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(browserTransitionFrameRef.current);
+      browserTransitionFrameRef.current = null;
+    }
+    if (browserTransitionTimerRef.current !== null) {
+      window.clearTimeout(browserTransitionTimerRef.current);
+      browserTransitionTimerRef.current = null;
+    }
+  }, []);
+
+  const measureBrowserViewportRect = useCallback(
+    (expanded: boolean): BrowserViewportRect | null => {
+      const workbenchBody = workbenchBodyRef.current;
+      if (!workbenchBody) return null;
+
+      if (expanded) {
+        return {
+          top: 0,
+          left: 0,
+          width: workbenchBody.clientWidth,
+          height: workbenchBody.clientHeight,
+        };
+      }
+
+      const browserDock = browserDockRef.current;
+      if (!browserDock) return null;
+
+      const bodyRect = workbenchBody.getBoundingClientRect();
+      const dockRect = browserDock.getBoundingClientRect();
+      return {
+        top: dockRect.top - bodyRect.top,
+        left: dockRect.left - bodyRect.left,
+        width: dockRect.width,
+        height: dockRect.height,
+      };
+    },
+    [],
+  );
+
+  const finishBrowserTransition = useCallback(
+    (expanded: boolean) => {
+      clearBrowserTransition();
+      setIsBrowserAnimating(false);
+      const finalRect = measureBrowserViewportRect(expanded);
+      if (finalRect) {
+        setBrowserViewportRect(finalRect);
+      }
+      if (!expanded) {
+        setIsBrowserVisualExpanded(false);
+      }
+    },
+    [clearBrowserTransition, measureBrowserViewportRect],
+  );
+
+  const animateBrowserViewport = useCallback(
+    (expand: boolean) => {
+      if (!normalizedNoVncUrl) return;
+
+      const targetRect = measureBrowserViewportRect(expand);
+      const originRect = browserViewportRect ?? measureBrowserViewportRect(!expand);
+      if (!targetRect || !originRect) {
+        clearBrowserTransition();
+        setIsBrowserAnimating(false);
+        setIsBrowserExpanded(expand);
+        setIsBrowserVisualExpanded(expand);
+        setBrowserViewportRect(targetRect ?? originRect ?? null);
+        return;
+      }
+
+      clearBrowserTransition();
+      if (expand) {
+        setActiveTab("browser");
+        setIsBrowserVisualExpanded(true);
+      }
+
+      setIsBrowserAnimating(true);
+      setBrowserViewportRect(originRect);
+      setIsBrowserExpanded(expand);
+
+      browserTransitionFrameRef.current = window.requestAnimationFrame(() => {
+        browserTransitionFrameRef.current = window.requestAnimationFrame(() => {
+          setBrowserViewportRect(targetRect);
+        });
+      });
+
+      browserTransitionTimerRef.current = window.setTimeout(() => {
+        finishBrowserTransition(expand);
+      }, BROWSER_VIEWPORT_TRANSITION_MS);
+    },
+    [
+      browserViewportRect,
+      clearBrowserTransition,
+      finishBrowserTransition,
+      measureBrowserViewportRect,
+      normalizedNoVncUrl,
+    ],
+  );
+
   // --- 新增：初始化 WebSocket ---
   const handleIncomingEvent = useCallback((event: any) => {
     const { event_type, data, timestamp, msg_id } = event;
@@ -174,7 +296,7 @@ export const AgentWorkbench: React.FC = () => {
     }
 
     // 1. 处理执行日志 (Execution Trace)
-    // 日志通常不需要流式输出，直接追加到 steps 数组即可
+    // 同一步骤可能收到多次状态快照，前端需要按 step 维度更新而不是盲目追加。
     if (["thought", "action", "observation", "final"].includes(event_type)) {
       // console.log('receive execute trace', event);
       const MAX_LEN = 500;
@@ -195,7 +317,10 @@ export const AgentWorkbench: React.FC = () => {
             : "");
       const content =
         rawContent.length > MAX_LEN ? rawContent.slice(0, MAX_LEN) + "..." : rawContent;
+      const stepMsgId = typeof msg_id === "string" ? msg_id : undefined;
       const newStep: AgentStep = {
+        stepId: stepMsgId,
+        msgId: stepMsgId,
         type: event_type,
         content: content,
         tool: data.tool_name,
@@ -204,7 +329,23 @@ export const AgentWorkbench: React.FC = () => {
         observations: observationBatch,
         timestamp: new Date(timestamp).getTime(),
       };
-      setSteps((prev) => [...prev, newStep]);
+      setSteps((prev) => {
+        if (!stepMsgId) {
+          return [...prev, newStep];
+        }
+        const existingIndex = prev.findIndex(
+          (item) => item.type === event_type && item.msgId === stepMsgId,
+        );
+        if (existingIndex < 0) {
+          return [...prev, newStep];
+        }
+        const next = [...prev];
+        next[existingIndex] = {
+          ...next[existingIndex],
+          ...newStep,
+        };
+        return next;
+      });
 
       if (event_type === "observation") {
         const obsHasBrowserAction =
@@ -453,6 +594,49 @@ export const AgentWorkbench: React.FC = () => {
   }, [activeTab, refreshNoVncUrl]);
 
   useEffect(() => {
+    if (!isBrowserVisualExpanded) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        animateBrowserViewport(false);
+      }
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => {
+      window.removeEventListener("keydown", handleEscape);
+    };
+  }, [animateBrowserViewport, isBrowserVisualExpanded]);
+
+  useLayoutEffect(() => {
+    if (!normalizedNoVncUrl || isBrowserAnimating) return;
+    const syncBrowserViewport = () => {
+      const nextRect = measureBrowserViewportRect(isBrowserExpanded);
+      if (nextRect) {
+        setBrowserViewportRect(nextRect);
+      }
+    };
+    syncBrowserViewport();
+    window.addEventListener("resize", syncBrowserViewport);
+    return () => {
+      window.removeEventListener("resize", syncBrowserViewport);
+    };
+  }, [isBrowserAnimating, isBrowserExpanded, measureBrowserViewportRect, normalizedNoVncUrl]);
+
+  useEffect(() => {
+    if (normalizedNoVncUrl) return;
+    clearBrowserTransition();
+    setIsBrowserAnimating(false);
+    setIsBrowserExpanded(false);
+    setIsBrowserVisualExpanded(false);
+    setBrowserViewportRect(null);
+  }, [clearBrowserTransition, normalizedNoVncUrl]);
+
+  useEffect(() => {
+    return () => {
+      clearBrowserTransition();
+    };
+  }, [clearBrowserTransition]);
+
+  useEffect(() => {
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
@@ -507,7 +691,7 @@ export const AgentWorkbench: React.FC = () => {
   };
 
   const handleRun = async () => {
-    if (!goal.trim() || isRunning || isStopping || pendingConfirm) return;
+    if (!goal.trim() || isRunning || isStopping || isResettingSession || pendingConfirm) return;
 
     // 1. UI 反馈
     const userMessage: ChatMessage = {
@@ -596,26 +780,96 @@ export const AgentWorkbench: React.FC = () => {
     }
   };
 
-  const handleNewSession = () => {
+  const handleNewSession = async () => {
+    if (isRunning || isStopping || pendingConfirm || isResettingSession) return;
+
+    setIsResettingSession(true);
+    try {
+      const response = await fetch(`${apiBase}/sandboxes/browser/reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        throw new Error("Failed to reset sandbox browser");
+      }
+    } catch (error) {
+      console.error(error);
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          id: uuidv4(),
+          role: "assistant",
+          content: "浏览器重置失败，当前会话未清空，请稍后重试。",
+          timestamp: Date.now(),
+        },
+      ]);
+      setIsResettingSession(false);
+      return;
+    }
+
+    clearBrowserTransition();
     setChatHistory([]);
     setSteps([]);
     setPendingConfirm(null);
     setIsRunning(false);
     setIsStopping(false);
+    setIsBrowserExpanded(false);
+    setIsBrowserAnimating(false);
+    setIsBrowserVisualExpanded(false);
+    setBrowserViewportRect(null);
     setGoal("");
     setTokenInfo(null);
     setTraceId(null);
     setNovncUrl(null);
     setActiveTab("runner");
+    setIsResettingSession(false);
   };
+
+  const openBrowserExpanded = useCallback(() => {
+    if (!normalizedNoVncUrl) return;
+    animateBrowserViewport(true);
+  }, [animateBrowserViewport, normalizedNoVncUrl]);
+
+  const closeBrowserExpanded = useCallback(() => {
+    if (!isBrowserVisualExpanded && !isBrowserAnimating) return;
+    animateBrowserViewport(false);
+  }, [animateBrowserViewport, isBrowserAnimating, isBrowserVisualExpanded]);
 
   const builtInCount = registrySummary?.counts.built_in_tools ?? 0;
   const mcpServerCount = registrySummary?.counts.mcp_servers ?? 0;
   const mcpToolCount = registrySummary?.counts.mcp_tools ?? 0;
   const showStopButton = isRunning && !pendingConfirm;
   const isAwaitingTraceId = showStopButton && !traceId;
-  const sendDisabled = isRunning || isStopping || Boolean(pendingConfirm) || !goal.trim();
-  const stopDisabled = isStopping || isAwaitingTraceId;
+  const sendDisabled =
+    isRunning || isStopping || isResettingSession || Boolean(pendingConfirm) || !goal.trim();
+  const stopDisabled = isStopping || isResettingSession || isAwaitingTraceId;
+  const canExpandBrowser = Boolean(normalizedNoVncUrl);
+  const shouldRenderBrowserViewport = Boolean(normalizedNoVncUrl && browserViewportRect);
+  const isBrowserViewportVisible =
+    activeTab === "browser" || isBrowserVisualExpanded || isBrowserAnimating;
+  const browserViewportStyle: React.CSSProperties | undefined = browserViewportRect
+    ? {
+        top: `${browserViewportRect.top}px`,
+        left: `${browserViewportRect.left}px`,
+        width: `${browserViewportRect.width}px`,
+        height: `${browserViewportRect.height}px`,
+        opacity: isBrowserViewportVisible ? 1 : 0,
+        pointerEvents: isBrowserViewportVisible ? "auto" : "none",
+        transition: [
+          `top ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+          `left ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+          `width ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+          `height ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+          "opacity 180ms ease",
+          `box-shadow ${BROWSER_VIEWPORT_TRANSITION_MS}ms ${BROWSER_VIEWPORT_TRANSITION_EASING}`,
+          "background-color 220ms ease",
+        ].join(", "),
+        boxShadow: isBrowserExpanded
+          ? "0 24px 80px rgba(15, 23, 42, 0.34)"
+          : "0 8px 28px rgba(15, 23, 42, 0.12)",
+      }
+    : undefined;
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
@@ -664,7 +918,101 @@ export const AgentWorkbench: React.FC = () => {
         </div>
       </div>
 
-      <div className="flex flex-1 divide-x divide-gray-100 overflow-hidden">
+      <div
+        ref={workbenchBodyRef}
+        className="relative flex flex-1 divide-x divide-gray-100 overflow-hidden"
+      >
+        {shouldRenderBrowserViewport && (
+          <>
+            <div
+              className={`absolute inset-0 z-20 transition-opacity ${
+                isBrowserExpanded ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+              }`}
+              style={{ transitionDuration: `${BROWSER_VIEWPORT_TRANSITION_MS}ms` }}
+            >
+              <button
+                onClick={closeBrowserExpanded}
+                className="h-full w-full bg-slate-950/22 backdrop-blur-[1px]"
+                aria-label="关闭 VNC 全屏遮罩"
+                tabIndex={isBrowserExpanded ? 0 : -1}
+              />
+            </div>
+
+            <div
+              className="absolute z-30 overflow-hidden bg-white"
+              style={browserViewportStyle}
+            >
+              <div
+                className={`relative h-full w-full overflow-hidden transition-colors duration-300 ${
+                  isBrowserVisualExpanded ? "bg-slate-950" : "bg-white"
+                }`}
+              >
+                <iframe
+                  src={normalizedNoVncUrl ?? undefined}
+                  title="VNC Browser View"
+                  className="h-full w-full border-0 bg-white"
+                  allow="clipboard-read; clipboard-write; fullscreen"
+                  referrerPolicy="no-referrer"
+                />
+                <div
+                  className={`pointer-events-none absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-3 transition-all duration-300 ${
+                    isBrowserVisualExpanded
+                      ? "border-b border-slate-800/80 bg-slate-950/84 px-5 py-3 backdrop-blur-md"
+                      : "px-4 py-4"
+                  }`}
+                >
+                  <div
+                    className={`pointer-events-auto flex items-center gap-2 transition-all duration-300 ${
+                      isBrowserVisualExpanded
+                        ? "text-sm font-bold tracking-wide text-slate-100"
+                        : "rounded-full border border-white/70 bg-white/85 px-3 py-1.5 text-[10px] font-black tracking-widest text-slate-700 uppercase shadow-lg backdrop-blur"
+                    }`}
+                  >
+                    <Globe
+                      className={`h-4 w-4 ${
+                        isBrowserVisualExpanded ? "text-emerald-400" : "text-slate-600"
+                      }`}
+                    />
+                    <span>{isBrowserVisualExpanded ? "VNC Browser View" : "Live VNC"}</span>
+                  </div>
+                  <div className="pointer-events-auto flex items-center gap-2">
+                    <button
+                      onClick={() => void refreshNoVncUrl()}
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-[10px] font-bold tracking-widest uppercase transition-colors duration-200 ${
+                        isBrowserVisualExpanded
+                          ? "border border-slate-700 bg-slate-800 text-slate-100 hover:border-slate-600 hover:bg-slate-700"
+                          : "border border-slate-200 bg-white/90 text-slate-700 shadow-lg backdrop-blur hover:border-slate-300 hover:bg-white"
+                      }`}
+                      title="刷新 VNC"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      刷新
+                    </button>
+                    <button
+                      onClick={
+                        isBrowserVisualExpanded ? closeBrowserExpanded : openBrowserExpanded
+                      }
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-[10px] font-bold tracking-widest uppercase transition-colors duration-200 ${
+                        isBrowserVisualExpanded
+                          ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:border-emerald-400 hover:bg-emerald-500/20"
+                          : "border border-emerald-200 bg-emerald-500 text-white shadow-lg shadow-emerald-200 hover:bg-emerald-600"
+                      }`}
+                      title={isBrowserVisualExpanded ? "退出全屏" : "在工作台内全屏显示 VNC"}
+                    >
+                      {isBrowserVisualExpanded ? (
+                        <Minimize2 className="h-3.5 w-3.5" />
+                      ) : (
+                        <Maximize2 className="h-3.5 w-3.5" />
+                      )}
+                      {isBrowserVisualExpanded ? "退出全屏" : "全屏"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+
         {/* Left Column: Chat History & Input */}
         <div className="flex w-1/2 flex-col bg-white">
           <div className="flex items-center justify-between border-b border-gray-100 bg-white px-6 py-3">
@@ -673,9 +1021,14 @@ export const AgentWorkbench: React.FC = () => {
             </span>
             <button
               onClick={handleNewSession}
-              className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold tracking-widest text-gray-600 uppercase hover:border-gray-300 hover:text-gray-800"
+              disabled={isRunning || isStopping || Boolean(pendingConfirm) || isResettingSession}
+              className={`rounded-lg border px-3 py-1.5 text-[10px] font-bold tracking-widest uppercase ${
+                isRunning || isStopping || Boolean(pendingConfirm) || isResettingSession
+                  ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-400"
+                  : "border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:text-gray-800"
+              }`}
             >
-              New Session
+              {isResettingSession ? "Resetting..." : "New Session"}
             </button>
           </div>
           {/* Chat Messages */}
@@ -1053,7 +1406,12 @@ export const AgentWorkbench: React.FC = () => {
                   </p>
                 </div>
               ) : (
-                steps.map((step, idx) => <StepCard key={idx} step={step} />)
+                steps.map((step, idx) => (
+                  <StepCard
+                    key={`${step.type}-${step.msgId ?? step.stepId ?? idx}`}
+                    step={step}
+                  />
+                ))
               )}
             </div>
           </div>
@@ -1065,17 +1423,11 @@ export const AgentWorkbench: React.FC = () => {
                 : "pointer-events-none opacity-0"
             }`}
           >
-            {/* Browser Viewport */}
-            <div className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner">
-              {normalizedNoVncUrl ? (
-                <iframe
-                  src={normalizedNoVncUrl}
-                  title="VNC Browser View"
-                  className="h-full w-full border-0"
-                  allow="clipboard-read; clipboard-write; fullscreen"
-                  referrerPolicy="no-referrer"
-                />
-              ) : (
+            <div
+              ref={normalizedNoVncUrl ? browserDockRef : null}
+              className="relative flex flex-1 items-center justify-center overflow-hidden bg-white shadow-inner"
+            >
+              {!canExpandBrowser && (
                 <div className="max-w-sm p-10 text-center">
                   <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-gray-100">
                     <Globe className="h-8 w-8 text-gray-300" />
@@ -1237,6 +1589,16 @@ const SearchResults: React.FC<{ items: SearchItem[] }> = ({ items }) => {
   );
 };
 
+const OBSERVATION_PREVIEW_LIMIT = 200;
+const OBSERVATION_PREVIEW_NOTICE = "[内容过长，已截断，仅供预览]";
+
+function formatObservationPreview(content: unknown): unknown {
+  if (typeof content !== "string") return content;
+  const chars = Array.from(content);
+  if (chars.length <= OBSERVATION_PREVIEW_LIMIT) return content;
+  return `${chars.slice(0, OBSERVATION_PREVIEW_LIMIT).join("")}\n${OBSERVATION_PREVIEW_NOTICE}`;
+}
+
 const ContentRenderer: React.FC<{ content: unknown }> = ({ content }) => {
   const v = normalizeMaybePythonDict(content);
 
@@ -1361,13 +1723,13 @@ const StepCard: React.FC<{ step: AgentStep }> = ({ step }) => {
                         </span>
                       )}
                     </div>
-                    <ContentRenderer content={observation.content} />
+                    <ContentRenderer content={formatObservationPreview(observation.content)} />
                   </div>
                 );
               })}
             </div>
           ) : (
-            <ContentRenderer content={step.content} />
+            <ContentRenderer content={formatObservationPreview(step.content)} />
           )
         ) : (
           <ContentRenderer content={step.content} />

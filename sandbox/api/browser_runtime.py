@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -53,9 +54,13 @@ _ACCESS_DENIED_MARKERS = (
     "access denied",
     "unauthorized",
     "forbidden",
-    "403",
     "拒绝访问",
     "无权访问",
+)
+_ACCESS_DENIED_403_PATTERNS = (
+    re.compile(r"(?:^|[\s([{:>])403(?:$|[\s)\]}:;,.!?<])"),
+    re.compile(r"(?<![\w-])(?:http|https|status|error|code)\s*[:=-]?\s*403(?![\w-])"),
+    re.compile(r"(?<![\w-])403\s+(?:forbidden|unauthorized|denied|error)(?!\w)"),
 )
 _LOGIN_TEXT_MARKERS = (
     "log in",
@@ -87,6 +92,7 @@ _OAUTH_URL_MARKERS = (
     "/authorize",
     "/consent",
 )
+DEFAULT_RESET_START_URL = os.getenv("START_URL", "chrome://new-tab-page/")
 
 
 def _default_artifact_writer(tool_name: str, text: str) -> str:
@@ -121,6 +127,15 @@ def _collect_marker_signals(source: str, haystack: str, markers: tuple[str, ...]
     return signals
 
 
+def _collect_access_denied_403_signals(source: str, haystack: str) -> list[str]:
+    if not haystack:
+        return []
+    for pattern in _ACCESS_DENIED_403_PATTERNS:
+        if pattern.search(haystack):
+            return [f"{source}:403"]
+    return []
+
+
 def _detect_hitl_barrier(*, text: str, url: str = "", title: str = "") -> dict[str, Any] | None:
     normalized_text = _normalize_barrier_text(text)
     normalized_url = _normalize_barrier_text(url)
@@ -139,7 +154,11 @@ def _detect_hitl_barrier(*, text: str, url: str = "", title: str = "") -> dict[s
             _collect_marker_signals("text", normalized_text, _OAUTH_MARKERS)
             + _collect_marker_signals("url", normalized_url, _OAUTH_URL_MARKERS),
         ),
-        ("access_denied", _collect_marker_signals("text", normalized_text, _ACCESS_DENIED_MARKERS)),
+        (
+            "access_denied",
+            _collect_marker_signals("text", normalized_text, _ACCESS_DENIED_MARKERS)
+            + _collect_access_denied_403_signals("text", normalized_text),
+        ),
     )
     for kind, signals in kinds_and_signals:
         if signals:
@@ -831,4 +850,95 @@ async def select_page(
         page_id=target_page_id,
         tool_name="tools_select_page",
         artifact_writer=artifact_writer,
+    )
+
+
+async def reset_browser(
+    *,
+    state: Any,
+    start_url: str | None = None,
+    artifact_writer: TextArtifactWriter = _default_artifact_writer,
+) -> dict[str, Any]:
+    context = await state.ensure_context()
+    pages = list(getattr(context, "pages", []) or [])
+    if not pages:
+        page = await context.new_page()
+        pages = [page]
+
+    selected_page = None
+    get_selected_page = getattr(state, "get_selected_page", None)
+    if callable(get_selected_page):
+        selected_page = get_selected_page()
+    if selected_page not in pages:
+        selected_page = pages[0]
+
+    for page in pages:
+        if page is selected_page:
+            continue
+        close_page = getattr(page, "close", None)
+        if callable(close_page):
+            try:
+                await close_page()
+            except Exception:
+                continue
+
+    synced_pages = list(getattr(context, "pages", []) or [])
+    if selected_page not in synced_pages:
+        if synced_pages:
+            selected_page = synced_pages[0]
+        else:
+            selected_page = await context.new_page()
+            synced_pages = [selected_page]
+
+    sync_pages = getattr(state, "sync_pages", None)
+    if callable(sync_pages):
+        sync_pages(synced_pages)
+
+    page_id = getattr(state, "get_page_id", lambda _page: None)(selected_page)
+    if page_id is not None:
+        setattr(state, "selected_page_id", int(page_id))
+
+    bring_to_front = getattr(selected_page, "bring_to_front", None)
+    if callable(bring_to_front):
+        try:
+            await bring_to_front()
+        except Exception:
+            pass
+
+    target_url = str(start_url or DEFAULT_RESET_START_URL).strip() or DEFAULT_RESET_START_URL
+    goto = getattr(selected_page, "goto", None)
+    navigated = False
+    if callable(goto):
+        try:
+            await goto(target_url, wait_until="domcontentloaded", timeout=15000)
+            navigated = True
+        except Exception:
+            try:
+                await goto(target_url, timeout=15000)
+                navigated = True
+            except Exception:
+                pass
+
+    clear_runtime_state = getattr(state, "clear_runtime_state", None)
+    if callable(clear_runtime_state):
+        clear_runtime_state()
+
+    resolved_page_id, _ = await _require_selected_page(state)
+    final_url = str(getattr(selected_page, "url", "") or "")
+    output = f"Reset browser to pageId={resolved_page_id} url={final_url or target_url}"
+    metadata = {
+        "reset": {
+            "pageCount": len(getattr(state, "page_id_to_page", {}) or {}),
+            "requestedStartUrl": target_url,
+            "finalUrl": final_url or target_url,
+            "navigationApplied": navigated,
+        }
+    }
+    return await _format_browser_result(
+        output,
+        state=state,
+        page_id=resolved_page_id,
+        tool_name="browser_reset",
+        artifact_writer=artifact_writer,
+        metadata=metadata,
     )

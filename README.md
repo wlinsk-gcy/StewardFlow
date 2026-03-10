@@ -23,17 +23,31 @@ StewardFlow 是一个基于 `FastAPI` + `React` 的可视化 `ReAct Agent`。它
 > 1. 到 `https://www.modelscope.cn/` 获取免费 API Key，每天可免费调用 20 次
 > 2. 到 `https://bailian.console.aliyun.com/` 申请免费 API Key，新用户可获得 `qwen3.5-plus` 的免费体验额度
 
-### 1. 打开小红书，搜索千问大模型主页并总结
+### 1. 浏览器自动化
+```text
+打开小红书。
+总结发布时间为最近一周，点赞量前十的且含有 #AI 话题的博文。
+并统计出这十篇文章的标题，文章内容，是图文还是视频，以及携带的话题。
+```
 
-可观看 `public/demo1.mp4`
 
-### 2. 查看当前目录有哪些文件
+### 2. 工具并行调用
 
-可观看 `public/demo2.mp4`
+```text
+请对当前工作区做一次并行巡检。以下任务彼此独立，请尽量并行调用工具完成，不要串行逐个处理：
 
-### 3. 使用 `bash` 工具在 Docker sandbox 内执行命令
+1. 统计所有 `.py` 文件数量和总代码行数
+2. 统计所有 `.md` 文件数量和总代码行数
+3. 搜索所有 `TODO` 和 `FIXME`
+4. 查找体积最大的 10 个文件
+5. 检查 `README.md`、`requirements.txt`、`package.json` 是否存在
+```
 
-可观看 `public/demo3.mp4`
+### 3. 代码编写
+
+```text
+请在当前环境中创建一个最小可运行的 Node.js 静态页面项目，写入项目文件并通过 npm 启动本地服务，然后使用浏览器工具打开 localhost 页面并验证页面内容与按钮交互是否正常。我会通过 VNC 直接观看最终页面效果，所以不要只生成代码，必须真正启动并打开页面。
+```
 
 ## 功能概览
 
@@ -236,7 +250,7 @@ npm run dev
 ## 已知限制
 
 - 当前 checkpoint、消息缓存、WebSocket 连接状态均为进程内存态；服务重启不会恢复运行中的 Trace
-- LLM provider 当前仍走同步 chat completion；因此 stop 在阻塞式 LLM 调用中可能要等请求返回后才完全生效
+- LLM provider 已切到异步 chat completion 路径；`stop` 通常可在等待中的 LLM 请求上更快生效，但实际取消延迟仍取决于 OpenAI SDK、底层 HTTP 连接以及上游兼容服务的取消行为
 - 部分工具若内部 I/O 不可取消，Trace 会先进入 `CANCELLED`，但底层 await 的实际终止速度仍取决于工具实现
 - 当前 Agent 运行时只绑定启动时自动创建的 sandbox；手动新建的 sandbox 不会自动切换为 Agent 的活跃执行目标
 

@@ -2,7 +2,7 @@ import re
 import logging
 import json
 from typing import Dict, Any, List, Optional, cast
-from openai import OpenAI,AsyncOpenAI
+from openai import AsyncOpenAI
 from .tools.tool import ToolRegistry
 
 from .builder.build import build_system_prompt
@@ -174,16 +174,12 @@ def _clip_for_log(text: str, *, limit: int = LLM_LOG_PREVIEW_CHARS) -> str:
 class Provider:
     tool_registry: ToolRegistry
     system_prompt: str
-    client: OpenAI
+    async_client: AsyncOpenAI
     ws_manager: ConnectionManager
     model: str
 
     def __init__(self, model:str, api_key: str, base_url: str, tool_registry: ToolRegistry, ws_manager: ConnectionManager, context_config: dict | None = None):
-        self.model = model # NVIDIA 免费 API 接口测试：QWEN 系列模型不支持 function call
-        self.client = OpenAI(
-            base_url=base_url,
-            api_key=api_key
-        )
+        self.model = model
         self.async_client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key
@@ -192,11 +188,11 @@ class Provider:
         self.system_prompt = build_system_prompt()
         self.ws_manager = ws_manager
 
-    def generate(self, context: Dict[str, Any]) -> tuple[str, str, list, dict]:
+    async def generate(self, context: Dict[str, Any]) -> tuple[str, str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
         is_thinking = context.get("is_thinking", True)
         # TODO 针对 429 Error Code 做重试
-        response = self.client.chat.completions.create(
+        response = await self.async_client.chat.completions.create(
             model=self.model,
             messages=context.get("messages"),
             temperature=0.2,
