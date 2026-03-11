@@ -110,7 +110,8 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
         name="bash",
         path="/tools/bash",
         description=(
-            "Execute a shell command inside the sandbox and return merged stdout/stderr. "
+            "Execute a shell command inside the sandbox. Foreground mode returns merged stdout/stderr; "
+            "background mode returns a launch summary for long-running commands. "
             "Use this for command execution, not for structured file reads or edits when dedicated tools fit better."
         ),
         parameters=_schema(
@@ -132,6 +133,10 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
                 "description": {
                     "type": "string",
                     "description": "Optional short note describing the command intent.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Launch the command in background mode and return a launch summary instead of waiting for final completion.",
                 },
             },
             required=["command"],
@@ -315,6 +320,38 @@ TOOL_SPECS: tuple[SandboxToolSpec, ...] = (
                     "description": "Optional path to persist the snapshot text inside the sandbox.",
                 },
             }
+        ),
+    ),
+    SandboxToolSpec(
+        name="browser_evaluate_script",
+        path="/tools/evaluate_script",
+        description=(
+            "Evaluate a read-only JavaScript function on the active page and return a JSON-serializable result. "
+            "Use this only when page snapshots do not expose enough readable information."
+        ),
+        parameters=_schema(
+            properties={
+                "script": {
+                    "type": "string",
+                    "description": "JavaScript source that evaluates to a function returning a JSON-serializable value.",
+                    "minLength": 1,
+                },
+                "pageId": {
+                    "type": "integer",
+                    "description": "Optional target page identifier. Defaults to the active page.",
+                    "minimum": 0,
+                },
+                "documentId": {
+                    "type": "string",
+                    "description": "Optional stale-page guard. If provided, the current page documentId must match.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Maximum script evaluation time in milliseconds.",
+                    "minimum": 1,
+                },
+            },
+            required=["script"],
         ),
     ),
     SandboxToolSpec(

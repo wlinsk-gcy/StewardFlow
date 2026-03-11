@@ -30,7 +30,7 @@ Please do a parallel inspection of the current work area. The following tasks ar
 ### 3. Code writing
 
 ```text
-Create a minimum workable Node.js static page project in your current environment, write the project file and start the local service via npm, then use the browser tool to open the localhost page and verify that the page content interacts with the button correctly. I'll watch the final page effect directly through VNC, so don't just generate code, you have to actually start and open the page.
+Help me implement a personal blog website and open it through a browser.
 ```
 
 ## What StewardFlow Gives You

@@ -4,7 +4,9 @@ import asyncio
 import os
 import re
 import signal
+import subprocess
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,9 @@ from .tool_runtime import (
     append_bash_metadata,
     build_tool_error_result,
     edit_file,
+    format_background_bash_result,
     format_bash_result,
+    shape_background_bash_early_output,
     grep_text,
     glob_paths,
     read_path,
@@ -34,7 +38,8 @@ UPLOAD_ROOT = Path(os.getenv("SANDBOX_UPLOAD_ROOT", "/config/uploads")).resolve(
 RESULT_ARTIFACT_ROOT = Path(
     os.getenv("SANDBOX_RESULT_ARTIFACT_ROOT", "/config/tool-artifacts/results")
 ).resolve()
-
+BACKGROUND_LAUNCH_TIMEOUT_MS = 2000
+BACKGROUND_EARLY_EXIT_WINDOW_MS = 300
 
 
 def _safe_tool_name(value: str) -> str:
@@ -81,6 +86,7 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
 async def lifespan(_app: FastAPI):
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     RESULT_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+    _background_job_root().mkdir(parents=True, exist_ok=True)
     try:
         yield
     finally:
@@ -99,6 +105,7 @@ class BashRequest(StrictRequestModel):
     timeout: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
     workdir: str | None = Field(default=None, description="Working directory. Supports absolute or relative path.")
     description: str | None = Field(default=None, description="Optional command description.")
+    background: bool = Field(default=False, description="Launch in background mode and return early.")
 
 
 class GlobRequest(StrictRequestModel):
@@ -140,6 +147,13 @@ class NavigatePageRequest(StrictRequestModel):
 class TakeSnapshotRequest(StrictRequestModel):
     verbose: bool = Field(default=False)
     filePath: str | None = Field(default=None)
+
+
+class EvaluateScriptRequest(StrictRequestModel):
+    script: str = Field(..., min_length=1)
+    pageId: int | None = Field(default=None, ge=0)
+    documentId: str | None = Field(default=None)
+    timeout: int = Field(default=browser_runtime.DEFAULT_EVALUATE_SCRIPT_TIMEOUT_MS, ge=1, le=MAX_TIMEOUT_MS)
 
 
 class ClickRequest(StrictRequestModel):
@@ -210,6 +224,52 @@ def _binary_artifact_writer(tool_name: str, data: bytes, suffix: str) -> str:
     return _write_binary_artifact(tool_name, data, suffix=suffix)
 
 
+def _background_job_root() -> Path:
+    return (RESULT_ARTIFACT_ROOT / "jobs").resolve()
+
+
+def _background_job_id() -> str:
+    return f"job_{time.time_ns()}_{uuid.uuid4().hex[:8]}"
+
+
+def _background_log_path(job_id: str) -> Path:
+    return (_background_job_root() / f"{job_id}.log").resolve()
+
+
+def _read_background_log_excerpt(log_path: Path) -> str:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return shape_background_bash_early_output(text)
+
+
+def _spawn_background_process(command: str, *, cwd: Path, log_path: Path) -> tuple[subprocess.Popen[str], Any]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(log_path, "a", encoding="utf-8")
+    kwargs: dict[str, Any] = {
+        "shell": True,
+        "cwd": str(cwd),
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(command, **kwargs)
+    except Exception:
+        log_handle.close()
+        raise
+    return proc, log_handle
+
+
 def _tool_error_payload(exc: Exception, *, metadata: dict[str, object] | None = None) -> dict[str, Any]:
     return build_tool_error_result(str(exc), metadata=metadata)
     # if isinstance(exc, ToolInputError):
@@ -219,12 +279,7 @@ def _tool_error_payload(exc: Exception, *, metadata: dict[str, object] | None = 
     # raise exc
 
 
-async def _execute_bash_command(command: str, *, workdir: str | None, timeout_ms: int) -> dict[str, Any]:
-    base_dir = _tool_base_dir()
-    cwd_path = resolve_path(workdir or ".", base_dir=base_dir)
-    if not cwd_path.exists() or not cwd_path.is_dir():
-        raise ToolInputError(f"invalid workdir: {cwd_path}")
-
+async def _execute_foreground_bash_command(command: str, *, cwd_path: Path, timeout_ms: int) -> dict[str, Any]:
     spawn_kwargs: dict[str, Any] = {}
     if os.name != "nt":
         spawn_kwargs["preexec_fn"] = os.setsid
@@ -263,6 +318,86 @@ async def _execute_bash_command(command: str, *, workdir: str | None, timeout_ms
     )
 
 
+async def _execute_background_bash_command(command: str, *, cwd_path: Path) -> dict[str, Any]:
+    job_id = _background_job_id()
+    log_path = _background_log_path(job_id)
+    try:
+        proc, log_handle = await asyncio.wait_for(
+            asyncio.to_thread(_spawn_background_process, command, cwd=cwd_path, log_path=log_path),
+            timeout=BACKGROUND_LAUNCH_TIMEOUT_MS / 1000.0,
+        )
+    except asyncio.TimeoutError:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.touch(exist_ok=True)
+        return format_background_bash_result(
+            status="launch_timeout",
+            command=command,
+            workdir=str(cwd_path),
+            job_id=job_id,
+            pid=None,
+            log_path=str(log_path),
+            exit_code=None,
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(str(exc), encoding="utf-8")
+        return format_background_bash_result(
+            status="failed_to_launch",
+            command=command,
+            workdir=str(cwd_path),
+            job_id=job_id,
+            pid=None,
+            log_path=str(log_path),
+            exit_code=None,
+            artifact_writer=_artifact_writer,
+            early_output=str(exc),
+        )
+
+    log_handle.close()
+    await asyncio.sleep(BACKGROUND_EARLY_EXIT_WINDOW_MS / 1000.0)
+    exit_code = proc.poll()
+    if exit_code is None:
+        return format_background_bash_result(
+            status="launched_unverified",
+            command=command,
+            workdir=str(cwd_path),
+            job_id=job_id,
+            pid=proc.pid,
+            log_path=str(log_path),
+            exit_code=None,
+            artifact_writer=_artifact_writer,
+        )
+
+    return format_background_bash_result(
+        status="exited_early",
+        command=command,
+        workdir=str(cwd_path),
+        job_id=job_id,
+        pid=proc.pid,
+        log_path=str(log_path),
+        exit_code=int(exit_code),
+        artifact_writer=_artifact_writer,
+        early_output=_read_background_log_excerpt(log_path),
+    )
+
+
+async def _execute_bash_command(
+    command: str,
+    *,
+    workdir: str | None,
+    timeout_ms: int,
+    background: bool = False,
+) -> dict[str, Any]:
+    base_dir = _tool_base_dir()
+    cwd_path = resolve_path(workdir or ".", base_dir=base_dir)
+    if not cwd_path.exists() or not cwd_path.is_dir():
+        raise ToolInputError(f"invalid workdir: {cwd_path}")
+    if background:
+        return await _execute_background_bash_command(command, cwd_path=cwd_path)
+    return await _execute_foreground_bash_command(command, cwd_path=cwd_path, timeout_ms=timeout_ms)
+
+
 @app.post("/tools/bash")
 async def tools_bash(req: BashRequest) -> dict[str, Any]:
     try:
@@ -270,6 +405,7 @@ async def tools_bash(req: BashRequest) -> dict[str, Any]:
             req.command,
             workdir=req.workdir,
             timeout_ms=req.timeout,
+            background=req.background,
         )
     except Exception as exc:
         return _tool_error_payload(exc, metadata={"exit_code": None})
@@ -369,6 +505,21 @@ async def tools_take_snapshot(req: TakeSnapshotRequest) -> dict[str, Any]:
             verbose=req.verbose,
             file_path=req.filePath,
             base_dir=_tool_base_dir(),
+            artifact_writer=_artifact_writer,
+        )
+    except Exception as exc:
+        return _tool_error_payload(exc)
+
+
+@app.post("/tools/evaluate_script")
+async def tools_evaluate_script(req: EvaluateScriptRequest) -> dict[str, Any]:
+    try:
+        return await browser_runtime.evaluate_script(
+            state=get_browser_state(),
+            script=req.script,
+            page_id=req.pageId,
+            document_id=req.documentId,
+            timeout_ms=req.timeout,
             artifact_writer=_artifact_writer,
         )
     except Exception as exc:

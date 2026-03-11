@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from pathlib import Path
@@ -93,6 +94,370 @@ _OAUTH_URL_MARKERS = (
     "/consent",
 )
 DEFAULT_RESET_START_URL = os.getenv("START_URL", "chrome://new-tab-page/")
+DEFAULT_EVALUATE_SCRIPT_TIMEOUT_MS = 3000
+MAX_EVALUATE_SCRIPT_TIMEOUT_MS = 5000
+_EVALUATE_SCRIPT_BLOCKLIST: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bfetch\s*\(", re.IGNORECASE), "fetch(...)"),
+    (re.compile(r"\bXMLHttpRequest\b", re.IGNORECASE), "XMLHttpRequest"),
+    (re.compile(r"\bnavigator\.sendBeacon\s*\(", re.IGNORECASE), "navigator.sendBeacon(...)"),
+    (re.compile(r"\b(?:window\.)?location\s*=", re.IGNORECASE), "location assignment"),
+    (
+        re.compile(r"\b(?:window\.)?location\.(?:href|assign|replace)\s*(?:=|\()", re.IGNORECASE),
+        "location navigation",
+    ),
+    (re.compile(r"(?:^|[^\w.])submit\s*\(", re.IGNORECASE), "submit(...)"),
+    (re.compile(r"\.submit\s*\(", re.IGNORECASE), ".submit(...)"),
+    (re.compile(r"(?:^|[^\w.])click\s*\(", re.IGNORECASE), "click(...)"),
+    (re.compile(r"\.click\s*\(", re.IGNORECASE), ".click(...)"),
+    (re.compile(r"\bdispatchEvent\s*\(", re.IGNORECASE), "dispatchEvent(...)"),
+    (re.compile(r"\bhistory\.(?:pushState|replaceState)\s*\(", re.IGNORECASE), "history mutation"),
+    (re.compile(r"\bscroll(?:To|By)\s*\(", re.IGNORECASE), "scroll mutation"),
+)
+_UID_RECOVERY_SCRIPT = """
+({ uid, descriptor }) => {
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const actionableTags = new Set(["a", "button", "input", "textarea", "select", "summary"]);
+    const actionableRoles = new Set([
+        "button",
+        "link",
+        "checkbox",
+        "radio",
+        "switch",
+        "tab",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "combobox",
+    ]);
+    const ignoredRoles = new Set(["presentation", "none"]);
+    const roleValue = (element) => normalize(element.getAttribute("role")).toLowerCase();
+    const classTokens = (value) =>
+        normalize(value)
+            .split(/\s+/)
+            .map((token) => token.trim().toLowerCase())
+            .filter(
+                (token) =>
+                    token &&
+                    token.length <= 40 &&
+                    /[a-z]/.test(token) &&
+                    ((token.match(/\d/g) || []).length <= 3)
+            )
+            .slice(0, 8);
+    const isVisible = (element) => {
+        if (!(element instanceof Element)) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        if (
+            !style ||
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.visibility === "collapse" ||
+            style.opacity === "0" ||
+            style.pointerEvents === "none"
+        ) {
+            return false;
+        }
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return false;
+        }
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        const samplePoints = [
+            [rect.left + rect.width / 2, rect.top + rect.height / 2],
+            [rect.left + 1, rect.top + 1],
+            [rect.right - 1, rect.top + 1],
+            [rect.left + 1, rect.bottom - 1],
+            [rect.right - 1, rect.bottom - 1],
+        ];
+        for (const [rawX, rawY] of samplePoints) {
+            const x = Math.min(Math.max(rawX, 0), viewportWidth - 1);
+            const y = Math.min(Math.max(rawY, 0), viewportHeight - 1);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) {
+                continue;
+            }
+            const hit = document.elementFromPoint(x, y);
+            if (hit && (hit === element || element.contains(hit))) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const hasText = (element) => normalize(element.innerText || element.textContent || element.value).length > 0;
+    const hasClickablePointer = (element) => {
+        const style = window.getComputedStyle(element);
+        return !!style && style.pointerEvents !== "none" && style.cursor === "pointer";
+    };
+    const hasUsableTabIndex = (element) => {
+        const raw = element.getAttribute("tabindex");
+        if (raw === null) {
+            return false;
+        }
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed >= 0 : true;
+    };
+    const isStandardActionTag = (element) => {
+        const tagName = element.tagName.toLowerCase();
+        if (!actionableTags.has(tagName)) {
+            return false;
+        }
+        if (tagName === "input") {
+            const inputType = normalize(element.getAttribute("type")).toLowerCase();
+            return inputType !== "hidden";
+        }
+        return true;
+    };
+    const isActionableElement = (element) => {
+        if (!(element instanceof Element) || !isVisible(element)) {
+            return false;
+        }
+        const role = roleValue(element);
+        if (ignoredRoles.has(role)) {
+            return false;
+        }
+        if (isStandardActionTag(element)) {
+            return true;
+        }
+        if (actionableRoles.has(role)) {
+            return true;
+        }
+        if (element.matches("[contenteditable='true']")) {
+            return true;
+        }
+        if (hasUsableTabIndex(element)) {
+            return true;
+        }
+        return hasClickablePointer(element) && hasText(element);
+    };
+    const normalizeActionTarget = (element) => {
+        if (!(element instanceof Element)) {
+            return null;
+        }
+        const tagName = element.tagName.toLowerCase();
+        if (tagName === "option") {
+            return element.closest("select") || element;
+        }
+        if (tagName === "label") {
+            return null;
+        }
+        return element;
+    };
+    const resolveActionTarget = (element) => {
+        let current = element;
+        while (current instanceof Element) {
+            const target = normalizeActionTarget(current);
+            if (target && isActionableElement(target)) {
+                return target;
+            }
+            current = current.parentElement;
+        }
+        return null;
+    };
+    if (!descriptor || typeof descriptor !== "object") {
+        return { recovered: false, reason: "missing_descriptor" };
+    }
+
+    const interactiveSelector = [
+        "a",
+        "button",
+        "input",
+        "textarea",
+        "select",
+        "summary",
+        "[role]",
+        "[tabindex]",
+        "[contenteditable='true']",
+        "[onclick]",
+        "div",
+        "span",
+    ].join(",");
+    const interactiveElements = [];
+    const seenElements = new Set();
+    for (const element of document.querySelectorAll(interactiveSelector)) {
+        if (!isVisible(element)) {
+            continue;
+        }
+        const target = resolveActionTarget(element);
+        if (!target || seenElements.has(target)) {
+            continue;
+        }
+        seenElements.add(target);
+        interactiveElements.push(target);
+    }
+
+    const expectedTag = normalize(descriptor.tag).toLowerCase();
+    const expectedRole = normalize(descriptor.role).toLowerCase();
+    const expectedType = normalize(descriptor.inputType).toLowerCase();
+    const expectedText = normalize(descriptor.text).slice(0, 160);
+    const expectedPlaceholder = normalize(descriptor.placeholder);
+    const expectedAriaLabel = normalize(descriptor.ariaLabel);
+    const expectedLabelText = normalize(descriptor.labelText);
+    const expectedName = normalize(descriptor.name);
+    const expectedTitle = normalize(descriptor.title);
+    const expectedHref = normalize(descriptor.href);
+    const expectedValue = normalize(descriptor.value);
+    const expectedClassTokens = Array.isArray(descriptor.classTokens)
+        ? descriptor.classTokens.map((token) => normalize(token).toLowerCase()).filter(Boolean)
+        : [];
+    const expectedActionIndex = Number.isFinite(Number(descriptor.actionIndex)) ? Number(descriptor.actionIndex) : null;
+    const expectedSignatureKey = normalize(descriptor.signatureKey).toLowerCase();
+    const expectedSignatureIndex = Number.isFinite(Number(descriptor.signatureIndex)) ? Number(descriptor.signatureIndex) : null;
+
+    const signatureCounts = new Map();
+    const scored = [];
+    for (let actionIndex = 0; actionIndex < interactiveElements.length; actionIndex += 1) {
+        const element = interactiveElements[actionIndex];
+        const tag = element.tagName.toLowerCase();
+        const role = roleValue(element);
+        const inputType = normalize(element.getAttribute("type")).toLowerCase();
+        const text = normalize(element.innerText || element.textContent).slice(0, 160);
+        const placeholder = normalize(element.getAttribute("placeholder"));
+        const ariaLabel = normalize(element.getAttribute("aria-label"));
+        const labels = element.labels ? Array.from(element.labels) : [];
+        const labelText = normalize(labels.map((label) => label.innerText || label.textContent).join(" "))
+            .slice(0, 160);
+        const name = normalize(element.getAttribute("name"));
+        const title = normalize(element.getAttribute("title"));
+        const href = normalize(element.getAttribute("href"));
+        const value = normalize(element.value);
+        const candidateClassTokens = classTokens(element.className);
+        const signatureText = normalize(placeholder || ariaLabel || labelText || text).slice(0, 80).toLowerCase();
+        const signatureKey = [tag, role, inputType, signatureText].join("|");
+        const signatureIndex = signatureCounts.get(signatureKey) || 0;
+        signatureCounts.set(signatureKey, signatureIndex + 1);
+
+        let score = 0;
+        let strong = 0;
+        const reasons = [];
+
+        if (expectedTag && tag === expectedTag) {
+            score += 4;
+            reasons.push("tag");
+        }
+        if (expectedRole && role === expectedRole) {
+            score += 3;
+            reasons.push("role");
+        }
+        if (expectedType && inputType === expectedType) {
+            score += 2;
+            reasons.push("type");
+        }
+        if (expectedPlaceholder && placeholder && placeholder === expectedPlaceholder) {
+            score += 7;
+            strong += 1;
+            reasons.push("placeholder");
+        }
+        if (expectedAriaLabel && ariaLabel && ariaLabel === expectedAriaLabel) {
+            score += 7;
+            strong += 1;
+            reasons.push("aria");
+        }
+        if (expectedLabelText && labelText && labelText === expectedLabelText) {
+            score += 5;
+            strong += 1;
+            reasons.push("label");
+        }
+        if (expectedTitle && title && title === expectedTitle) {
+            score += 3;
+            reasons.push("title");
+        }
+        if (expectedName && name && name === expectedName) {
+            score += 3;
+            reasons.push("name");
+        }
+        if (expectedHref && href && href === expectedHref) {
+            score += 6;
+            strong += 1;
+            reasons.push("href");
+        }
+        if (expectedValue && value && value === expectedValue) {
+            score += 2;
+            reasons.push("value");
+        }
+        if (expectedText && text) {
+            if (text === expectedText) {
+                score += 8;
+                strong += 1;
+                reasons.push("text");
+            } else if (expectedText.length >= 8 && (text.includes(expectedText) || expectedText.includes(text))) {
+                score += 4;
+                reasons.push("text_partial");
+            }
+        }
+        if (expectedClassTokens.length) {
+            const overlap = expectedClassTokens.filter((token) => candidateClassTokens.includes(token)).length;
+            if (overlap > 0) {
+                score += Math.min(overlap, 3);
+                reasons.push("class");
+            }
+        }
+        if (expectedActionIndex !== null) {
+            const distance = Math.abs(actionIndex - expectedActionIndex);
+            if (distance === 0) {
+                score += 3;
+            } else if (distance <= 2) {
+                score += 2;
+            } else if (distance <= 5) {
+                score += 1;
+            } else if (distance >= 25) {
+                score -= 2;
+            }
+        }
+        if (expectedSignatureKey && signatureKey === expectedSignatureKey && expectedSignatureIndex !== null) {
+            const distance = Math.abs(signatureIndex - expectedSignatureIndex);
+            if (distance === 0) {
+                score += 2;
+            } else if (distance <= 1) {
+                score += 1;
+            }
+        }
+        if (strong === 0 && score < 7) {
+            continue;
+        }
+        scored.push({ element, score, strong, reasons, tag, text });
+    }
+
+    if (!scored.length) {
+        return { recovered: false, reason: "no_match" };
+    }
+
+    scored.sort((left, right) => {
+        if (right.score !== left.score) {
+            return right.score - left.score;
+        }
+        if (right.strong !== left.strong) {
+            return right.strong - left.strong;
+        }
+        return 0;
+    });
+
+    const best = scored[0];
+    const second = scored[1];
+    if (!best || best.score < 7 || best.strong < 1) {
+        return { recovered: false, reason: "low_confidence", bestScore: best ? best.score : 0 };
+    }
+    if (second && best.score === second.score && best.strong === second.strong) {
+        return { recovered: false, reason: "ambiguous", bestScore: best.score };
+    }
+
+    for (const existing of document.querySelectorAll(`[data-sf-uid="${uid}"]`)) {
+        if (existing !== best.element) {
+            existing.removeAttribute("data-sf-uid");
+        }
+    }
+    best.element.setAttribute("data-sf-uid", uid);
+    return {
+        recovered: true,
+        score: best.score,
+        strong: best.strong,
+        tag: best.tag,
+        text: best.text,
+        reasons: best.reasons,
+    };
+}
+"""
 
 
 def _default_artifact_writer(tool_name: str, text: str) -> str:
@@ -263,6 +628,107 @@ async def _require_selected_page(state: Any) -> tuple[int, Any]:
     return int(page_id), page
 
 
+async def _require_page(state: Any, *, page_id: int | None = None) -> tuple[int, Any]:
+    if page_id is None:
+        return await _require_selected_page(state)
+
+    ensure_context = getattr(state, "ensure_context", None)
+    if not callable(ensure_context):
+        raise ToolExecutionError("browser context is unavailable")
+    context = await ensure_context()
+    pages = list(getattr(context, "pages", []))
+    if not pages:
+        page = await context.new_page()
+        pages = [page]
+
+    sync_pages = getattr(state, "sync_pages", None)
+    if callable(sync_pages):
+        sync_pages(pages)
+
+    target_page_id = int(page_id)
+    page = (getattr(state, "page_id_to_page", {}) or {}).get(target_page_id)
+    if page is None:
+        raise ToolInputError(f"unknown pageId: {page_id}")
+    return target_page_id, page
+
+
+async def _ensure_page_document_id(state: Any, *, page: Any, page_id: int) -> str:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        raise ToolExecutionError("page evaluation is unavailable")
+
+    try:
+        raw = await evaluate(
+            """
+            () => {
+                const root = document.documentElement;
+                const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+                let documentId = normalize(root?.getAttribute?.("data-sf-document-id"));
+                if (!documentId) {
+                    documentId = `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+                    root?.setAttribute?.("data-sf-document-id", documentId);
+                }
+                return documentId;
+            }
+            """
+        )
+    except Exception as exc:
+        raise ToolExecutionError("page document id is unavailable") from exc
+
+    document_id = str(raw or "").strip() or f"doc-{page_id}"
+    page_document_ids = getattr(state, "page_document_ids", None)
+    if isinstance(page_document_ids, dict):
+        page_document_ids[page_id] = document_id
+    return document_id
+
+
+def _normalize_evaluate_script_source(script: str) -> str:
+    source = str(script or "").strip()
+    if not source:
+        raise ToolInputError("script must not be empty")
+    for pattern, label in _EVALUATE_SCRIPT_BLOCKLIST:
+        if pattern.search(source):
+            raise ToolInputError(
+                f"evaluate_script is read-only; disallowed pattern detected: {label}"
+            )
+    return source
+
+
+def _json_result_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _format_evaluate_script_output(
+    *,
+    page_id: int,
+    document_id: str,
+    result_type: str,
+    result_text: str,
+) -> str:
+    return "\n".join(
+        [
+            f"<page_id>{page_id}</page_id>",
+            f"<document_id>{document_id}</document_id>",
+            f"<result_type>{result_type}</result_type>",
+            "<content>",
+            result_text,
+            "</content>",
+        ]
+    )
+
+
 async def _format_browser_result(
     output: str,
     *,
@@ -315,11 +781,75 @@ def _uid_selector(uid: str) -> str:
     return f'[data-sf-uid="{uid}"]'
 
 
-def _locator_for_uid(page: Any, uid: str) -> Any:
+def _descriptor_for_uid(state: Any, *, page_id: int, uid: str) -> dict[str, Any] | None:
+    record = _latest_snapshot_record(state, page_id)
+    if record is None:
+        return None
+    descriptors = _record_value(record, "descriptors") or {}
+    if not isinstance(descriptors, dict):
+        return None
+    descriptor = descriptors.get(uid)
+    return descriptor if isinstance(descriptor, dict) else None
+
+
+def _raw_locator_for_uid(page: Any, uid: str) -> Any:
     locator_fn = getattr(page, "locator", None)
     if not callable(locator_fn):
         raise ToolExecutionError(f"element for uid '{uid}' is no longer available; DOM changed")
     return locator_fn(_uid_selector(uid))
+
+
+async def _uid_binding_exists(page: Any, uid: str) -> bool:
+    query_selector = getattr(page, "query_selector", None)
+    if callable(query_selector):
+        try:
+            handle = await query_selector(_uid_selector(uid))
+        except Exception:
+            return False
+        if handle is None:
+            return False
+        dispose = getattr(handle, "dispose", None)
+        if callable(dispose):
+            try:
+                await dispose()
+            except Exception:
+                pass
+        return True
+
+    locator = _raw_locator_for_uid(page, uid)
+    count = getattr(locator, "count", None)
+    if not callable(count):
+        return False
+    try:
+        return int(await count()) > 0
+    except Exception:
+        return False
+
+
+async def _attempt_uid_recovery(page: Any, *, uid: str, descriptor: dict[str, Any]) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return False
+    try:
+        raw = await evaluate(
+            _UID_RECOVERY_SCRIPT,
+            {"uid": uid, "descriptor": descriptor},
+        )
+    except Exception:
+        return False
+    return isinstance(raw, dict) and bool(raw.get("recovered"))
+
+
+async def _locator_for_uid(state: Any, *, page: Any, page_id: int, uid: str) -> Any:
+    if await _uid_binding_exists(page, uid):
+        return _raw_locator_for_uid(page, uid)
+
+    descriptor = _descriptor_for_uid(state, page_id=page_id, uid=uid)
+    if descriptor and await _attempt_uid_recovery(page, uid=uid, descriptor=descriptor):
+        if await _uid_binding_exists(page, uid):
+            return _raw_locator_for_uid(page, uid)
+
+    raise ToolExecutionError(f"element for uid '{uid}' is no longer available; DOM changed")
 
 
 def _simplify_click_error(exc: Exception) -> str:
@@ -467,6 +997,7 @@ async def take_snapshot(
             document_id=document_id,
             uids=uids,
             text=output,
+            descriptors=snapshot_data.get("descriptors") or {},
         )
         snapshot_id = _record_value(record, "snapshot_id")
 
@@ -493,6 +1024,107 @@ async def take_snapshot(
         state=state,
         page_id=page_id,
         tool_name="tools_take_snapshot",
+        artifact_writer=artifact_writer,
+        metadata=metadata,
+    )
+
+
+async def evaluate_script(
+    *,
+    state: Any,
+    script: str,
+    page_id: int | None = None,
+    document_id: str | None = None,
+    timeout_ms: int = DEFAULT_EVALUATE_SCRIPT_TIMEOUT_MS,
+    artifact_writer: TextArtifactWriter = _default_artifact_writer,
+) -> dict[str, Any]:
+    normalized_script = _normalize_evaluate_script_source(script)
+    safe_timeout_ms = max(1, min(int(timeout_ms), MAX_EVALUATE_SCRIPT_TIMEOUT_MS))
+    target_page_id, page = await _require_page(state, page_id=page_id)
+    current_document_id = await _ensure_page_document_id(state, page=page, page_id=target_page_id)
+
+    expected_document_id = str(document_id or "").strip()
+    if expected_document_id and expected_document_id != current_document_id:
+        raise ToolInputError(
+            f"document is stale for pageId={target_page_id}; expected documentId={expected_document_id}, current documentId={current_document_id}"
+        )
+
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        raise ToolExecutionError("page evaluation is unavailable")
+
+    try:
+        raw = await asyncio.wait_for(
+            evaluate(
+                """
+                async ({ script }) => {
+                    const globalEval = (0, eval);
+                    let factory;
+                    try {
+                        factory = globalEval(script);
+                    } catch (error) {
+                        throw new Error(`script parse failed: ${error?.message || String(error)}`);
+                    }
+                    if (typeof factory !== "function") {
+                        throw new Error("script must evaluate to a function");
+                    }
+                    let value;
+                    try {
+                        value = await factory();
+                    } catch (error) {
+                        throw new Error(`script execution failed: ${error?.message || String(error)}`);
+                    }
+                    try {
+                        const jsonText = JSON.stringify(value === undefined ? null : value);
+                        return {
+                            value: JSON.parse(jsonText),
+                            jsonText,
+                        };
+                    } catch (error) {
+                        throw new Error(
+                            `script result must be JSON-serializable: ${error?.message || String(error)}`
+                        );
+                    }
+                }
+                """,
+                {"script": normalized_script},
+            ),
+            timeout=safe_timeout_ms / 1000,
+        )
+    except TimeoutError as exc:
+        raise ToolExecutionError(
+            f"evaluate_script timed out after {safe_timeout_ms} ms"
+        ) from exc
+    except (ToolInputError, ToolExecutionError):
+        raise
+    except Exception as exc:
+        raise ToolExecutionError(str(exc)) from exc
+
+    if not isinstance(raw, dict):
+        raise ToolExecutionError("evaluate_script returned an invalid payload")
+
+    result_value = raw.get("value")
+    result_type = _json_result_type(result_value)
+    result_text = str(raw.get("jsonText") or json.dumps(result_value, ensure_ascii=False))
+    if result_type in {"object", "array"}:
+        result_text = json.dumps(result_value, ensure_ascii=False, indent=2)
+
+    output = _format_evaluate_script_output(
+        page_id=target_page_id,
+        document_id=current_document_id,
+        result_type=result_type,
+        result_text=result_text,
+    )
+    metadata = {
+        "documentId": current_document_id,
+        "resultType": result_type,
+        "timeoutMs": safe_timeout_ms,
+    }
+    return await _format_browser_result(
+        output,
+        state=state,
+        page_id=target_page_id,
+        tool_name="tools_evaluate_script",
         artifact_writer=artifact_writer,
         metadata=metadata,
     )
@@ -546,7 +1178,7 @@ async def click(
 ) -> dict[str, Any]:
     page_id, page = await _require_selected_page(state)
     _validate_latest_uid(state, page_id=page_id, uid=uid)
-    locator = _locator_for_uid(page, uid)
+    locator = await _locator_for_uid(state, page=page, page_id=page_id, uid=uid)
     await _click_with_dialog_support(locator, state=state, click_count=2 if dbl_click else 1)
     output, metadata = await _append_snapshot_output(
         f"Clicked uid={uid}",
@@ -574,7 +1206,7 @@ async def fill(
 ) -> dict[str, Any]:
     page_id, page = await _require_selected_page(state)
     _validate_latest_uid(state, page_id=page_id, uid=uid)
-    locator = _locator_for_uid(page, uid)
+    locator = await _locator_for_uid(state, page=page, page_id=page_id, uid=uid)
 
     used_select_option = False
     select_option = getattr(locator, "select_option", None)
@@ -620,7 +1252,7 @@ async def take_screenshot(
     capture_target = page
     if uid is not None:
         _validate_latest_uid(state, page_id=page_id, uid=uid)
-        capture_target = _locator_for_uid(page, uid)
+        capture_target = await _locator_for_uid(state, page=page, page_id=page_id, uid=uid)
 
     screenshot_fn = getattr(capture_target, "screenshot", None)
     if not callable(screenshot_fn):
@@ -730,7 +1362,7 @@ async def hover(
 ) -> dict[str, Any]:
     page_id, page = await _require_selected_page(state)
     _validate_latest_uid(state, page_id=page_id, uid=uid)
-    locator = _locator_for_uid(page, uid)
+    locator = await _locator_for_uid(state, page=page, page_id=page_id, uid=uid)
     await locator.hover()
     output, metadata = await _append_snapshot_output(
         f"Hovered uid={uid}",
@@ -805,7 +1437,7 @@ async def upload_file(
 
     page_id, page = await _require_selected_page(state)
     _validate_latest_uid(state, page_id=page_id, uid=uid)
-    locator = _locator_for_uid(page, uid)
+    locator = await _locator_for_uid(state, page=page, page_id=page_id, uid=uid)
     set_input_files = getattr(locator, "set_input_files", None)
     if not callable(set_input_files):
         raise ToolExecutionError(f"element for uid '{uid}' is no longer available; DOM changed")
