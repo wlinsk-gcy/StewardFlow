@@ -10,7 +10,12 @@ from core.protocol import ActionType
 
 logger = logging.getLogger(__name__)
 
+# HITL_CONTINUATION_MESSAGE = "Manual intervention has been completed. The previous snapshot has expired, so please re-check the current page state first."
 HITL_CONTINUATION_MESSAGE = "人工操作已完成，旧快照已过期，请先重新检查当前页面状态。"
+CONTEXT_WINDOW_METADATA_KEY = "context_window"
+CONTEXT_WINDOW_ESTIMATED_TOKENS_KEY = "estimated_tokens"
+CONTEXT_WINDOW_COMPACTED_AT_KEY = "compacted_at"
+PLACEHOLDER_TOOL_RESULT = "[Old tool result content cleared]"
 
 
 def _enum_value(value: Any) -> Any:
@@ -57,9 +62,13 @@ class CacheManager(abc.ABC):
                     for call in tool_calls:
                         call_id = (call or {}).get("id")
                         obs = obs_map.get(call_id)
-                        content = getattr(obs, "content", "")
+                        if self._is_compacted_tool_result(obs):
+                            tool_content = PLACEHOLDER_TOOL_RESULT
+                        else:
+                            content = getattr(obs, "content", "")
+                            tool_content = self._to_str(content)
                         step_messages.append(
-                            {"role": "tool", "tool_call_id": call_id, "content": self._to_str(content)})
+                            {"role": "tool", "tool_call_id": call_id, "content": tool_content})
 
                     # 针对HITL request_input做上下文注入 -- 只有tool call时才会出发request_input
                     request_input_actions = [a for a in actions if a.type == ActionType.REQUEST_INPUT]
@@ -67,7 +76,7 @@ class CacheManager(abc.ABC):
                         req = getattr(request_input_actions[0], "request_input", None)
                         if req == "done":
                             step_messages.append(
-                                {"role": "user", "content": "人工操作已完成，旧快照已过期，请先重新检查当前页面状态"})
+                                {"role": "user", "content": HITL_CONTINUATION_MESSAGE})
                 # 普通 step：有内容就保留
                 else:
                     for a in actions:
@@ -91,6 +100,19 @@ class CacheManager(abc.ABC):
             if action_id:
                 obs_map[action_id] = observation
         return obs_map
+
+    @staticmethod
+    def _get_context_window_metadata(observation: Any) -> Dict[str, Any]:
+        metadata = getattr(observation, "metadata", None)
+        if not isinstance(metadata, dict):
+            return {}
+        value = metadata.get(CONTEXT_WINDOW_METADATA_KEY)
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def _is_compacted_tool_result(cls, observation: Any) -> bool:
+        context_window = cls._get_context_window_metadata(observation)
+        return bool(context_window.get(CONTEXT_WINDOW_COMPACTED_AT_KEY))
 
     @staticmethod
     def _to_str(value: Any) -> str:

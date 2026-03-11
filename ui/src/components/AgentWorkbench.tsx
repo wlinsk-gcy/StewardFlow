@@ -38,13 +38,116 @@ function normalizeText(s: string) {
   return s.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 }
 
+function joinClasses(...values: Array<string | undefined | false | null>) {
+  return values.filter(Boolean).join(" ");
+}
+
 const MessageContent: React.FC<{ content: string }> = ({ content }) => {
   return (
     <div className="sf-markdown max-w-none text-[14px] leading-7">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
+          h1: ({ className, ...props }) => (
+            <h1
+              {...props}
+              className={joinClasses("sf-markdown-heading sf-markdown-h1", className)}
+            />
+          ),
+          h2: ({ className, ...props }) => (
+            <h2
+              {...props}
+              className={joinClasses("sf-markdown-heading sf-markdown-h2", className)}
+            />
+          ),
+          h3: ({ className, ...props }) => (
+            <h3
+              {...props}
+              className={joinClasses("sf-markdown-heading sf-markdown-h3", className)}
+            />
+          ),
+          h4: ({ className, ...props }) => (
+            <h4
+              {...props}
+              className={joinClasses("sf-markdown-heading sf-markdown-h4", className)}
+            />
+          ),
+          p: ({ className, ...props }) => (
+            <p {...props} className={joinClasses("sf-markdown-paragraph", className)} />
+          ),
+          blockquote: ({ className, ...props }) => (
+            <blockquote
+              {...props}
+              className={joinClasses("sf-markdown-blockquote", className)}
+            />
+          ),
+          hr: ({ className, ...props }) => (
+            <hr {...props} className={joinClasses("sf-markdown-divider", className)} />
+          ),
+          a: ({ className, ...props }) => (
+            <a
+              {...props}
+              className={joinClasses("sf-markdown-link", className)}
+              target="_blank"
+              rel="noreferrer"
+            />
+          ),
+          pre: ({ className, ...props }) => (
+            <pre {...props} className={joinClasses("sf-markdown-pre", className)} />
+          ),
+          code: ({ inline, className, ...props }: any) =>
+            inline ? (
+              <code
+                {...props}
+                className={joinClasses("sf-markdown-inline-code", className)}
+              />
+            ) : (
+              <code
+                {...props}
+                className={joinClasses("sf-markdown-code-block", className)}
+              />
+            ),
+          table: ({ className, ...props }) => (
+            <div className="sf-markdown-table-wrap">
+              <table
+                {...props}
+                className={joinClasses("sf-markdown-table", className)}
+              />
+            </div>
+          ),
+          thead: ({ className, ...props }) => (
+            <thead
+              {...props}
+              className={joinClasses("sf-markdown-table-head", className)}
+            />
+          ),
+          tbody: ({ className, ...props }) => (
+            <tbody
+              {...props}
+              className={joinClasses("sf-markdown-table-body", className)}
+            />
+          ),
+          tr: ({ className, ...props }) => (
+            <tr {...props} className={joinClasses("sf-markdown-table-row", className)} />
+          ),
+          th: ({ className, ...props }) => (
+            <th
+              {...props}
+              className={joinClasses("sf-markdown-table-cell sf-markdown-table-th", className)}
+            />
+          ),
+          td: ({ className, ...props }) => (
+            <td
+              {...props}
+              className={joinClasses("sf-markdown-table-cell sf-markdown-table-td", className)}
+            />
+          ),
+          ul: ({ className, ...props }) => (
+            <ul {...props} className={joinClasses("sf-markdown-list", className)} />
+          ),
+          ol: ({ className, ...props }) => (
+            <ol {...props} className={joinClasses("sf-markdown-list", className)} />
+          ),
         }}
       >
         {normalizeText(content || "")}
@@ -1100,7 +1203,7 @@ export const AgentWorkbench: React.FC = () => {
           {/* Chat Messages */}
           <div
             ref={chatScrollRef}
-            className="flex-1 space-y-6 overflow-y-auto bg-[rgba(247,249,252,0.42)] p-6"
+            className="flex-1 space-y-6 overflow-y-auto overflow-x-hidden bg-[rgba(247,249,252,0.42)] p-6"
           >
             {chatHistory.length === 0 && (
               <div className="sf-empty-state flex h-full flex-col items-center justify-center px-10 text-center">
@@ -1118,10 +1221,14 @@ export const AgentWorkbench: React.FC = () => {
             {chatHistory.map((msg) => (
               <div
                 key={msg.id}
-                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                className={`flex min-w-0 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
-                  className={`flex max-w-[85%] gap-3 ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}
+                  className={`flex min-w-0 gap-3 ${
+                    msg.role === "user"
+                      ? "max-w-[85%] flex-row-reverse"
+                      : "w-full max-w-[48rem] flex-row"
+                  }`}
                 >
                   <div
                     className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl shadow-sm ${
@@ -1137,10 +1244,10 @@ export const AgentWorkbench: React.FC = () => {
                     )}
                   </div>
                   <div
-                    className={`rounded-[24px] p-4 text-left text-sm leading-relaxed break-words shadow-[0_14px_28px_rgba(15,23,42,0.05)] ${
+                    className={`min-w-0 overflow-hidden rounded-[24px] p-4 text-left text-sm leading-relaxed break-words shadow-[0_14px_28px_rgba(15,23,42,0.05)] ${
                       msg.role === "user"
                         ? "rounded-tr-none bg-[linear-gradient(180deg,var(--sf-accent),var(--sf-accent-strong))] text-white"
-                        : "rounded-tl-none border border-[var(--sf-border)] bg-white/[0.88] text-[var(--sf-ink)]"
+                        : "flex-1 rounded-tl-none border border-[var(--sf-border)] bg-white/[0.88] text-[var(--sf-ink)]"
                     }`}
                   >
                     <MessageContent content={String(msg.content ?? "")} />

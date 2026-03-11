@@ -18,7 +18,12 @@ from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
 from ws.connection_manager import ConnectionManager
-from core.cache_manager import CacheManager
+from core.cache_manager import (
+    CacheManager,
+    CONTEXT_WINDOW_COMPACTED_AT_KEY,
+    CONTEXT_WINDOW_ESTIMATED_TOKENS_KEY,
+    CONTEXT_WINDOW_METADATA_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,9 @@ BASH_HIGH_RISK_MARKERS = (
     "git push",
 )
 BASH_OPERATOR_MARKERS = (">", ">>", "<", "<<", "| tee", "$(", "`")
+PRUNE_PROTECT_TOKENS = 40_000
+PRUNE_MINIMUM_TOKENS = 20_000
+PRUNE_SKIP_RECENT_TURNS = 2
 
 
 def _serialize_observation_content(payload: Any) -> str:
@@ -170,6 +178,127 @@ class TaskExecutor:
         for action in step.actions or []:
             if action.status in cancellable_statuses:
                 action.status = ActionStatus.CANCELLED
+
+    @staticmethod
+    def _estimate_text_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return round(len(text) / 4)
+
+    @staticmethod
+    def _normalize_metadata(metadata: Any) -> dict[str, Any]:
+        return metadata if isinstance(metadata, dict) else {}
+
+    @classmethod
+    def _ensure_context_window_metadata(cls, metadata: Any) -> dict[str, Any]:
+        normalized = cls._normalize_metadata(metadata)
+        context_window = normalized.get(CONTEXT_WINDOW_METADATA_KEY)
+        if not isinstance(context_window, dict):
+            context_window = {}
+            normalized[CONTEXT_WINDOW_METADATA_KEY] = context_window
+        return context_window
+
+    @staticmethod
+    def _get_call_ids(step: Step | None) -> list[str]:
+        if not step:
+            return []
+        return [call.get("id") for call in (step.tool_calls or []) if (call or {}).get("id")]
+
+    @staticmethod
+    def _build_step_observation_map(step: Step | None) -> dict[str, Observation]:
+        obs_map: dict[str, Observation] = {}
+        if not step:
+            return obs_map
+        for observation in step.observations or []:
+            action_id = getattr(observation, "action_id", None)
+            if action_id:
+                obs_map[action_id] = observation
+        return obs_map
+
+    def _is_complete_tool_step(self, step: Step | None) -> bool:
+        call_ids = self._get_call_ids(step)
+        if not call_ids:
+            return False
+        obs_map = self._build_step_observation_map(step)
+        return all(call_id in obs_map for call_id in call_ids)
+
+    @classmethod
+    def _is_compacted_observation(cls, observation: Observation | None) -> bool:
+        if observation is None:
+            return False
+        metadata = cls._normalize_metadata(getattr(observation, "metadata", None))
+        context_window = metadata.get(CONTEXT_WINDOW_METADATA_KEY)
+        if not isinstance(context_window, dict):
+            return False
+        return bool(context_window.get(CONTEXT_WINDOW_COMPACTED_AT_KEY))
+
+    def _get_estimated_tokens(self, observation: Observation) -> int:
+        metadata = self._normalize_metadata(getattr(observation, "metadata", None))
+        context_window = metadata.get(CONTEXT_WINDOW_METADATA_KEY)
+        if isinstance(context_window, dict):
+            estimate = context_window.get(CONTEXT_WINDOW_ESTIMATED_TOKENS_KEY)
+            if isinstance(estimate, int) and estimate >= 0:
+                return estimate
+
+        serialized_output = _serialize_observation_content(getattr(observation, "content", ""))
+        estimate = self._estimate_text_tokens(serialized_output)
+        if estimate > 0:
+            metadata = self._normalize_metadata(getattr(observation, "metadata", None))
+            context_window = self._ensure_context_window_metadata(metadata)
+            context_window[CONTEXT_WINDOW_ESTIMATED_TOKENS_KEY] = estimate
+            observation.metadata = metadata
+        return estimate
+
+    def _mark_observation_compacted(self, observation: Observation, *, compacted_at: str) -> None:
+        metadata = self._normalize_metadata(getattr(observation, "metadata", None))
+        context_window = self._ensure_context_window_metadata(metadata)
+        context_window[CONTEXT_WINDOW_COMPACTED_AT_KEY] = compacted_at
+        observation.metadata = metadata
+
+    def _iter_prune_candidates(self, trace: Trace) -> list[Observation]:
+        if len(trace.turns) <= PRUNE_SKIP_RECENT_TURNS:
+            return []
+
+        candidates: list[Observation] = []
+        older_turns = trace.turns[:-PRUNE_SKIP_RECENT_TURNS]
+        for turn in reversed(older_turns):
+            for step in reversed(turn.steps or []):
+                if not self._is_complete_tool_step(step):
+                    continue
+                obs_map = self._build_step_observation_map(step)
+                for call_id in reversed(self._get_call_ids(step)):
+                    observation = obs_map.get(call_id)
+                    if observation is None:
+                        continue
+                    if observation.type != ObservationType.TOOL_RESULT:
+                        continue
+                    if self._is_compacted_observation(observation):
+                        continue
+                    candidates.append(observation)
+        return candidates
+
+    def _prune_old_tool_results(self, trace: Trace) -> int:
+        protected_tokens = 0
+        candidate_tokens = 0
+        prune_targets: list[Observation] = []
+
+        for observation in self._iter_prune_candidates(trace):
+            estimate = self._get_estimated_tokens(observation)
+            if estimate <= 0:
+                continue
+            if protected_tokens < PRUNE_PROTECT_TOKENS:
+                protected_tokens += estimate
+                continue
+            prune_targets.append(observation)
+            candidate_tokens += estimate
+
+        if candidate_tokens <= PRUNE_MINIMUM_TOKENS:
+            return 0
+
+        compacted_at = datetime.utcnow().isoformat()
+        for observation in prune_targets:
+            self._mark_observation_compacted(observation, compacted_at=compacted_at)
+        return len(prune_targets)
 
     def _mark_trace_cancelled(self, trace: Trace, turn: Turn | None, step: Step | None) -> str:
         finished_at = datetime.utcnow()
@@ -417,29 +546,19 @@ class TaskExecutor:
         self.checkpoint.save(trace)
 
     async def _action(self, trace: Trace, turn: Turn, step: Step):
-        finish_action_list = [action for action in step.actions if action.type == ActionType.FINISH]
-        if finish_action_list and ActionType.FINISH == finish_action_list[0].type:
-            finish_action = finish_action_list[0]
-            observation = Observation(observation_id=get_sonyflake("observation_"),
-                                      action_id=finish_action.action_id, type=ObservationType.INFO, ok=True,
-                                      content=finish_action.message)
-            finish_action.status = ActionStatus.DONE
+        for action in step.actions:
+            # Execute only planned non-confirm actions in current step.
+            if action.requires_confirm:
+                continue
+            if action.status != ActionStatus.PLANNED:
+                continue
+            action.status = ActionStatus.RUNNING
+            observation = await self._execute_tool(trace, turn, step, action)
             step.observations.append(observation)
-            trace.node = NodeType.END  # End workflow.
-        else:
-            for action in step.actions:
-                # Execute only planned non-confirm actions in current step.
-                if action.requires_confirm:
-                    continue
-                if action.status != ActionStatus.PLANNED:
-                    continue
-                action.status = ActionStatus.RUNNING
-                observation = await self._execute_tool(trace, turn, step, action)
-                step.observations.append(observation)
 
-            trace.node = NodeType.OBSERVE
-
+        trace.node = NodeType.OBSERVE
         self.checkpoint.save(trace)
+
 
     def _detect_hitl_barrier(self, step: Step) -> dict[str, Any] | None:
         if not step or not step.observations:
@@ -452,11 +571,6 @@ class TaskExecutor:
         return None
 
     async def _guard(self, trace: Trace, turn: Turn, step: Step):
-        if step is None:
-            trace.node = NodeType.THINK
-            self.checkpoint.save(trace)
-            return
-
         barrier_signal = self._detect_hitl_barrier(step)
         if barrier_signal:
             action = Action(
@@ -470,6 +584,8 @@ class TaskExecutor:
             )
             step.actions.append(action)
             await self._enter_request_input_wait(trace, step, action)
+            if self._is_complete_tool_step(step):
+                self._prune_old_tool_results(trace)
             self.checkpoint.save(trace)
             return
 
@@ -481,6 +597,8 @@ class TaskExecutor:
             trace.node = NodeType.END
         else:
             trace.node = NodeType.THINK
+        if self._is_complete_tool_step(step):
+            self._prune_old_tool_results(trace)
         self.checkpoint.save(trace)
 
     async def _observe(self, trace: Trace, turn: Turn, step: Step):
@@ -551,14 +669,24 @@ class TaskExecutor:
         try:
             execute_result = await tool.execute(**(args or {}))
             parsed_payload = self._try_parse_tool_payload(execute_result)
+            if isinstance(parsed_payload, dict):
+                observation_content = parsed_payload.get("output")
+                observation_metadata = self._normalize_metadata(parsed_payload.get("metadata"))
+            else:
+                observation_content = parsed_payload
+                observation_metadata = {}
+
+            serialized_output = _serialize_observation_content(observation_content)
+            context_window = self._ensure_context_window_metadata(observation_metadata)
+            context_window[CONTEXT_WINDOW_ESTIMATED_TOKENS_KEY] = self._estimate_text_tokens(serialized_output)
             action.status = ActionStatus.DONE
             return Observation(
                 observation_id=observation_id,
                 action_id=action.action_id,
                 type=ObservationType.TOOL_RESULT,
                 ok=True,
-                content=parsed_payload.get("output"),
-                metadata=parsed_payload.get("metadata")
+                content=observation_content,
+                metadata=observation_metadata,
             )
         except asyncio.CancelledError:
             action.status = ActionStatus.CANCELLED

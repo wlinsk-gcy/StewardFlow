@@ -203,6 +203,29 @@ SNAPSHOT_EVALUATE_SCRIPT = """
     return values.join(" | ");
   };
 
+  const descriptorClassTokens = (value) =>
+    normalize(value)
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter(
+        (token) =>
+          token &&
+          token.length <= 40 &&
+          /[a-zA-Z]/.test(token) &&
+          ((token.match(/\d/g) || []).length <= 3)
+      )
+      .slice(0, 8);
+  const descriptorText = (element) => normalize(element.innerText || element.textContent).slice(0, 160);
+  const descriptorLabelText = (element) => {
+    const labels = element.labels ? Array.from(element.labels) : [];
+    return normalize(labels.map((label) => label.innerText || label.textContent).join(" "))
+      .slice(0, 160);
+  };
+  const descriptorSignatureText = (descriptor) =>
+    normalize(descriptor.placeholder || descriptor.ariaLabel || descriptor.labelText || descriptor.text)
+      .slice(0, 80)
+      .toLowerCase();
+
   const interactiveSelector = [
     "a",
     "button",
@@ -232,7 +255,10 @@ SNAPSHOT_EVALUATE_SCRIPT = """
   }
 
   const uids = [];
-  for (const element of interactiveElements) {
+  const descriptors = {};
+  const signatureCounts = new Map();
+  for (let actionIndex = 0; actionIndex < interactiveElements.length; actionIndex += 1) {
+    const element = interactiveElements[actionIndex];
     let uid = normalize(element.getAttribute("data-sf-uid"));
     if (!uid) {
       uid = `sf-${nextUid}`;
@@ -240,6 +266,32 @@ SNAPSHOT_EVALUATE_SCRIPT = """
       element.setAttribute("data-sf-uid", uid);
     }
     uids.push(uid);
+    const descriptor = {
+      tag: element.tagName.toLowerCase(),
+      role: roleValue(element),
+      inputType: normalize(element.getAttribute("type")).toLowerCase(),
+      text: descriptorText(element),
+      placeholder: normalize(element.getAttribute("placeholder")),
+      ariaLabel: normalize(element.getAttribute("aria-label")),
+      labelText: descriptorLabelText(element),
+      name: normalize(element.getAttribute("name")),
+      title: normalize(element.getAttribute("title")),
+      href: normalize(element.getAttribute("href")),
+      value: normalize(element.value),
+      classTokens: descriptorClassTokens(element.className),
+      actionIndex,
+    };
+    const signatureKey = [
+      descriptor.tag,
+      descriptor.role,
+      descriptor.inputType,
+      descriptorSignatureText(descriptor),
+    ].join("|");
+    const signatureIndex = signatureCounts.get(signatureKey) || 0;
+    signatureCounts.set(signatureKey, signatureIndex + 1);
+    descriptor.signatureKey = signatureKey;
+    descriptor.signatureIndex = signatureIndex;
+    descriptors[uid] = descriptor;
     pushLine(`[uid=${uid}] ${describeElement(element)}`);
   }
   root.setAttribute("data-sf-uid-seq", String(nextUid));
@@ -266,6 +318,7 @@ SNAPSHOT_EVALUATE_SCRIPT = """
     documentId,
     lines: uniqueLines,
     uids,
+    descriptors,
   };
 }
 """
@@ -279,6 +332,7 @@ class SnapshotRecord:
     created_at: float
     uids: set[str] = field(default_factory=set)
     text: str = ""
+    descriptors: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class BrowserState:
@@ -377,6 +431,7 @@ class BrowserState:
         document_id: str,
         uids: set[str],
         text: str,
+        descriptors: dict[str, dict[str, Any]] | None = None,
     ) -> SnapshotRecord:
         record = SnapshotRecord(
             snapshot_id=self.next_snapshot_id,
@@ -385,6 +440,7 @@ class BrowserState:
             created_at=time.time(),
             uids=set(uids),
             text=text,
+            descriptors=dict(descriptors or {}),
         )
         self.next_snapshot_id += 1
         self.page_document_ids[page_id] = document_id
@@ -485,6 +541,11 @@ class BrowserState:
             "text": "\n".join(lines),
             "document_id": document_id,
             "uids": {str(uid) for uid in (snapshot.get("uids") or []) if str(uid).strip()},
+            "descriptors": {
+                str(uid): value
+                for uid, value in dict(snapshot.get("descriptors") or {}).items()
+                if str(uid).strip() and isinstance(value, dict)
+            },
         }
 
     async def shutdown(self) -> None:

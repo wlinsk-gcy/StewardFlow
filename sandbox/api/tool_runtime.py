@@ -10,6 +10,8 @@ from typing import Callable
 
 UNIFIED_MAX_LINES = 200
 UNIFIED_MAX_BYTES = 10 * 1024
+BACKGROUND_EARLY_OUTPUT_MAX_LINES = 40
+BACKGROUND_EARLY_OUTPUT_MAX_CHARS = 4000
 READ_DEFAULT_LIMIT = 200
 READ_LINE_MAX_CHARS = 2000
 GLOB_MAX_RESULTS = 100
@@ -73,15 +75,118 @@ def format_bash_result(
     *,
     exit_code: int | None,
     artifact_writer: Callable[[str, str], str],
+    metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    merged_metadata = dict(metadata or {})
+    merged_metadata["exit_code"] = exit_code
     return apply_unified_truncation(
         {
             "output": output,
-            "metadata": {"exit_code": exit_code},
+            "metadata": merged_metadata,
         },
         tool_name="tools_bash",
         artifact_writer=artifact_writer,
     )
+
+
+def shape_background_bash_early_output(output: str) -> str:
+    text = str(output or "")
+    if not text:
+        return ""
+
+    limited_lines = text.splitlines()[:BACKGROUND_EARLY_OUTPUT_MAX_LINES]
+    shaped = "\n".join(limited_lines).strip()
+    if len(shaped) > BACKGROUND_EARLY_OUTPUT_MAX_CHARS:
+        shaped = shaped[: BACKGROUND_EARLY_OUTPUT_MAX_CHARS - 3].rstrip() + "..."
+    return shaped
+
+
+def format_background_bash_result(
+    *,
+    status: str,
+    command: str,
+    workdir: str,
+    job_id: str,
+    pid: int | None,
+    log_path: str,
+    exit_code: int | None,
+    artifact_writer: Callable[[str, str], str],
+    early_output: str | None = None,
+) -> dict[str, object]:
+    output = _build_background_bash_output(
+        status=status,
+        command=command,
+        workdir=workdir,
+        job_id=job_id,
+        pid=pid,
+        log_path=log_path,
+        early_output=early_output,
+    )
+    return format_bash_result(
+        output,
+        exit_code=exit_code,
+        artifact_writer=artifact_writer,
+        metadata={
+            "mode": "background",
+            "status": status,
+            "job_id": job_id,
+            "pid": pid,
+            "logPath": log_path,
+        },
+    )
+
+
+def _append_tagged_block(lines: list[str], tag: str, value: str | None) -> None:
+    if value is None:
+        return
+    text = str(value)
+    if "\n" in text:
+        lines.append(f"<{tag}>")
+        lines.extend(text.splitlines())
+        lines.append(f"</{tag}>")
+        return
+    lines.append(f"<{tag}>{text}</{tag}>")
+
+
+def _build_background_bash_output(
+    *,
+    status: str,
+    command: str,
+    workdir: str,
+    job_id: str,
+    pid: int | None,
+    log_path: str,
+    early_output: str | None,
+) -> str:
+    lines: list[str] = []
+    _append_tagged_block(lines, "status", status)
+    _append_tagged_block(lines, "command", command)
+    _append_tagged_block(lines, "workdir", workdir)
+    _append_tagged_block(lines, "job_id", job_id)
+    if pid is not None:
+        _append_tagged_block(lines, "pid", str(pid))
+    _append_tagged_block(lines, "log_path", log_path)
+
+    if status == "launched_unverified":
+        _append_tagged_block(
+            lines,
+            "message",
+            "The command was launched and returned early by design.\n"
+            "Do not assume the service is ready yet.\n"
+            "Use a follow-up check if readiness matters.",
+        )
+    elif status == "launch_timeout":
+        _append_tagged_block(
+            lines,
+            "message",
+            "The command did not reach the expected quick-return state.",
+        )
+    elif status in {"failed_to_launch", "exited_early"}:
+        shaped = shape_background_bash_early_output(early_output or "")
+        if shaped:
+            _append_tagged_block(lines, "early_output", shaped)
+
+    return "\n".join(lines)
 
 
 def apply_unified_truncation(
