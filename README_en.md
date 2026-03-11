@@ -272,9 +272,6 @@ Rules:
   automatically become the active execution target
 - `CheckpointStore` and `InMemoryCacheManager` are still memory-backed only
 
-## License
-
-This repository is released under the `MIT` License. See [LICENSE](LICENSE).
 
 ## Special Thanks
 
