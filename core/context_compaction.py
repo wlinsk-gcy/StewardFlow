@@ -12,6 +12,7 @@ Only output the summary."""
 
 WHAT_DID_WE_DO_PROMPT = "What did we do so far?"
 CONTINUE_PROMPT = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+BOUNDARY_BEFORE_FIRST_STEP = "__before_first_step__"
 
 
 def build_summary_instruction_prompt() -> str:
@@ -108,6 +109,9 @@ def resolve_compaction_boundary(trace: Any) -> tuple[int | None, int | None]:
         if getattr(turn, "turn_id", None) != boundary_turn_id:
             continue
         boundary_turn_index = turn_index
+        if boundary_step_id == BOUNDARY_BEFORE_FIRST_STEP:
+            boundary_step_index = -1
+            break
         if not boundary_step_id:
             break
         for step_index, step in enumerate(getattr(turn, "steps", []) or []):

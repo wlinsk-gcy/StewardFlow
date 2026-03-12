@@ -14,6 +14,7 @@ from .protocol import (
     Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus, HitlTicket
 )
 from .context_compaction import (
+    BOUNDARY_BEFORE_FIRST_STEP,
     COMPACTION_SYSTEM_PROMPT,
     CONTINUE_PROMPT,
     build_summary_instruction_prompt,
@@ -376,10 +377,12 @@ class TaskExecutor:
         trace: Trace,
         *,
         boundary_turn: Turn,
-        boundary_step: Step,
+        boundary_step: Step | None,
         mode: str,
         source: str,
         resume_prompt: str,
+        event_step_id: str | None = None,
+        boundary_step_id: str | None = None,
         history_messages: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         history = list(history_messages) if history_messages is not None else await self._build_summary_history_messages(trace)
@@ -389,11 +392,13 @@ class TaskExecutor:
             system_prompt=COMPACTION_SYSTEM_PROMPT,
         )
         trace.token_info = self._merge_token_info(trace.token_info, token_info)
-        await self._emit_trace_token_info(trace, step_id=boundary_step.step_id)
+        emit_step_id = event_step_id or getattr(boundary_step, "step_id", None)
+        if emit_step_id:
+            await self._emit_trace_token_info(trace, step_id=emit_step_id)
         trace.context_compaction = make_context_compaction(
             summary_text=summary_text,
             boundary_turn_id=boundary_turn.turn_id,
-            boundary_step_id=boundary_step.step_id,
+            boundary_step_id=boundary_step_id if boundary_step_id is not None else getattr(boundary_step, "step_id", None),
             resume_prompt=resume_prompt,
             mode=mode,
             source=source,
@@ -439,6 +444,99 @@ class TaskExecutor:
             return False
         finally:
             self._clear_pending_compaction(trace)
+
+    @staticmethod
+    def _find_last_completed_step(turn: Turn, *, exclude_step_id: str | None = None) -> Step | None:
+        steps = list(turn.steps or [])
+        for step in reversed(steps):
+            if exclude_step_id and step.step_id == exclude_step_id:
+                continue
+            if step.status == StepStatus.DONE:
+                return step
+        return None
+
+    async def _recover_from_hard_overflow(self, trace: Trace, turn: Turn, step: Step) -> None:
+        self._set_pending_compaction(
+            trace,
+            overflow=True,
+            source="hard_overflow",
+            turn=turn,
+            step=step,
+        )
+        previous_compaction = getattr(trace, "context_compaction", None)
+        previous_step = self._find_last_completed_step(turn, exclude_step_id=step.step_id)
+        history_messages = await self._build_summary_history_messages(trace)
+        mode = "continue"
+        resume_prompt = CONTINUE_PROMPT
+        boundary_step: Step | None = previous_step
+        boundary_step_id: str | None = getattr(previous_step, "step_id", None)
+
+        if previous_step is None:
+            mode = "replay"
+            resume_prompt = str(getattr(turn, "user_input", "") or "")
+            boundary_step = None
+            boundary_step_id = BOUNDARY_BEFORE_FIRST_STEP
+            if history_messages and history_messages[-1].get("role") == "user":
+                last_user = str(history_messages[-1].get("content", "") or "")
+                if last_user == resume_prompt:
+                    history_messages = history_messages[:-1]
+
+        try:
+            await self._execute_summary_compaction(
+                trace,
+                boundary_turn=turn,
+                boundary_step=boundary_step,
+                boundary_step_id=boundary_step_id,
+                event_step_id=step.step_id,
+                mode=mode,
+                source="hard_overflow",
+                resume_prompt=resume_prompt,
+                history_messages=history_messages,
+            )
+            logger.info(
+                "hard_compaction_success trace=%s turn=%s step=%s mode=%s",
+                trace.trace_id,
+                turn.turn_id,
+                step.step_id,
+                mode,
+            )
+        except Exception:
+            trace.context_compaction = previous_compaction
+            raise
+        finally:
+            self._clear_pending_compaction(trace)
+
+    async def _generate_with_hard_overflow_recovery(
+        self,
+        trace: Trace,
+        turn: Turn,
+        step: Step,
+        context: dict[str, Any],
+    ) -> tuple[str, str, list, dict]:
+        try:
+            return await self.llm.generate(context)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "hard_overflow_detected trace=%s turn=%s step=%s error=%s",
+                trace.trace_id,
+                turn.turn_id,
+                step.step_id,
+                exc,
+            )
+            await self._recover_from_hard_overflow(trace, turn, step)
+            context["messages"] = await self.cache_manager.build_messages(trace)
+            try:
+                return await self.llm.generate(context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as retry_exc:
+                if is_context_overflow_error(retry_exc):
+                    raise RuntimeError("Context overflow persisted after summary compaction") from retry_exc
+                raise
 
     def _iter_prune_candidates(self, trace: Trace) -> list[Observation]:
         if len(trace.turns) <= PRUNE_SKIP_RECENT_TURNS:
@@ -607,7 +705,12 @@ class TaskExecutor:
             "user_input": turn.user_input,
             "messages": messages,
         }
-        finish_reason, reasoning, actions, token_info = await self.llm.generate(context)
+        finish_reason, reasoning, actions, token_info = await self._generate_with_hard_overflow_recovery(
+            trace,
+            turn,
+            step,
+            context,
+        )
 
         trace.token_info = self._merge_token_info(trace.token_info, token_info)
         if self._should_schedule_soft_compaction(token_info):
