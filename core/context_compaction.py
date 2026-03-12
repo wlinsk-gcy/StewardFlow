@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 COMPACTION_SYSTEM_PROMPT = """You are StewardFlow's context compaction assistant.
 
@@ -74,3 +75,63 @@ def make_context_compaction(
         "model": str(model or "").strip() or None,
         "created_at": datetime.utcnow().isoformat(),
     }
+
+
+def get_active_compaction(trace: Any) -> dict[str, Any] | None:
+    value = getattr(trace, "context_compaction", None)
+    if not isinstance(value, dict):
+        return None
+    if not value.get("summary_text"):
+        return None
+    if not value.get("boundary_turn_id"):
+        return None
+    return value
+
+
+def get_compaction_boundary(trace: Any) -> tuple[str | None, str | None]:
+    compaction = get_active_compaction(trace)
+    if not compaction:
+        return None, None
+    boundary_turn_id = str(compaction.get("boundary_turn_id") or "").strip() or None
+    boundary_step_id = str(compaction.get("boundary_step_id") or "").strip() or None
+    return boundary_turn_id, boundary_step_id
+
+
+def resolve_compaction_boundary(trace: Any) -> tuple[int | None, int | None]:
+    boundary_turn_id, boundary_step_id = get_compaction_boundary(trace)
+    if not boundary_turn_id:
+        return None, None
+
+    boundary_turn_index: int | None = None
+    boundary_step_index: int | None = None
+    for turn_index, turn in enumerate(getattr(trace, "turns", []) or []):
+        if getattr(turn, "turn_id", None) != boundary_turn_id:
+            continue
+        boundary_turn_index = turn_index
+        if not boundary_step_id:
+            break
+        for step_index, step in enumerate(getattr(turn, "steps", []) or []):
+            if getattr(step, "step_id", None) == boundary_step_id:
+                boundary_step_index = step_index
+                break
+        break
+    return boundary_turn_index, boundary_step_index
+
+
+def should_skip_turn_step(
+    turn_index: int,
+    step_index: int | None,
+    boundary_turn_index: int | None,
+    boundary_step_index: int | None,
+) -> bool:
+    if boundary_turn_index is None:
+        return False
+    if turn_index < boundary_turn_index:
+        return True
+    if turn_index > boundary_turn_index:
+        return False
+    if step_index is None:
+        return True
+    if boundary_step_index is None:
+        return True
+    return step_index <= boundary_step_index

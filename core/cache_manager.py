@@ -6,6 +6,12 @@ import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
+from core.context_compaction import (
+    WHAT_DID_WE_DO_PROMPT,
+    get_active_compaction,
+    resolve_compaction_boundary,
+    should_skip_turn_step,
+)
 from core.protocol import ActionType
 
 logger = logging.getLogger(__name__)
@@ -32,18 +38,45 @@ class CacheManager(abc.ABC):
     async def build_messages(self, trace: Any) -> List[Dict[str, Any]]:
         sys_prompt = self._build_system_prompt_fn()
         messages = [{"role": "system", "content": sys_prompt}]
+        active_compaction = get_active_compaction(trace)
+        boundary_turn_index: int | None = None
+        boundary_step_index: int | None = None
+        if active_compaction:
+            boundary_turn_index, boundary_step_index = resolve_compaction_boundary(trace)
+            if boundary_turn_index is None:
+                active_compaction = None
+            else:
+                messages.extend(
+                    [
+                        {"role": "user", "content": WHAT_DID_WE_DO_PROMPT},
+                        {"role": "assistant", "content": self._to_str(active_compaction.get("summary_text"))},
+                        {"role": "user", "content": self._to_str(active_compaction.get("resume_prompt"))},
+                    ]
+                )
 
         current_turn_id = getattr(trace, "current_turn_id", None)
 
-        for turn in getattr(trace, "turns", []):
+        for turn_index, turn in enumerate(getattr(trace, "turns", [])):
             user_input = getattr(turn, "user_input", None)
             turn_id = getattr(turn, "turn_id", None)
             is_latest_turn = turn_id == current_turn_id
+            include_turn_user_message = True
+            if active_compaction and boundary_turn_index is not None and turn_index < boundary_turn_index:
+                continue
+            if active_compaction and boundary_turn_index == turn_index:
+                include_turn_user_message = False
 
             turn_step_messages: List[Dict[str, Any]] = []
             has_valid_step = False
 
-            for step in getattr(turn, "steps", []):
+            for step_index, step in enumerate(getattr(turn, "steps", [])):
+                if active_compaction and should_skip_turn_step(
+                    turn_index=turn_index,
+                    step_index=step_index,
+                    boundary_turn_index=boundary_turn_index,
+                    boundary_step_index=boundary_step_index,
+                ):
+                    continue
                 step_messages: List[Dict[str, Any]] = []
                 tool_calls = getattr(step, "tool_calls", None) or []
                 observations = getattr(step, "observations", None) or []
@@ -88,8 +121,9 @@ class CacheManager(abc.ABC):
                     has_valid_step = True
                     turn_step_messages.extend(step_messages)
 
-            if has_valid_step or is_latest_turn:
-                messages.append({"role": "user", "content": str(user_input)})
+            if include_turn_user_message and (has_valid_step or is_latest_turn):
+                messages.append({"role": "user", "content": self._to_str(user_input)})
+            if has_valid_step:
                 messages.extend(turn_step_messages)
         return messages
 
