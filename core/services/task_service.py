@@ -8,6 +8,7 @@ from typing import Optional
 from core.cache_manager import CacheManager
 from core.executor import TaskExecutor
 from core.llm import Provider
+from core.model_limits import ModelLimitRegistry
 from core.protocol import Action, AgentStatus, HitlTicket, NodeType, Observation, Step, Trace, Turn
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
@@ -38,12 +39,14 @@ class TaskService:
         tool_registry: ToolRegistry,
         ws_manager: ConnectionManager,
         cache_manager: CacheManager,
+        model_limit_registry: ModelLimitRegistry,
     ):
         self.checkpoint = checkpoint
         self.provider = provider
         self.tool_registry = tool_registry
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
+        self.model_limit_registry = model_limit_registry
 
         self.queue_lanes_enabled = True
         self.global_concurrency_limit = 4
@@ -62,6 +65,7 @@ class TaskService:
             tool_registry,
             ws_manager,
             cache_manager,
+            model_limit_registry,
         )
 
     @staticmethod

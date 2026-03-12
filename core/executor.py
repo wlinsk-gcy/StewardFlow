@@ -14,6 +14,7 @@ from .protocol import (
     Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus, HitlTicket
 )
 from .llm import Provider
+from .model_limits import ModelLimitRegistry
 from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
@@ -125,12 +126,14 @@ class TaskExecutor:
 
     def __init__(self, checkpoint: CheckpointStore, provider: Provider, tool_registry: ToolRegistry,
                  ws_manager: ConnectionManager, cache_manager: CacheManager,
+                 model_limit_registry: ModelLimitRegistry,
                  ):
         self.llm = provider
         self.tool_registry = tool_registry
         self.checkpoint = checkpoint
         self.ws_manager = ws_manager
         self.cache_manager = cache_manager
+        self.model_limit_registry = model_limit_registry
         self.schema_v2_enabled = True
         self.obs_card_v1_enabled = True
         self.toolset_schema_version = "tools_v2" if self.schema_v2_enabled else "tools_v1"

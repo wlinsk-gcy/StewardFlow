@@ -21,6 +21,7 @@ from context import request_id_ctx, trace_id_ctx
 from utils.id_util import get_sonyflake
 from utils.tool_artifacts_util import clear_tool_artifacts
 from core.llm import Provider
+from core.model_limits import ModelLimitRegistry
 from core.storage.checkpoint import CheckpointStore
 from core.tools.tool import ToolRegistry
 from core.tools.sandbox import register_sandbox_tools
@@ -208,6 +209,9 @@ async def lifespan(app: FastAPI):
     # ===== startup =====
     ws_manager = ConnectionManager()
     checkpoint = CheckpointStore()
+    model_limit_registry = ModelLimitRegistry(PROJECT_ROOT / "data" / "model_limits" / "models.dev.json")
+    model_limit_registry.load_cache()
+    await model_limit_registry.refresh_cache_best_effort()
     tool_registry, browser_manager = init_load_tools()
     mcp_client = MCPClient(config="./mcp_config.json")
     mcp_cfg = config.get("mcp") or {}
@@ -235,9 +239,11 @@ async def lifespan(app: FastAPI):
         tool_registry,
         ws_manager,
         cache_manager,
+        model_limit_registry,
     )
 
     app.state.checkpoint = checkpoint
+    app.state.model_limit_registry = model_limit_registry
     app.state.tool_registry = tool_registry
     app.state.provider = provider
     app.state.ws_manager = ws_manager
