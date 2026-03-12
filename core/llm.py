@@ -332,9 +332,11 @@ class Provider:
     async_client: AsyncOpenAI
     ws_manager: ConnectionManager
     model: str
+    base_url: str
 
     def __init__(self, model:str, api_key: str, base_url: str, tool_registry: ToolRegistry, ws_manager: ConnectionManager, context_config: dict | None = None):
         self.model = model
+        self.base_url = base_url
         self.async_client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key

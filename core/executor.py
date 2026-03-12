@@ -13,8 +13,15 @@ from .protocol import (
     ActionType, Event, EventType,
     Trace, Turn, Step, ActionStatus, Action, Observation, ObservationType, StepStatus, TurnStatus, HitlTicket
 )
-from .llm import Provider
-from .model_limits import ModelLimitRegistry
+from .context_compaction import (
+    COMPACTION_SYSTEM_PROMPT,
+    CONTINUE_PROMPT,
+    build_summary_instruction_prompt,
+    make_context_compaction,
+    make_pending_compaction,
+)
+from .llm import Provider, is_context_overflow_error
+from .model_limits import ModelLimitRegistry, ModelLimits
 from .tools.tool import ToolRegistry
 from .storage.checkpoint import CheckpointStore
 from utils.id_util import get_sonyflake
@@ -258,6 +265,181 @@ class TaskExecutor:
         context_window[CONTEXT_WINDOW_COMPACTED_AT_KEY] = compacted_at
         observation.metadata = metadata
 
+    @staticmethod
+    def _merge_token_info(existing: dict[str, Any] | None, delta: dict[str, Any] | None) -> dict[str, Any]:
+        base = existing if isinstance(existing, dict) else {}
+        update = delta if isinstance(delta, dict) else {}
+        return {
+            "cache_tokens": int(base.get("cache_tokens", 0) or 0) + int(update.get("cache_tokens", 0) or 0),
+            "prompt_tokens": int(base.get("prompt_tokens", 0) or 0) + int(update.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(base.get("completion_tokens", 0) or 0)
+            + int(update.get("completion_tokens", 0) or 0),
+            "total_tokens": int(base.get("total_tokens", 0) or 0) + int(update.get("total_tokens", 0) or 0),
+        }
+
+    @staticmethod
+    def _get_pending_compaction(trace: Trace) -> dict[str, Any] | None:
+        value = getattr(trace, "pending_compaction", None)
+        return value if isinstance(value, dict) and value else None
+
+    def _set_pending_compaction(
+        self,
+        trace: Trace,
+        *,
+        overflow: bool,
+        source: str,
+        turn: Turn,
+        step: Step,
+    ) -> None:
+        trace.pending_compaction = make_pending_compaction(
+            overflow=overflow,
+            source=source,
+            turn_id=turn.turn_id,
+            step_id=step.step_id,
+        )
+
+    @staticmethod
+    def _clear_pending_compaction(trace: Trace) -> None:
+        trace.pending_compaction = {}
+
+    @staticmethod
+    def _find_turn_and_step(
+        trace: Trace,
+        *,
+        turn_id: str | None,
+        step_id: str | None,
+    ) -> tuple[Turn | None, Step | None]:
+        if not turn_id:
+            return None, None
+        for turn in trace.turns or []:
+            if turn.turn_id != turn_id:
+                continue
+            if not step_id:
+                return turn, None
+            for step in turn.steps or []:
+                if step.step_id == step_id:
+                    return turn, step
+            return turn, None
+        return None, None
+
+    def _get_model_limits(self) -> ModelLimits | None:
+        return self.model_limit_registry.get_limits(
+            model=getattr(self.llm, "model", ""),
+            base_url=getattr(self.llm, "base_url", None),
+        )
+
+    @staticmethod
+    def _usage_token_count(token_info: dict[str, Any] | None) -> int | None:
+        if not isinstance(token_info, dict):
+            return None
+        total = token_info.get("total_tokens")
+        if isinstance(total, int) and total >= 0:
+            return total
+        prompt = int(token_info.get("prompt_tokens", 0) or 0)
+        completion = int(token_info.get("completion_tokens", 0) or 0)
+        cache = int(token_info.get("cache_tokens", 0) or 0)
+        count = prompt + completion + cache
+        return count if count > 0 else None
+
+    @staticmethod
+    def _soft_overflow_threshold(limits: ModelLimits | None) -> int | None:
+        if not limits:
+            return None
+        if limits.input and limits.output:
+            reserved_tokens = min(20_000, limits.output)
+            threshold = limits.input - reserved_tokens
+            return threshold if threshold > 0 else None
+        if limits.context and limits.output:
+            threshold = limits.context - limits.output
+            return threshold if threshold > 0 else None
+        return None
+
+    def _should_schedule_soft_compaction(self, token_info: dict[str, Any] | None) -> bool:
+        threshold = self._soft_overflow_threshold(self._get_model_limits())
+        count = self._usage_token_count(token_info)
+        if threshold is None or count is None:
+            return False
+        return count >= threshold
+
+    async def _emit_trace_token_info(self, trace: Trace, *, step_id: str) -> None:
+        event = Event(EventType.TOKEN_INFO, trace.trace_id, step_id, trace.token_info)
+        await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+
+    async def _build_summary_history_messages(self, trace: Trace) -> list[dict[str, Any]]:
+        messages = await self.cache_manager.build_messages(trace)
+        if messages and messages[0].get("role") == "system":
+            return list(messages[1:])
+        return list(messages)
+
+    async def _execute_summary_compaction(
+        self,
+        trace: Trace,
+        *,
+        boundary_turn: Turn,
+        boundary_step: Step,
+        mode: str,
+        source: str,
+        resume_prompt: str,
+        history_messages: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        history = list(history_messages) if history_messages is not None else await self._build_summary_history_messages(trace)
+        history.append({"role": "user", "content": build_summary_instruction_prompt()})
+        summary_text, token_info = await self.llm.generate_summary(
+            messages=history,
+            system_prompt=COMPACTION_SYSTEM_PROMPT,
+        )
+        trace.token_info = self._merge_token_info(trace.token_info, token_info)
+        await self._emit_trace_token_info(trace, step_id=boundary_step.step_id)
+        trace.context_compaction = make_context_compaction(
+            summary_text=summary_text,
+            boundary_turn_id=boundary_turn.turn_id,
+            boundary_step_id=boundary_step.step_id,
+            resume_prompt=resume_prompt,
+            mode=mode,
+            source=source,
+            model=getattr(self.llm, "model", None),
+        )
+        return trace.context_compaction
+
+    async def _maybe_run_pending_soft_compaction(self, trace: Trace) -> bool:
+        pending = self._get_pending_compaction(trace)
+        if not pending or pending.get("overflow"):
+            return False
+
+        pending_turn, pending_step = self._find_turn_and_step(
+            trace,
+            turn_id=pending.get("trigger_turn_id"),
+            step_id=pending.get("trigger_step_id"),
+        )
+        if not pending_turn or not pending_step:
+            logger.warning("soft_compaction_skip_missing_boundary trace=%s pending=%s", trace.trace_id, pending)
+            self._clear_pending_compaction(trace)
+            return False
+
+        previous_compaction = getattr(trace, "context_compaction", None)
+        try:
+            await self._execute_summary_compaction(
+                trace,
+                boundary_turn=pending_turn,
+                boundary_step=pending_step,
+                mode="continue",
+                source=str(pending.get("source") or "soft_overflow"),
+                resume_prompt=CONTINUE_PROMPT,
+            )
+            logger.info(
+                "soft_compaction_success trace=%s turn=%s step=%s",
+                trace.trace_id,
+                pending_turn.turn_id,
+                pending_step.step_id,
+            )
+            return True
+        except Exception as exc:
+            trace.context_compaction = previous_compaction
+            logger.warning("soft_compaction_failed trace=%s error=%s", trace.trace_id, exc)
+            return False
+        finally:
+            self._clear_pending_compaction(trace)
+
     def _iter_prune_candidates(self, trace: Trace) -> list[Observation]:
         if len(trace.turns) <= PRUNE_SKIP_RECENT_TURNS:
             return []
@@ -413,6 +595,7 @@ class TaskExecutor:
             return
 
     async def _think(self, trace: Trace, turn: Turn) -> Step:
+        await self._maybe_run_pending_soft_compaction(trace)
         step = Step(index=len(turn.steps) + 1)
         turn.steps.append(step)
         trace.current_step_id = step.step_id
@@ -426,17 +609,18 @@ class TaskExecutor:
         }
         finish_reason, reasoning, actions, token_info = await self.llm.generate(context)
 
-        if trace.token_info:
-            trace.token_info["cache_tokens"] += token_info["cache_tokens"]
-            trace.token_info["prompt_tokens"] += token_info["prompt_tokens"]
-            trace.token_info["completion_tokens"] += token_info["completion_tokens"]
-            trace.token_info["total_tokens"] += token_info["total_tokens"]
-        else:
-            trace.token_info = token_info
+        trace.token_info = self._merge_token_info(trace.token_info, token_info)
+        if self._should_schedule_soft_compaction(token_info):
+            self._set_pending_compaction(
+                trace,
+                overflow=False,
+                source="soft_overflow",
+                turn=turn,
+                step=step,
+            )
         event = Event(EventType.THOUGHT, trace.trace_id, step.step_id, {"content": reasoning})
         await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
-        event = Event(EventType.TOKEN_INFO, trace.trace_id, step.step_id, trace.token_info)
-        await self.ws_manager.send(event.to_dict(), client_id=trace.client_id)
+        await self._emit_trace_token_info(trace, step_id=step.step_id)
         step.thought = reasoning
         step.actions = actions
         # Non-stream mode: emit answer/end events directly.
@@ -600,7 +784,8 @@ class TaskExecutor:
             trace.node = NodeType.END
         else:
             trace.node = NodeType.THINK
-        if self._is_complete_tool_step(step):
+        compaction_ran = await self._maybe_run_pending_soft_compaction(trace)
+        if self._is_complete_tool_step(step) and not compaction_ran:
             self._prune_old_tool_results(trace)
         self.checkpoint.save(trace)
 
