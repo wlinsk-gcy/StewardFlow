@@ -1,3 +1,4 @@
+import asyncio
 import re
 import logging
 import json
@@ -14,6 +15,45 @@ logger = logging.getLogger(__name__)
 
 THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 LLM_LOG_PREVIEW_CHARS = 120
+SUMMARY_MAX_RETRIES = 3
+CONTEXT_OVERFLOW_MARKERS = (
+    "context length",
+    "maximum context length",
+    "max context length",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "token limit",
+    "requested tokens",
+    "reduce the length",
+)
+NON_RETRYABLE_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "quota",
+    "usage limit",
+    "billing",
+    "credit",
+)
+NON_RETRYABLE_AUTH_MARKERS = (
+    "invalid api key",
+    "authentication",
+    "unauthorized",
+    "forbidden",
+    "permission",
+)
+RETRYABLE_ERROR_MARKERS = (
+    "connection reset",
+    "connection aborted",
+    "temporarily unavailable",
+    "temporarily overloaded",
+    "server overloaded",
+    "upstream error",
+    "timed out",
+    "timeout",
+    "try again",
+    "rate limit",
+)
 
 
 def _parse_json_dict(s: str) -> Optional[dict]:
@@ -170,6 +210,121 @@ def _clip_for_log(text: str, *, limit: int = LLM_LOG_PREVIEW_CHARS) -> str:
     return value[:limit] + "..."
 
 
+def _extract_status_code(exc: Exception) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if isinstance(value, int):
+        return value
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    value = getattr(response, "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+def _extract_error_code(exc: Exception) -> str | None:
+    for source in (exc, getattr(exc, "body", None)):
+        if isinstance(source, dict):
+            error = source.get("error") if isinstance(source.get("error"), dict) else source
+            code = error.get("code")
+            if code:
+                return str(code).strip().lower()
+    code = getattr(exc, "code", None)
+    if code:
+        return str(code).strip().lower()
+    return None
+
+
+def _extract_error_text(exc: Exception) -> str:
+    parts: list[str] = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        parts.append(json.dumps(body, ensure_ascii=False))
+    response = getattr(exc, "response", None)
+    data = getattr(response, "text", None)
+    if isinstance(data, str) and data:
+        parts.append(data)
+    return " ".join(part for part in parts if part).strip().lower()
+
+
+def _get_retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = None
+    if isinstance(headers, dict):
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    else:
+        raw = getattr(headers, "get", lambda *_: None)("retry-after") or getattr(headers, "get", lambda *_: None)("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _compute_retry_delay(exc: Exception, attempt: int) -> float:
+    retry_after = _get_retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+    return min(8.0, float(2 ** max(attempt - 1, 0)))
+
+
+def is_context_overflow_error(exc: Exception) -> bool:
+    code = _extract_error_code(exc)
+    if code in {"context_length_exceeded", "context_length_error"}:
+        return True
+    status_code = _extract_status_code(exc)
+    text = _extract_error_text(exc)
+    if status_code in {400, 413, 422} and any(marker in text for marker in CONTEXT_OVERFLOW_MARKERS):
+        return True
+    return any(marker in text for marker in CONTEXT_OVERFLOW_MARKERS)
+
+
+def is_retryable_provider_error(exc: Exception) -> bool:
+    if is_context_overflow_error(exc):
+        return False
+
+    error_type = type(exc).__name__.lower()
+    status_code = _extract_status_code(exc)
+    code = _extract_error_code(exc)
+    text = _extract_error_text(exc)
+
+    if code and any(marker in code for marker in NON_RETRYABLE_QUOTA_MARKERS):
+        return False
+    if any(marker in text for marker in NON_RETRYABLE_QUOTA_MARKERS):
+        return False
+    if status_code in {401, 403}:
+        return False
+    if any(marker in text for marker in NON_RETRYABLE_AUTH_MARKERS):
+        return False
+    if status_code in {408, 409, 429}:
+        return True
+    if isinstance(status_code, int) and status_code >= 500:
+        return True
+    if error_type in {"apiconnectionerror", "apitimeouterror", "timeouterror", "connectionerror"}:
+        return True
+    return any(marker in text for marker in RETRYABLE_ERROR_MARKERS)
+
+
+def _extract_token_info(response: Any) -> dict:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"cache_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    cached_tokens = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details and getattr(details, "cached_tokens", None):
+        cached_tokens = int(details.cached_tokens)
+    return {
+        "cache_tokens": cached_tokens,
+        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+    }
+
+
 
 class Provider:
     tool_registry: ToolRegistry
@@ -188,18 +343,41 @@ class Provider:
         self.system_prompt = build_system_prompt()
         self.ws_manager = ws_manager
 
+    async def _create_chat_completion(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools_enabled: bool,
+        is_thinking: bool,
+    ) -> Any:
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "extra_body": {"enable_thinking": is_thinking},
+        }
+        if tools_enabled:
+            request["tools"] = self.tool_registry.get_all_schemas()
+            request["parallel_tool_calls"] = True
+        return await self.async_client.chat.completions.create(**request)
+
+    @staticmethod
+    def _extract_summary_text(response: Any) -> str:
+        if response is None:
+            raise Exception("OpenAI response is empty.")
+        message = response.choices[0].message
+        content = getattr(message, "content", None) or ""
+        fallback_text = getattr(message, "refusal", "") or ""
+        return _coerce_natural_finish(content, fallback=fallback_text)
+
     async def generate(self, context: Dict[str, Any]) -> tuple[str, str, list, dict]:
         step = cast(Step,context.get("step")) # current_step
         is_thinking = context.get("is_thinking", True)
-        # TODO 针对 429 Error Code 做重试
-        response = await self.async_client.chat.completions.create(
-            model=self.model,
+        response = await self._create_chat_completion(
             messages=context.get("messages"),
-            temperature=0.2,
-            top_p=0.9,
-            tools=self.tool_registry.get_all_schemas(),
-            extra_body={"enable_thinking": is_thinking},
-            parallel_tool_calls=True,
+            tools_enabled=True,
+            is_thinking=is_thinking,
         )
         if response is None:
             raise Exception("OpenAI response is empty.")
@@ -256,23 +434,60 @@ class Provider:
                 len(action_message),
             )
 
-        cached_tokens = 0
-        if response.usage.prompt_tokens_details and response.usage.prompt_tokens_details.cached_tokens:
-            cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
+        token_info = _extract_token_info(response)
         logger.info(
             "llm_usage finish_reason=%s actions=%s prompt=%s completion=%s total=%s cache=%s",
             finish_reason,
             len(actions),
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
-            response.usage.total_tokens,
-            cached_tokens,
+            token_info["prompt_tokens"],
+            token_info["completion_tokens"],
+            token_info["total_tokens"],
+            token_info["cache_tokens"],
         )
-        token_info = {
-            "cache_tokens": cached_tokens,
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens
-        }
         return finish_reason, reasoning, actions, token_info
+
+    async def generate_summary(
+        self,
+        *,
+        messages: list[dict],
+        system_prompt: str,
+        max_retries: int = SUMMARY_MAX_RETRIES,
+    ) -> tuple[str, dict]:
+        request_messages: list[dict] = [{"role": "system", "content": system_prompt}, *(messages or [])]
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = await self._create_chat_completion(
+                    messages=request_messages,
+                    tools_enabled=False,
+                    is_thinking=False,
+                )
+                summary_text = self._extract_summary_text(response)
+                token_info = _extract_token_info(response)
+                logger.info(
+                    "llm_summary finish_reason=%s prompt=%s completion=%s total=%s cache=%s",
+                    getattr(response.choices[0], "finish_reason", None),
+                    token_info["prompt_tokens"],
+                    token_info["completion_tokens"],
+                    token_info["total_tokens"],
+                    token_info["cache_tokens"],
+                )
+                return summary_text, token_info
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if is_context_overflow_error(exc):
+                    raise
+                if attempt > max_retries or not is_retryable_provider_error(exc):
+                    raise
+                delay = _compute_retry_delay(exc, attempt)
+                logger.warning(
+                    "llm_summary_retry attempt=%s max_retries=%s delay=%.2fs error=%s",
+                    attempt,
+                    max_retries,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
 
