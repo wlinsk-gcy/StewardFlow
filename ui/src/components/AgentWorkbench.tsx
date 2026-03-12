@@ -42,116 +42,141 @@ function joinClasses(...values: Array<string | undefined | false | null>) {
   return values.filter(Boolean).join(" ");
 }
 
-const MessageContent: React.FC<{ content: string }> = ({ content }) => {
+function isBacktickOnlyContent(content: string) {
+  const trimmed = content.trim();
+  return Boolean(trimmed) && /^`+$/.test(trimmed);
+}
+
+const MessageContent: React.FC<{ content: string; className?: string }> = ({
+  content,
+  className,
+}) => {
+  const normalizedContent = normalizeText(content || "");
+  const trimmedContent = normalizedContent.trim();
+
   return (
-    <div className="sf-markdown max-w-none text-[14px] leading-7">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          h1: ({ className, ...props }) => (
-            <h1
-              {...props}
-              className={joinClasses("sf-markdown-heading sf-markdown-h1", className)}
-            />
-          ),
-          h2: ({ className, ...props }) => (
-            <h2
-              {...props}
-              className={joinClasses("sf-markdown-heading sf-markdown-h2", className)}
-            />
-          ),
-          h3: ({ className, ...props }) => (
-            <h3
-              {...props}
-              className={joinClasses("sf-markdown-heading sf-markdown-h3", className)}
-            />
-          ),
-          h4: ({ className, ...props }) => (
-            <h4
-              {...props}
-              className={joinClasses("sf-markdown-heading sf-markdown-h4", className)}
-            />
-          ),
-          p: ({ className, ...props }) => (
-            <p {...props} className={joinClasses("sf-markdown-paragraph", className)} />
-          ),
-          blockquote: ({ className, ...props }) => (
-            <blockquote
-              {...props}
-              className={joinClasses("sf-markdown-blockquote", className)}
-            />
-          ),
-          hr: ({ className, ...props }) => (
-            <hr {...props} className={joinClasses("sf-markdown-divider", className)} />
-          ),
-          a: ({ className, ...props }) => (
-            <a
-              {...props}
-              className={joinClasses("sf-markdown-link", className)}
-              target="_blank"
-              rel="noreferrer"
-            />
-          ),
-          pre: ({ className, ...props }) => (
-            <pre {...props} className={joinClasses("sf-markdown-pre", className)} />
-          ),
-          code: ({ inline, className, ...props }: any) =>
-            inline ? (
+    <div className={joinClasses("sf-markdown max-w-none text-[14px] leading-7", className)}>
+      {isBacktickOnlyContent(trimmedContent) ? (
+        <code className="sf-markdown-inline-code">{trimmedContent}</code>
+      ) : (
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            h1: ({ className, ...props }) => (
+              <h1
+                {...props}
+                className={joinClasses("sf-markdown-heading sf-markdown-h1", className)}
+              />
+            ),
+            h2: ({ className, ...props }) => (
+              <h2
+                {...props}
+                className={joinClasses("sf-markdown-heading sf-markdown-h2", className)}
+              />
+            ),
+            h3: ({ className, ...props }) => (
+              <h3
+                {...props}
+                className={joinClasses("sf-markdown-heading sf-markdown-h3", className)}
+              />
+            ),
+            h4: ({ className, ...props }) => (
+              <h4
+                {...props}
+                className={joinClasses("sf-markdown-heading sf-markdown-h4", className)}
+              />
+            ),
+            p: ({ className, ...props }) => (
+              <p {...props} className={joinClasses("sf-markdown-paragraph", className)} />
+            ),
+            blockquote: ({ className, ...props }) => (
+              <blockquote
+                {...props}
+                className={joinClasses("sf-markdown-blockquote", className)}
+              />
+            ),
+            hr: ({ className, ...props }) => (
+              <hr {...props} className={joinClasses("sf-markdown-divider", className)} />
+            ),
+            a: ({ className, ...props }) => (
+              <a
+                {...props}
+                className={joinClasses("sf-markdown-link", className)}
+                target="_blank"
+                rel="noreferrer"
+              />
+            ),
+            pre: ({ className, children, node: _node, ...props }) => {
+              const onlyChild =
+                React.Children.count(children) === 1 ? React.Children.only(children) : null;
+              const renderedChildren =
+                React.isValidElement<{ className?: string }>(onlyChild)
+                  ? React.cloneElement(onlyChild, {
+                      className: joinClasses(
+                        "sf-markdown-code-block",
+                        onlyChild.props.className,
+                      ),
+                    })
+                  : children;
+
+              return (
+                <pre {...props} className={joinClasses("sf-markdown-pre", className)}>
+                  {renderedChildren}
+                </pre>
+              );
+            },
+            code: ({ className, node: _node, ...props }) => (
               <code
                 {...props}
                 className={joinClasses("sf-markdown-inline-code", className)}
               />
-            ) : (
-              <code
+            ),
+            table: ({ className, ...props }) => (
+              <div className="sf-markdown-table-wrap">
+                <table
+                  {...props}
+                  className={joinClasses("sf-markdown-table", className)}
+                />
+              </div>
+            ),
+            thead: ({ className, ...props }) => (
+              <thead
                 {...props}
-                className={joinClasses("sf-markdown-code-block", className)}
+                className={joinClasses("sf-markdown-table-head", className)}
               />
             ),
-          table: ({ className, ...props }) => (
-            <div className="sf-markdown-table-wrap">
-              <table
+            tbody: ({ className, ...props }) => (
+              <tbody
                 {...props}
-                className={joinClasses("sf-markdown-table", className)}
+                className={joinClasses("sf-markdown-table-body", className)}
               />
-            </div>
-          ),
-          thead: ({ className, ...props }) => (
-            <thead
-              {...props}
-              className={joinClasses("sf-markdown-table-head", className)}
-            />
-          ),
-          tbody: ({ className, ...props }) => (
-            <tbody
-              {...props}
-              className={joinClasses("sf-markdown-table-body", className)}
-            />
-          ),
-          tr: ({ className, ...props }) => (
-            <tr {...props} className={joinClasses("sf-markdown-table-row", className)} />
-          ),
-          th: ({ className, ...props }) => (
-            <th
-              {...props}
-              className={joinClasses("sf-markdown-table-cell sf-markdown-table-th", className)}
-            />
-          ),
-          td: ({ className, ...props }) => (
-            <td
-              {...props}
-              className={joinClasses("sf-markdown-table-cell sf-markdown-table-td", className)}
-            />
-          ),
-          ul: ({ className, ...props }) => (
-            <ul {...props} className={joinClasses("sf-markdown-list", className)} />
-          ),
-          ol: ({ className, ...props }) => (
-            <ol {...props} className={joinClasses("sf-markdown-list", className)} />
-          ),
-        }}
-      >
-        {normalizeText(content || "")}
-      </ReactMarkdown>
+            ),
+            tr: ({ className, ...props }) => (
+              <tr {...props} className={joinClasses("sf-markdown-table-row", className)} />
+            ),
+            th: ({ className, ...props }) => (
+              <th
+                {...props}
+                className={joinClasses("sf-markdown-table-cell sf-markdown-table-th", className)}
+              />
+            ),
+            td: ({ className, ...props }) => (
+              <td
+                {...props}
+                className={joinClasses("sf-markdown-table-cell sf-markdown-table-td", className)}
+              />
+            ),
+            ul: ({ className, ...props }) => (
+              <ul {...props} className={joinClasses("sf-markdown-list", className)} />
+            ),
+            ol: ({ className, ...props }) => (
+              <ol {...props} className={joinClasses("sf-markdown-list", className)} />
+            ),
+          }}
+        >
+          {normalizedContent}
+        </ReactMarkdown>
+      )}
     </div>
   );
 };
@@ -1250,7 +1275,10 @@ export const AgentWorkbench: React.FC = () => {
                         : "flex-1 rounded-tl-none border border-[var(--sf-border)] bg-white/[0.88] text-[var(--sf-ink)]"
                     }`}
                   >
-                    <MessageContent content={String(msg.content ?? "")} />
+                    <MessageContent
+                      content={String(msg.content ?? "")}
+                      className={msg.role === "assistant" ? "sf-markdown-assistant" : undefined}
+                    />
                     {msg.role === "assistant" &&
                       msg.hitlType === "confirm" &&
                       pendingConfirm &&
