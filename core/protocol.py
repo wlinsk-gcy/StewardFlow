@@ -140,6 +140,8 @@ class Trace:
     turns: List["Turn"] = field(default_factory=list)
     max_turns: int = 100
     token_info: Optional[Dict[str, Any]] = field(default_factory=dict)
+    pending_compaction: Optional[Dict[str, Any]] = field(default_factory=dict)
+    context_compaction: Optional[Dict[str, Any]] = field(default_factory=dict)
     error_count: int = 0
     error_message: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
@@ -159,6 +161,8 @@ class Trace:
             "turns": [turn.to_dict() for turn in self.turns],
             "max_turns": self.max_turns,
             "token_info": self.token_info,
+            "pending_compaction": self.pending_compaction,
+            "context_compaction": self.context_compaction,
             "error_count": self.error_count,
             "error_message": self.error_message,
             "created_at": self.created_at.isoformat() if self.created_at else None,
