@@ -268,6 +268,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # ===== shutdown =====
+    await ws_manager.close()
     if browser_manager is not None:
         await browser_manager.shutdown()
     await stop_mcp_initialization(getattr(app.state, "mcp_init_task", None), logger)
@@ -342,7 +343,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             # Keep connection alive.
             await websocket.receive_text()
     except WebSocketDisconnect:
-        ws_manager.disconnect(client_id)
+        await ws_manager.disconnect(client_id, websocket)
         logger.info(f"Disconnected from client: {client_id}")
 
 
